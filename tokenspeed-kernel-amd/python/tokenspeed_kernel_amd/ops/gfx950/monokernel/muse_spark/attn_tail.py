@@ -155,6 +155,15 @@ def tail_stages(mb, task, h, alpha, beta, pre_gain, RANK: gl.constexpr):
     rl: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [1, nw], [1, 0])
     src = gl.arange(0, WORLD, gl.SliceLayout(1, rl))
     j = gl.arange(0, TAIL_COLS // 2, gl.SliceLayout(0, rl))
+    # The parameters load before the first poll: a load after a poll would
+    # start only when the poll returns.
+    c = task * TAIL_COLS + 2 * j
+    beta_lo = gl.load(beta + c)
+    beta_hi = gl.load(beta + c + 1)
+    ah_lo = gl.load(alpha + c) * gl.load(h + c)
+    ah_hi = gl.load(alpha + c + 1) * gl.load(h + c + 1)
+    gain_lo = gl.load(pre_gain + c)
+    gain_hi = gl.load(pre_gain + c + 1)
     (got,) = mb.poll_many(
         ("red",), (src[:, None] * (OWNED // 2) + task * (TAIL_COLS // 2) + j[None, :],)
     )
@@ -175,11 +184,8 @@ def tail_stages(mb, task, h, alpha, beta, pre_gain, RANK: gl.constexpr):
     mb.stamp("tail2", trace.START)
     inv = gl.rsqrt(_total(mb, "ss1") / HIDDEN + POST_EPS)
     mb.stamp("tail2", trace.READY)
-    c = task * TAIL_COLS + 2 * j
-    hp_lo = gl.fma(gl.load(beta + c), lo * inv, gl.load(alpha + c) * gl.load(h + c))
-    hp_hi = gl.fma(
-        gl.load(beta + c + 1), hi * inv, gl.load(alpha + c + 1) * gl.load(h + c + 1)
-    )
+    hp_lo = gl.fma(beta_lo, lo * inv, ah_lo)
+    hp_hi = gl.fma(beta_hi, hi * inv, ah_hi)
     # The MoE tail reads h' on other CTAs: through the mailbox, not memory.
     mb.put("hp", c, hp_lo.to(gl.int32, bitcast=True))
     mb.put("hp", c + 1, hp_hi.to(gl.int32, bitcast=True))
@@ -194,8 +200,8 @@ def tail_stages(mb, task, h, alpha, beta, pre_gain, RANK: gl.constexpr):
     mb.stamp("tail3", trace.START)
     inv2 = gl.rsqrt(_total(mb, "ss2") / HIDDEN + PRE_EPS)
     mb.stamp("tail3", trace.READY)
-    u_lo = hp_lo * inv2 * gl.load(pre_gain + c)
-    u_hi = hp_hi * inv2 * gl.load(pre_gain + c + 1)
+    u_lo = hp_lo * inv2 * gain_lo
+    u_hi = hp_hi * inv2 * gain_hi
     word = (u_lo.to(gl.bfloat16).to(gl.int16, bitcast=True).to(gl.int32) & 0xFFFF) | (
         u_hi.to(gl.bfloat16).to(gl.int16, bitcast=True).to(gl.int32) << 16
     )
