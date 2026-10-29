@@ -202,7 +202,17 @@ def gluon_muse_spark_layer_gfx950(
     task, active = schedule.stage_task(PLAN, "attn")
     if active:
         attention.attn_stage(
-            mb, task, seq_len, page_table, k_cache, v_cache, SPLITS, WIN, "attn"
+            mb,
+            task,
+            seq_len,
+            page_table,
+            k_cache,
+            v_cache,
+            cos_sin,
+            ROPE,
+            SPLITS,
+            WIN,
+            "attn",
         )
     task, active = schedule.stage_task(PLAN, "merge")
     if active:
