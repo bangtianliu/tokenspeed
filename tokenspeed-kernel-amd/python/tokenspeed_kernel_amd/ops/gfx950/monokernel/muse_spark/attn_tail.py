@@ -35,7 +35,7 @@ output projection (a reduce-scatter).
     and puts ``sum b^2`` of its columns into every rank's ``ss1``.
   - tail2: ``b rsqrt(mean(b^2) + 1e-8)`` (the weightless post-attention
     norm over all 8192 columns), then the residual gate ``h' = beta b +
-    alpha h``, stored as the rank's next residual slice; puts ``sum h'^2``.
+    alpha h``, published in ``hp``; puts ``sum h'^2``.
   - tail3: ``u = h' rsqrt(mean(h'^2) + 1e-5) bf16(w + 1)`` (the pre-FFN
     norm), published as FP32 in ``u`` for the router, and as BF16 in every
     rank's ``xin`` (the MoE input, which the pooler reads whole).
@@ -65,6 +65,7 @@ def regions() -> tuple[tuple[str, int], ...]:
         ("red", world * owned // 2),  # BF16 pairs [source rank][owned column]
         ("ss1", world * tasks),  # FP32 partial sums of squares [rank][task]
         ("ss2", world * tasks),
+        ("hp", owned),  # FP32 owned slice of the residual after attention (h')
         ("u", owned),  # FP32 owned slice of the pre-FFN norm output
         ("xin", world * owned // 2),  # BF16 pairs of the whole MoE input, rank-major
     )
@@ -76,7 +77,7 @@ def stages(bases: dict[str, int]) -> tuple[Stage, ...]:
     return (
         Stage("oproj", int(OPROJ_TASKS), oproj, reads=("z",), writes=("red",)),
         Stage("tail1", tasks, tail, reads=("red",), writes=("ss1",)),
-        Stage("tail2", tasks, tail, reads=("ss1",), writes=("ss2",)),
+        Stage("tail2", tasks, tail, reads=("ss1",), writes=("ss2", "hp")),
         Stage("tail3", tasks, tail, reads=("ss2",), writes=("u", "xin")),
     )
 
@@ -140,14 +141,12 @@ def _total(mb, region: gl.constexpr):
 
 
 @gluon.jit
-def tail_stages(mb, task, h, h_out, alpha, beta, pre_gain, RANK: gl.constexpr):
+def tail_stages(mb, task, h, alpha, beta, pre_gain, RANK: gl.constexpr):
     """Tail tasks ``task`` of tail1, tail2 and tail3: owned columns
     ``128 task ..`` (of the rank's 1024).
 
     Args:
-        h: The rank's FP32 residual slice ``[1024]``.
-        h_out: Where ``h'`` goes (not ``h``: the waves of a task read ``h``
-            while others store ``h'``).
+        h: The rank's FP32 residual slice ``[1024]`` (the previous launch's).
         alpha, beta: FP32 residual-gate coefficients of the owned columns.
         pre_gain: FP32 ``bf16(w + 1)`` of the pre-FFN norm, owned columns.
     """
@@ -181,8 +180,9 @@ def tail_stages(mb, task, h, h_out, alpha, beta, pre_gain, RANK: gl.constexpr):
     hp_hi = gl.fma(
         gl.load(beta + c + 1), hi * inv, gl.load(alpha + c + 1) * gl.load(h + c + 1)
     )
-    gl.store(h_out + c, hp_lo)
-    gl.store(h_out + c + 1, hp_hi)
+    # The MoE tail reads h' on other CTAs: through the mailbox, not memory.
+    mb.put("hp", c, hp_lo.to(gl.int32, bitcast=True))
+    mb.put("hp", c + 1, hp_hi.to(gl.int32, bitcast=True))
     _put_all(
         mb,
         "ss2",
