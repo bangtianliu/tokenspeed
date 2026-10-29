@@ -88,6 +88,19 @@ wave spin on hint pairs before a wide poll.
 100 us. A deadlock or a missing producer then gives a GPU error
 (`hipErrorLaunchFailure`) and the process stops, instead of a hang.
 
+**A tensor-parallel group runs one plan.** In a plan of `world` > 1 ranks,
+every rank runs the same stages, and a stage can put into another rank's
+copy of a peer region. The deadlock rule then holds across ranks: the
+earliest unfinished stage on any rank reads only regions that earlier stages
+on every rank wrote, and all CTAs of all ranks are resident. The mailbox
+buffer sits on Iris's symmetric heap, so a region has the same offset on
+every rank. A rank can start its next launch while another still reads this
+one, but not two launches ahead, because finishing the next launch needs
+every rank's part of it. So a peer region holds two copies, chosen by a
+launch parity that alternates on every rank. Puts and polls of a peer region
+are system scope (`sc0 sc1`): another GPU's store does not update the local
+L2.
+
 **Kernels take compile-time plans as text.** Triton's compile hooks serialize
 every compile-time argument to JSON. A kernel therefore takes its plan as
 `Plan.key` (a `PlanKey`: the canonical JSON, which also carries the plan
