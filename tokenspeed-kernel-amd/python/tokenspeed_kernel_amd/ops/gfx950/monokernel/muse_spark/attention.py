@@ -48,6 +48,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import (
     K_ROW,
     KV_HEADS,
     Q_HEADS,
+    QKVG,
     V_ROW,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Stage, placement
@@ -90,18 +91,38 @@ def stages(bases: dict[str, int], splits: int) -> tuple[Stage, ...]:
             "merge",
             int(MERGE_TASKS),
             merge,
-            reads=("part", "lse", "qkvg"),
+            reads=("part", "lse", "gate"),
             writes=("z",),
         ),
     )
 
 
+@gluon.constexpr_function
+def _pair_layout(rank, nw):
+    """Index layouts of polls of projection pairs: the last axis (half 0
+    even, half 0 odd, half 1 even, half 1 odd) in one thread. ``rank`` 2:
+    ``[32 pairs, 4]``; 3: ``[16 heads, 32 pairs, 4]``."""
+    if rank == 2:
+        return gl.BlockedLayout([1, 4], [64, 1], [nw, 1], [1, 0])
+    return gl.BlockedLayout([1, 1, 4], [2, 32, 1], [nw, 1, 1], [2, 1, 0])
+
+
 @gluon.jit
-def _halves(words):
-    """FP32 values ``2 p`` and ``2 p + 1`` of BF16 pairs ``words``."""
-    return (words << 16).to(gl.float32, bitcast=True), (words & -65536).to(
-        gl.float32, bitcast=True
-    )
+def _pair_index(pair, e, N: gl.constexpr, row0):
+    """Partial-sum indices of values ``row0 + 2 pair`` and ``+ 1`` of a
+    projection region of ``N`` rows a K half (``e``: the last axis)."""
+    return (e // 2) * N + row0 + 2 * pair + e % 2
+
+
+@gluon.jit
+def _pair_values(got, e, AX: gl.constexpr):
+    """(even, odd) BF16-rounded values (FP32) from the polled partial sums
+    of :func:`_pair_index` (``e``: their last axis ``AX``): half 0 plus
+    half 1."""
+    x = got.to(gl.float32, bitcast=True)
+    lo = gl.sum(gl.where(e % 2 == 0, x, 0.0), axis=AX)
+    hi = gl.sum(gl.where(e % 2 == 1, x, 0.0), axis=AX)
+    return lo.to(gl.bfloat16).to(gl.float32), hi.to(gl.bfloat16).to(gl.float32)
 
 
 @gluon.jit
@@ -139,23 +160,27 @@ def head_stage(
             (unused when ``ROPE`` is false).
     """
     mb.stamp(STAGE, trace.START)
-    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
-    j = gl.arange(0, HEAD // 2, lanes)
+    pl: gl.constexpr = _pair_layout(2, gl.num_warps())
+    j = gl.arange(0, HEAD // 2, gl.SliceLayout(1, pl))
+    e = gl.arange(0, 4, gl.SliceLayout(0, pl))[None, :]
     pos = gl.load(seq_len) - 1
     slot_at = gl.load(slot).to(gl.int64) * KV_STRIDE + 2 * j
     g = task
     kw, vw = mb.poll_many(
         ("qkvg", "qkvg"),
-        ((K_ROW + g * HEAD) // 2 + j, (V_ROW + g * HEAD) // 2 + j),
+        (
+            _pair_index(j[:, None], e, GATE_ROW, K_ROW + g * HEAD),
+            _pair_index(j[:, None], e, GATE_ROW, V_ROW + g * HEAD),
+        ),
     )
     mb.stamp(STAGE, trace.READY)
-    lo, hi = _halves(kw)
+    lo, hi = _pair_values(kw, e, 1)
     lo, hi = _norm_rope(lo, hi, 1.0, cos_sin, pos, j, ROPE)
     # The cache keeps the rotated k and the raw v.
     at = slot_at + g * HEAD
     gl.store(k_cache + at, lo)
     gl.store(k_cache + at + 1, hi)
-    vlo, vhi = _halves(vw)
+    vlo, vhi = _pair_values(vw, e, 1)
     gl.store(v_cache + at, vlo.to(gl.bfloat16))
     gl.store(v_cache + at + 1, vhi.to(gl.bfloat16))
     mb.stamp(STAGE, trace.END)
@@ -266,11 +291,14 @@ def attn_stage(
     # q of the 8 heads (rows 8 .. 15 zero), and the token's k and v. A
     # thread holds one pair, 32 lanes a head: the norm sums in head_stage's
     # order.
-    ql: gl.constexpr = gl.BlockedLayout([1, 1], [2, 32], [nw, 1], [1, 0])
+    q3: gl.constexpr = _pair_layout(3, nw)
+    ql: gl.constexpr = gl.SliceLayout(2, q3)
     qr = gl.arange(0, 16, gl.SliceLayout(1, ql))[:, None]
     qp = gl.arange(0, HEAD // 2, gl.SliceLayout(0, ql))[None, :]
-    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
-    tp = gl.arange(0, HEAD // 2, lanes)
+    eq = gl.arange(0, 4, gl.SliceLayout(0, gl.SliceLayout(1, q3)))[None, None, :]
+    k2: gl.constexpr = _pair_layout(2, nw)
+    tp = gl.arange(0, HEAD // 2, gl.SliceLayout(1, k2))
+    ek = gl.arange(0, 4, gl.SliceLayout(0, k2))[None, :]
     if ROPE:
         # The RoPE rows load before the poll: a load after a poll would
         # start only when the poll returns.
@@ -281,17 +309,22 @@ def attn_stage(
     got_q, got_k, got_v = mb.poll_many(
         ("qkvg", "qkvg", "qkvg"),
         (
-            (g * GROUP + gl.minimum(qr, GROUP - 1)) * (HEAD // 2) + qp,
-            (K_ROW + g * HEAD) // 2 + tp,
-            (V_ROW + g * HEAD) // 2 + tp,
+            _pair_index(
+                qp[:, :, None],
+                eq,
+                GATE_ROW,
+                (g * GROUP + gl.minimum(qr, GROUP - 1))[:, :, None] * HEAD,
+            ),
+            _pair_index(tp[:, None], ek, GATE_ROW, K_ROW + g * HEAD),
+            _pair_index(tp[:, None], ek, GATE_ROW, V_ROW + g * HEAD),
         ),
     )
     mb.stamp(STAGE, trace.READY)
-    q_lo, q_hi = _halves(got_q)
+    q_lo, q_hi = _pair_values(got_q, eq, 2)
     inv_q = gl.rsqrt(gl.sum(q_lo * q_lo + q_hi * q_hi, axis=1) / HEAD + EPS)[:, None]
     q_lo = q_lo * inv_q * Q_GAIN
     q_hi = q_hi * inv_q * Q_GAIN
-    k_lo, k_hi = _halves(got_k)
+    k_lo, k_hi = _pair_values(got_k, ek, 1)
     inv_k = gl.rsqrt(gl.sum(k_lo * k_lo + k_hi * k_hi, axis=0) / HEAD + EPS)
     k_lo = k_lo * inv_k * 1.0
     k_hi = k_hi * inv_k * 1.0
@@ -310,7 +343,7 @@ def attn_stage(
     line: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
     cur_k = gl.allocate_shared_memory(gl.bfloat16, [HEAD], line)
     cur_v = gl.allocate_shared_memory(gl.bfloat16, [HEAD], line)
-    v_lo, v_hi = _halves(got_v)
+    v_lo, v_hi = _pair_values(got_v, ek, 1)
     cur_k.store(gl.reshape(gl.join(k_lo, k_hi), [HEAD]).to(gl.bfloat16))
     cur_v.store(gl.reshape(gl.join(v_lo, v_hi), [HEAD]).to(gl.bfloat16))
     gl.barrier()
@@ -384,9 +417,12 @@ def merge_stage(mb, task, SPLITS: gl.constexpr, STAGE: gl.constexpr):
     s = gl.arange(0, SPLITS, gl.SliceLayout(1, ml))
     c = gl.arange(0, HEAD, gl.SliceLayout(0, ml))
     part = ((s[:, None] * KV_HEADS + g) * GROUP + hh) * HEAD + c[None, :]
+    gl2: gl.constexpr = gl.BlockedLayout([1, 2], [64, 1], [nw, 1], [1, 0])
+    gc = gl.arange(0, HEAD, gl.SliceLayout(1, gl2))[:, None]
+    gh = gl.arange(0, 2, gl.SliceLayout(0, gl2))[None, :]
     got_p, got_l, got_g = mb.poll_many(
-        ("part", "lse", "qkvg"),
-        (part, s * Q_HEADS + h, (GATE_ROW + h * HEAD + c) // 2),
+        ("part", "lse", "gate"),
+        (part, s * Q_HEADS + h, gh * (QKVG - GATE_ROW) + h * HEAD + gc),
     )
     mb.stamp(STAGE, trace.READY)
     lse = got_l.to(gl.float32, bitcast=True)
@@ -396,7 +432,9 @@ def merge_stage(mb, task, SPLITS: gl.constexpr, STAGE: gl.constexpr):
     out = gl.sum(p * w[:, None], axis=0) / gl.sum(w, axis=0)
     a = out.to(gl.bfloat16).to(gl.float32)
     inv = gl.rsqrt(gl.sum(a * a, axis=0) / HEAD + EPS)
-    z = a * inv * mx.sigmoid(mx.bf16_half(got_g, c))
+    gate = gl.sum(got_g.to(gl.float32, bitcast=True), axis=1)
+    gate = gl.convert_layout(gate.to(gl.bfloat16).to(gl.float32), c.type.layout)
+    z = a * inv * mx.sigmoid(gate)
     mb.stamp(STAGE, trace.COMPUTED)
     mx.put_bf16(mb, "z", h * (HEAD // 2), z)
     mb.stamp(STAGE, trace.END)

@@ -34,8 +34,11 @@ if not is_cdna4():
 
 from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox, schedule  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
     attention,
+)
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (  # noqa: E402
+    qkvg as qkvg_stage,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import (  # noqa: E402
     Plan,
@@ -93,10 +96,10 @@ def _plan(splits: int) -> Plan:
     return Plan(
         grid=256,
         stages=attention.stages({"head": 0, "attn": 32, "merge": 18}, splits),
-        regions=(("qkvg", QKVG // 2),) + attention.regions(splits),
+        regions=qkvg_stage.REGIONS + attention.regions(splits),
         rows=1,
         chain=1,
-        external=("qkvg",),
+        external=("qkvg", "gate"),
     )
 
 
@@ -181,7 +184,11 @@ def test_attention_matches_the_regular_path_math(length, window, splits):
     scratch = torch.zeros(plan.scratch_pairs, dtype=torch.int64, device="cuda")
     step = 5
     tag = launch_tag(step, 0)
-    fill(scratch, plan, "qkvg", qkvg.view(torch.int32).cuda(), tag)
+    # The projection's two K halves: each half of the value (exact), so
+    # their FP32 sum is the BF16 value.
+    for region, rows in (("qkvg", qkvg[:GATE_ROW]), ("gate", qkvg[GATE_ROW:])):
+        half = (rows.float() / 2).view(torch.int32)
+        fill(scratch, plan, region, torch.cat([half, half]).cuda(), tag)
     kc, vc = k_cache.clone().cuda(), v_cache.clone().cuda()
     attention_kernel[(plan.grid,)](
         scratch,
