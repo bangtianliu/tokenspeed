@@ -81,7 +81,7 @@ def peer_plan() -> Plan:
 def peer_sum_kernel(
     scratch, step, bases, x, out, PLAN: gl.constexpr, RANK: gl.constexpr
 ):
-    peers = mailbox.Peers(bases, RANK, gl.load(step) & 1)
+    peers = mailbox.load_peers(bases, RANK, gl.load(step) & 1, 8)
     mb = mailbox.Mailbox(scratch, mailbox.launch_tag(step, 0), PLAN, None, peers)
     lanes: gl.constexpr = mailbox.lane_layout(gl.num_warps())
     W: gl.constexpr = schedule.world(PLAN)

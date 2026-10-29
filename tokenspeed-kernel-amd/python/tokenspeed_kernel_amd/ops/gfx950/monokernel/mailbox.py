@@ -345,28 +345,38 @@ def lane_layout(num_warps):
 class Peers:
     """A rank's view of the other ranks of a plan of ``world`` > 1.
 
-    ``bases`` points at the ``int64`` base address of every rank's
-    symmetric heap (Iris's ``IrisGroup.bases``); the mailbox buffer sits on
-    that heap, so a region has the same offset on every rank. ``parity``
-    (0 or 1) selects this launch's copy of every peer region: it must
-    alternate from one launch to the next on every rank.
+    The mailbox buffer sits on Iris's symmetric heap, so a region has the
+    same offset on every rank. ``deltas`` holds, for every rank, its heap
+    base minus this rank's: :meth:`Peers.load` reads the bases once per
+    launch (``IrisGroup.bases``), so a put to another rank needs no load.
+    ``parity`` (0 or 1) selects this launch's copy of every peer region: it
+    must alternate from one launch to the next on every rank.
     """
 
-    bases: gl.tensor
+    deltas: gl.tensor
     rank: gl.constexpr
     parity: gl.tensor
 
     @gluon.constexpr_function
-    def __init__(self, bases, rank, parity):
-        self.bases = bases
+    def __init__(self, deltas, rank, parity):
+        self.deltas = deltas
         self.rank = gl.constexpr(rank)
         self.parity = parity
 
     @gluon.jit
     def translate(self, ptrs, peer):
         """``ptrs`` (on this rank's heap) as seen on rank ``peer``'s heap."""
-        delta = gl.load(self.bases + peer) - gl.load(self.bases + self.rank)
+        i = gl.arange(0, self.deltas.shape[0], self.deltas.type.layout)
+        delta = gl.sum(gl.where(i == peer, self.deltas, 0), axis=0)
         return (ptrs.to(gl.int64) + delta).to(ptrs.dtype)
+
+
+@gluon.jit
+def load_peers(bases, rank: gl.constexpr, parity, WORLD: gl.constexpr):
+    """:class:`Peers` from the ``int64 [WORLD]`` heap bases of the group."""
+    layout: gl.constexpr = gl.BlockedLayout([WORLD], [64], [gl.num_warps()], [0])
+    b = gl.load(bases + gl.arange(0, WORLD, layout))
+    return Peers(b - gl.load(bases + rank), rank, parity)
 
 
 @gluon.constexpr_function
@@ -562,6 +572,7 @@ __all__ = [
     "LAYER_SLOTS",
     "Mailbox",
     "Peers",
+    "load_peers",
     "lane_layout",
     "launch_tag",
     "poll",
