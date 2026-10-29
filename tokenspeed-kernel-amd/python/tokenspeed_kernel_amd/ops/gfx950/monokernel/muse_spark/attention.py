@@ -190,6 +190,43 @@ def _layouts(nw):
 
 
 @gluon.jit
+def _load_kv(
+    table,
+    k_cache,
+    v_cache,
+    g,
+    c0,
+    hi,
+    L,
+    dk,
+    dv,
+    k_layout: gl.constexpr,
+    v_load: gl.constexpr,
+):
+    """Keys ``[64, BN]`` and values ``[BN, 64]`` of chunk ``c0 ..`` from the
+    cache (zero past ``hi`` and at the token ``L``, which this launch writes)."""
+    jk = c0 + gl.arange(0, BN, gl.SliceLayout(0, k_layout))
+    jv = c0 + gl.arange(0, BN, gl.SliceLayout(1, v_load))
+    old_k = (jk < hi) & (jk != L)
+    old_v = (jv < hi) & (jv != L)
+    page_k = gl.load(table + jk // PAGE, mask=old_k, other=0)
+    page_v = gl.load(table + jv // PAGE, mask=old_v, other=0)
+    slot_k = page_k.to(gl.int64) * PAGE + jk % PAGE
+    slot_v = page_v.to(gl.int64) * PAGE + jv % PAGE
+    keys = gl.load(
+        k_cache + g * HEAD + slot_k[None, :] * KV_STRIDE + dk[:, None],
+        mask=old_k[None, :],
+        other=0.0,
+    )
+    values = gl.load(
+        v_cache + g * HEAD + slot_v[:, None] * KV_STRIDE + dv[None, :],
+        mask=old_v[:, None],
+        other=0.0,
+    )
+    return keys, values
+
+
+@gluon.jit
 def attn_stage(
     mb,
     task,
@@ -229,6 +266,14 @@ def attn_stage(
     lo = L + 1 - n + s * per
     hi = gl.minimum(lo + per, L + 1)
 
+    # The first chunk's cache loads go before the poll: they do not depend
+    # on this launch, and they arrive while the projections run.
+    dk = gl.arange(0, HEAD, gl.SliceLayout(1, k_layout))
+    dv = gl.arange(0, HEAD, gl.SliceLayout(0, v_load))
+    keys, values = _load_kv(
+        table, k_cache, v_cache, g, lo, hi, L, dk, dv, k_layout, v_load
+    )
+
     # q of the 8 heads (rows 8 .. 15 zero), and the token's k and v.
     ql: gl.constexpr = gl.BlockedLayout([1, 2], [2, 32], [nw, 1], [1, 0])
     qr = gl.arange(0, 16, gl.SliceLayout(1, ql))[:, None]
@@ -264,8 +309,6 @@ def attn_stage(
         gl.bfloat16, [BN, HEAD], gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     )
 
-    dk = gl.arange(0, HEAD, gl.SliceLayout(1, k_layout))
-    dv = gl.arange(0, HEAD, gl.SliceLayout(0, v_load))
     m = gl.full([16], float("-inf"), gl.float32, gl.SliceLayout(1, qk_mma))
     l = gl.zeros([16], gl.float32, gl.SliceLayout(1, qk_mma))
     acc = gl.zeros([16, HEAD], gl.float32, pv_mma)
@@ -273,25 +316,12 @@ def attn_stage(
         jk = c0 + gl.arange(0, BN, gl.SliceLayout(0, k_layout))
         jv = c0 + gl.arange(0, BN, gl.SliceLayout(1, v_load))
         ok_k = jk < hi
-        ok_v = jv < hi
-        old_k = ok_k & (jk != L)
-        old_v = ok_v & (jv != L)
-        page_k = gl.load(table + jk // PAGE, mask=old_k, other=0)
-        page_v = gl.load(table + jv // PAGE, mask=old_v, other=0)
-        slot_k = page_k.to(gl.int64) * PAGE + jk % PAGE
-        slot_v = page_v.to(gl.int64) * PAGE + jv % PAGE
-        keys = gl.load(
-            k_cache + g * HEAD + slot_k[None, :] * KV_STRIDE + dk[:, None],
-            mask=old_k[None, :],
-            other=0.0,
-        )
-        values = gl.load(
-            v_cache + g * HEAD + slot_v[:, None] * KV_STRIDE + dv[None, :],
-            mask=old_v[:, None],
-            other=0.0,
-        )
         keys = gl.where((jk == L)[None, :], k_t[:, None], keys)
         values = gl.where((jv == L)[:, None], v_t[None, :], values)
+        # The next chunk's loads go before this chunk's math.
+        next_keys, next_values = _load_kv(
+            table, k_cache, v_cache, g, c0 + BN, hi, L, dk, dv, k_layout, v_load
+        )
         scores = gl.zeros([16, BN], gl.float32, qk_mma)
         scores = gl.amd.cdna4.mfma(q, keys, scores)
         valid = gl.convert_layout(ok_k, gl.SliceLayout(0, qk_mma))
@@ -310,6 +340,8 @@ def attn_stage(
         )
         acc = acc * gl.convert_layout(alpha, gl.SliceLayout(1, pv_mma))[:, None] + pv
         m = m_new
+        keys = next_keys
+        values = next_values
     mb.stamp(STAGE, trace.COMPUTED)
     l_acc = gl.convert_layout(l, gl.SliceLayout(1, pv_mma))
     out = acc / gl.where(l_acc > 0, l_acc, 1.0)[:, None]
