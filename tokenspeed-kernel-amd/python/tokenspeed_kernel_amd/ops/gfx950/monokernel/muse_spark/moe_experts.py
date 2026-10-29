@@ -41,10 +41,12 @@ them): a second copy of every expert would not fit.
 Expert weights cannot load before routing picks the experts. So that both
 weight streams start then, and every CTA reads the same 96 KiB, a CTA runs
 its ex1 and ex2 tasks in parts: :func:`ex1_prep` (the pooled row is ready
-before routing), then :func:`ex1_issue` and :func:`ex2_issue`, then
-:func:`ex1_finish`, and :func:`ex2_finish` at ex2's place in the plan. The
-prep polls before the loads are issued: a poll waits for every earlier load
-of its wave (``vmcnt`` counts in order).
+before routing), then :func:`expert_ids` (one poll for both tasks' experts),
+:func:`ex1_issue` and :func:`ex2_issue`, then :func:`ex1_finish`, and
+:func:`ex2_finish` at ex2's place in the plan. The polls come before the
+loads: a poll waits for every earlier load of its wave (``vmcnt`` counts in
+order), so a poll between the two weight streams would start the second
+only when the first has arrived.
 """
 
 from __future__ import annotations
@@ -102,11 +104,16 @@ def stages(bases: dict[str, int]) -> tuple[Stage, ...]:
 
 
 @gluon.jit
-def _expert(mb, pick):
-    """The expert id of pick ``pick`` (``route``)."""
+def expert_ids(mb, task1, task2):
+    """The expert ids of ex1 task ``task1`` and ex2 task ``task2`` (from
+    ``route``), in one poll."""
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
-    (got,) = mb.poll_many(("route",), (pick + gl.arange(0, 1, lanes),))
-    return gl.max(got, axis=0)
+    i = gl.arange(0, 2, lanes)
+    pick = gl.where(i == 0, task1 // (NB1 * KSPLIT), task2 // (NB2 // EX2_BLOCKS))
+    (got,) = mb.poll_many(("route",), (pick,))
+    return gl.max(gl.where(i == 0, got, -1), axis=0), gl.max(
+        gl.where(i == 1, got, -1), axis=0
+    )
 
 
 @gluon.jit
@@ -232,19 +239,18 @@ def ex1_prep(mb, task, active, pre_gain, STAGE: gl.constexpr):
 
 @gluon.jit
 def ex1_issue(
-    mb, task, active, w13, w13s, stride_we, stride_se, stride_slin, stride_snb
+    task, active, expert, w13, w13s, stride_we, stride_se, stride_slin, stride_snb
 ):
-    """Issue ex1 task ``task``'s w13 loads (pick, column block, K quarter);
-    nothing loads when ``active`` is false.
+    """Issue ex1 task ``task``'s w13 loads (pick, column block, K quarter) of
+    expert ``expert`` (:func:`expert_ids`); nothing loads when ``active`` is
+    false.
 
     Args:
         w13, w13s: The rank's preprocessed w13 bytes ``[256, 2048, 1024]`` and
             scales (as ``decode_stage1`` takes them), with their strides.
     """
-    pick = task // (NB1 * KSPLIT)
     blk = (task // KSPLIT) % NB1
     ks = task % KSPLIT
-    expert = _expert(mb, pick)
     return _load_b(
         w13,
         w13s,
@@ -285,6 +291,7 @@ def ex2_issue(
     mb,
     task,
     active,
+    expert,
     w2,
     w2s,
     stride_we,
@@ -293,8 +300,9 @@ def ex2_issue(
     stride_snb,
     STAGE: gl.constexpr,
 ):
-    """Issue ex2 task ``task``'s w2 loads (pick, column block); nothing
-    loads (and nothing stamps) when ``active`` is false. Every CTA calls it
+    """Issue ex2 task ``task``'s w2 loads (pick, column block) of expert
+    ``expert`` (:func:`expert_ids`); nothing loads (and nothing stamps) when
+    ``active`` is false. Every CTA calls it
     (Gluon cannot carry the tiles out of a branch); :func:`ex2_finish` uses
     them.
 
@@ -305,9 +313,7 @@ def ex2_issue(
     if active:
         mb.stamp(STAGE, trace.START)
     TASKS_PER_PICK: gl.constexpr = NB2 // EX2_BLOCKS
-    pick = task // TASKS_PER_PICK
     blk0 = (task % TASKS_PER_PICK) * EX2_BLOCKS
-    expert = _expert(mb, pick)
     loads = ()
     for i in gl.static_range(EX2_BLOCKS):
         loads += (
