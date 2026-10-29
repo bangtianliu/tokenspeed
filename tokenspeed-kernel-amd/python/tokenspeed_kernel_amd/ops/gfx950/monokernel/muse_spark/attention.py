@@ -149,6 +149,7 @@ def head_stage(
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     j = gl.arange(0, HEAD // 2, lanes)
     pos = gl.load(seq_len) - 1
+    slot_at = gl.load(slot).to(gl.int64) * KV_STRIDE + 2 * j
     if task < Q_HEADS:
         (words,) = mb.poll_many(("qkvg",), (task * (HEAD // 2) + j,))
         mb.stamp(STAGE, trace.READY)
@@ -166,7 +167,7 @@ def head_stage(
         lo, hi = _norm_rope(lo, hi, 1.0, cos_sin, pos, j, ROPE)
         mb.put("kn", g * (HEAD // 2) + j, _pack(lo, hi))
         # The cache keeps the rotated k and the raw v.
-        at = gl.load(slot).to(gl.int64) * KV_STRIDE + g * HEAD + 2 * j
+        at = slot_at + g * HEAD
         gl.store(k_cache + at, lo)
         gl.store(k_cache + at + 1, hi)
         vlo, vhi = _halves(vw)

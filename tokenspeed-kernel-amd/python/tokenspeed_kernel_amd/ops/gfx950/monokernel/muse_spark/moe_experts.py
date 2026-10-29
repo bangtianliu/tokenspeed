@@ -207,6 +207,9 @@ def ex1_prep(mb, task, active, pre_gain, STAGE: gl.constexpr):
     ql: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [1, nw], [1, 0])
     q = gl.arange(0, KSPLIT, gl.SliceLayout(1, ql))
     j = gl.arange(0, K_SLICE // 2, gl.SliceLayout(0, ql))
+    c = ks * K_SLICE + 2 * j
+    gain_lo = gl.load(pre_gain + c)
+    gain_hi = gl.load(pre_gain + c + 1)
     (got,) = mb.poll_many(("cg",), (q[:, None] * (K_SLICE // 2) + j[None, :],))
     if active:
         mb.stamp(STAGE, trace.READY)
@@ -216,9 +219,8 @@ def ex1_prep(mb, task, active, pre_gain, STAGE: gl.constexpr):
     mine = q[:, None] == ks
     lo = gl.sum(gl.where(mine, lo, 0.0), axis=0)
     hi = gl.sum(gl.where(mine, hi, 0.0), axis=0)
-    c = ks * K_SLICE + 2 * j
-    lo = lo * inv * gl.load(pre_gain + c)
-    hi = hi * inv * gl.load(pre_gain + c + 1)
+    lo = lo * inv * gain_lo
+    hi = hi * inv * gain_hi
     x = gl.reshape(gl.join(lo, hi), [K_SLICE])
     x16 = (
         gl.zeros([M_DUP, 1], gl.float32, ql)
