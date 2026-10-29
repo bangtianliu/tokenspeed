@@ -50,25 +50,52 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import (  # noqa: E402
 )
 
 WORLD, HIDDEN, OWNED, EXPERTS, TOP_K, TAIL_TASKS = 8, 8192, 1024, 256, 8, 8
+SUMS = 4
+
+
+def _tail_sums(b, h, alpha, beta) -> torch.Tensor:
+    """The attention tail's four partial sums (``b^2``, ``(beta b)^2``,
+    ``(alpha h)(beta b)``, ``(alpha h)^2``), FP32 ``[rank * task, sum]``."""
+    bb, ah = beta.double() * b.double(), alpha.double() * h.double()
+    parts = torch.stack([b.double().pow(2), bb * bb, ah * bb, ah * ah], dim=1)
+    return parts.view(WORLD * TAIL_TASKS, -1, SUMS).sum(dim=1).float().contiguous()
 
 
 @gluon.jit
 def route_kernel(
-    scratch, step, bases, w, pre_gain, bias, PLAN: gl.constexpr, RANK: gl.constexpr
+    scratch,
+    step,
+    bases,
+    w,
+    pre_gain,
+    h,
+    alpha,
+    beta,
+    bias,
+    PLAN: gl.constexpr,
+    RANK: gl.constexpr,
 ):
     peers = mailbox.load_peers(bases, RANK, gl.load(step) & 1, 8)
     mb = mailbox.Mailbox(scratch, mailbox.launch_tag(step, 0), PLAN, None, peers)
     task, active = schedule.stage_task(PLAN, "router")
     if active:
-        moe_route.router_stage(mb, task, w, pre_gain, RANK, "router")
+        moe_route.router_stage(mb, task, w, pre_gain, h, alpha, beta, RANK, "router")
     task, active = schedule.stage_task(PLAN, "topk")
     if active:
         moe_route.topk_stage(mb, bias, "topk")
 
 
 def _inputs(seed: int):
+    """The attention tail's ``b`` (BF16 values), ``h``, ``alpha``, ``beta``,
+    the residual ``h' = beta b inv + alpha h`` they give, and the router's
+    weights."""
     g = torch.Generator().manual_seed(seed)
-    hp = torch.randn(HIDDEN, generator=g) * 3.0
+    b = torch.randn(HIDDEN, generator=g).to(torch.bfloat16).float()
+    h = torch.randn(HIDDEN, generator=g) * 3.0
+    alpha = torch.rand(HIDDEN, generator=g) + 0.5
+    beta = torch.rand(HIDDEN, generator=g) + 0.5
+    inv = torch.rsqrt(b.double().pow(2).mean() + 1e-8)
+    hp = beta.double() * b.double() * inv + alpha.double() * h.double()
     pre_gain = (torch.randn(HIDDEN, generator=g) * 0.1 + 1.0).to(torch.bfloat16).float()
     w = torch.randn(EXPERTS, HIDDEN, generator=g) / HIDDEN**0.5
     bias = torch.randn(EXPERTS, generator=g) * 0.1
@@ -77,7 +104,7 @@ def _inputs(seed: int):
         # bias, so the same score + bias. The lower id must come first.
         w[9] = w[5]
         bias[5] = bias[9] = 2.0
-    return hp, pre_gain, w, bias
+    return (b, h, alpha, beta), hp, pre_gain, w, bias
 
 
 def _worker(rank: int, port: int) -> None:
@@ -96,10 +123,11 @@ def _worker(rank: int, port: int) -> None:
         plan = Plan(
             grid=256,
             stages=moe_route.stages({"router": 0, "topk": 16}),
-            regions=(("hp", OWNED), ("ss2", WORLD * TAIL_TASKS)) + moe_route.regions(),
+            regions=(("bq", OWNED), ("ss1", WORLD * TAIL_TASKS * SUMS))
+            + moe_route.regions(),
             rows=1,
             chain=1,
-            external=("hp", "ss2"),
+            external=("bq", "ss1"),
             world=WORLD,
             peers=moe_route.PEERS,
         )
@@ -108,21 +136,20 @@ def _worker(rank: int, port: int) -> None:
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         for k, seed in enumerate((1, 2, 3)):
             step = 4 + k
-            hp, pre_gain, w, bias = _inputs(seed)
+            (b, h, alpha, beta), hp, pre_gain, w, bias = _inputs(seed)
             fill(
                 scratch,
                 plan,
-                "hp",
-                hp[own].view(torch.int32).to(device),
+                "bq",
+                b[own].view(torch.int32).to(device),
                 launch_tag(step, 0),
             )
-            # The attention tail's sums of h'^2: [rank][task of 128 columns].
-            ss2 = hp.view(WORLD * TAIL_TASKS, -1).pow(2).sum(dim=1)
+            # The attention tail's partial sums: [rank][task of 128 columns][sum].
             fill(
                 scratch,
                 plan,
-                "ss2",
-                ss2.view(torch.int32).to(device),
+                "ss1",
+                _tail_sums(b, h, alpha, beta).view(torch.int32).to(device),
                 launch_tag(step, 0),
             )
             route_kernel[(plan.grid,)](
@@ -131,6 +158,9 @@ def _worker(rank: int, port: int) -> None:
                 group.bases,
                 w[:, own].contiguous().to(device),
                 pre_gain[own].to(device),
+                h[own].to(device),
+                alpha[own].to(device),
+                beta[own].to(device),
                 bias.to(device),
                 plan.key,
                 rank,
@@ -138,7 +168,7 @@ def _worker(rank: int, port: int) -> None:
             )
             torch.cuda.synchronize()
             got = payloads(scratch, plan, "route", 2 * TOP_K, launch_tag(step, 0)).cpu()
-            u = hp.double() * torch.rsqrt(hp.double().pow(2).mean() + 1e-5) * pre_gain
+            u = hp * torch.rsqrt(hp.pow(2).mean() + 1e-5) * pre_gain
             logit = (w.double() @ u) * 0.17677669529663687
             score = torch.sigmoid(logit)
             # Largest first, a tie to the lowest id.
