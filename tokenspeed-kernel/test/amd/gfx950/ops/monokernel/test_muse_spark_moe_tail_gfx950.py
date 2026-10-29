@@ -78,10 +78,9 @@ def moe_tail_kernel(
         moe_tail.comb_stages(mb, task, pen_gain, RANK)
     task, active = schedule.stage_task(PLAN, "unpool")
     if active:
-        moe_tail.unpool_stage(mb, task, w_post, "unpool")
-    task, active = schedule.stage_task(PLAN, "fin1")
-    if active:
-        moe_tail.fin_stages(mb, task, post_gain, alpha, beta, in_gain, h_next, RANK)
+        moe_tail.unpool_stages(
+            mb, task, w_post, post_gain, alpha, beta, in_gain, h_next, RANK
+        )
     task, active = schedule.stage_task(PLAN, "out")
     if active:
         moe_tail.out_stage(mb, task, a_out, "out")
@@ -131,7 +130,7 @@ def _worker(rank: int, port: int) -> None:
         group = IrisGroup(ctx, dist.group.WORLD, rank, device)
         plan = Plan(
             grid=256,
-            stages=moe_tail.stages({"comb": 0, "unpool": 8, "fin": 72, "out": 80}),
+            stages=moe_tail.stages({"comb": 0, "unpool": 8, "out": 72}),
             regions=(
                 ("route", 2 * TOP_K),
                 ("hp", OWNED),
