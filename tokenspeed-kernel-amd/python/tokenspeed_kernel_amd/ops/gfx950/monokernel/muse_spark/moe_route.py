@@ -20,14 +20,18 @@
 
 """Expert routing of one Muse Spark rank (one row).
 
-The router multiplies the FP32 pre-FFN norm output ``u`` by the FP32 router
-weight. Rank ``r`` holds ``u`` only for its 1024 owned columns, so it takes
-the matching 1024 columns of the router weight (1 MiB, not the replicated
-8 MiB) and every rank adds the 8 partial logits.
+The router multiplies the FP32 pre-FFN norm output ``u = h' s g`` (``s =
+rsqrt(mean(h'^2) + 1e-5)``, ``g = bf16(w + 1)``) by the FP32 router weight.
+Rank ``r`` holds ``h'`` only for its 1024 owned columns, so it takes the
+matching 1024 columns of the router weight (1 MiB, not the replicated 8 MiB)
+and every rank adds the 8 partial logits. ``u`` is not rounded on this path,
+so the router multiplies ``h' g`` and top-8 applies the scalar ``s``: the
+router does not wait for the exchange that gives ``s``.
 
-* router, 16 tasks of 16 experts: this rank's partial logits, put into every
-  rank's ``lg`` slot of this rank.
-* topk, 1 task: the rank-order sum times ``output_multiplier``, the sigmoid
+* router, 16 tasks of 16 experts: this rank's partial logits of ``h' g``,
+  put into every rank's ``lg`` slot of this rank.
+* topk, 1 task: the rank-order sum times ``s`` (from ``ss2``) times
+  ``output_multiplier``, the sigmoid
   scores, and the 8 experts of the largest ``score + bias`` (8 argmax passes,
   a tie to the lowest id). The weights are the bias-free scores of the 8,
   divided by their sum. Every rank gets the same bits, published in ``route``
@@ -38,8 +42,12 @@ from __future__ import annotations
 
 from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import trace
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.attn_tail import OWNED
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import WORLD
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.attn_tail import (
+    OWNED,
+    PRE_EPS,
+    TAIL_TASKS,
+)
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import HIDDEN, WORLD
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Stage, placement
 
 EXPERTS = gl.constexpr(256)
@@ -61,18 +69,19 @@ def regions() -> tuple[tuple[str, int], ...]:
 def stages(bases: dict[str, int]) -> tuple[Stage, ...]:
     router, topk = placement(bases, ("router", "topk"))
     return (
-        Stage("router", int(ROUTER_TASKS), router, reads=("u",), writes=("lg",)),
-        Stage("topk", 1, topk, reads=("lg",), writes=("route",)),
+        Stage("router", int(ROUTER_TASKS), router, reads=("hp",), writes=("lg",)),
+        Stage("topk", 1, topk, reads=("lg", "ss2"), writes=("route",)),
     )
 
 
 @gluon.jit
-def router_stage(mb, task, w, RANK: gl.constexpr, STAGE: gl.constexpr):
+def router_stage(mb, task, w, pre_gain, RANK: gl.constexpr, STAGE: gl.constexpr):
     """Router task ``task``: experts ``16 task ..``.
 
     Args:
         w: This rank's router columns, FP32 ``[256, 1024]`` (row ``e`` is
             expert ``e``'s weights for the owned columns).
+        pre_gain: FP32 ``bf16(w + 1)`` of the pre-FFN norm, owned columns.
     """
     mb.stamp(STAGE, trace.START)
     nw: gl.constexpr = gl.num_warps()
@@ -80,10 +89,11 @@ def router_stage(mb, task, w, RANK: gl.constexpr, STAGE: gl.constexpr):
     e = task * ROUTER_ROWS + gl.arange(0, ROUTER_ROWS, gl.SliceLayout(1, wl))
     k = gl.arange(0, OWNED, gl.SliceLayout(0, wl))
     weights = gl.load(w + e[:, None] * OWNED + k[None, :])
-    (got,) = mb.poll_many(("u",), (k,))
+    gain = gl.load(pre_gain + k)
+    (got,) = mb.poll_many(("hp",), (k,))
     mb.stamp(STAGE, trace.READY)
-    u = got.to(gl.float32, bitcast=True)
-    partial = gl.sum(weights * u[None, :], axis=1)
+    v = got.to(gl.float32, bitcast=True) * gain
+    partial = gl.sum(weights * v[None, :], axis=1)
     mb.stamp(STAGE, trace.COMPUTED)
     word = partial.to(gl.int32, bitcast=True)
     for p in gl.static_range(WORLD):
@@ -99,12 +109,19 @@ def topk_stage(mb, bias, STAGE: gl.constexpr):
     ll: gl.constexpr = gl.BlockedLayout([WORLD, 1], [1, 64], [1, nw], [0, 1])
     src = gl.arange(0, WORLD, gl.SliceLayout(1, ll))
     e = gl.arange(0, EXPERTS, gl.SliceLayout(0, ll))
-    (got,) = mb.poll_many(("lg",), (src[:, None] * EXPERTS + e[None, :],))
+    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
+    got, ss = mb.poll_many(
+        ("lg", "ss2"),
+        (src[:, None] * EXPERTS + e[None, :], gl.arange(0, WORLD * TAIL_TASKS, lanes)),
+    )
     mb.stamp(STAGE, trace.READY)
+    # The pre-FFN norm's scale: the ranks' sums of h'^2 in rank-major order.
+    s = gl.rsqrt(gl.sum(ss.to(gl.float32, bitcast=True), axis=0) / HIDDEN + PRE_EPS)
     parts = got.to(gl.float32, bitcast=True)
     logit = gl.zeros([EXPERTS], gl.float32, gl.SliceLayout(0, ll))
     for p in gl.static_range(WORLD):
         logit += gl.sum(gl.where(src[:, None] == p, parts, 0.0), axis=0)
+    logit = logit * s
     # Every wave holds all 256 experts (4 a lane), so each argmax below
     # reduces within a wave: no LDS round trip and barrier per pass.
     wl: gl.constexpr = gl.BlockedLayout([EXPERTS // 64], [64], [nw], [0])
