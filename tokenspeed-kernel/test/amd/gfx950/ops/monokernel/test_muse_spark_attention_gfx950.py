@@ -72,7 +72,17 @@ def attention_kernel(
     task, active = schedule.stage_task(PLAN, "attn")
     if active:
         attention.attn_stage(
-            mb, task, seq_len, table, k_cache, v_cache, SPLITS, WINDOW, "attn"
+            mb,
+            task,
+            seq_len,
+            table,
+            k_cache,
+            v_cache,
+            cos_sin,
+            ROPE,
+            SPLITS,
+            WINDOW,
+            "attn",
         )
     task, active = schedule.stage_task(PLAN, "merge")
     if active:
