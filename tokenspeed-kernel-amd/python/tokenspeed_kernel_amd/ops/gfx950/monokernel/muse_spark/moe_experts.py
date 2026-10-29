@@ -27,22 +27,23 @@ CDNA4-swizzled E8M0 scales, as ``decode_stage1`` / ``decode_stage2`` read
 them): a second copy of every expert would not fit.
 
 * ex1, 256 tasks: pick ``k``, 128 of the 1024 interleaved gate / up columns,
-  a quarter of K. A task issues its 64 KiB of weights once ``route`` names
-  the expert, then polls the whole pooled row, applies the pre-expert RMS
-  norm, and quantizes its K quarter to MXFP4 (the regular path's "even"
-  rule) in LDS. It publishes the FP32 partial sums.
+  a quarter of K (64 KiB of weights). A task polls the whole pooled row,
+  applies the pre-expert RMS norm, and quantizes its K quarter to MXFP4 (the
+  regular path's "even" rule) in LDS. It publishes the FP32 partial sums.
 * act, 64 tasks: the 4 partials in K order, SwiGLU (``silu(gate) up``),
   then the regular path's BF16 rounding and MXFP4 requantization (2 groups
   of 32), published in ``inter``.
-* ex2, 128 tasks: pick ``k``, 256 of the 4096 output columns (two blocks of
-  128 with one owner rank) over the rank's 512 intermediate values (64 KiB).
-  The BF16 partial goes to the rank that owns those columns (``rr``), which
-  sums the 8 ranks' partials.
+* ex2, 256 tasks: pick ``k``, 128 of the 4096 output columns over the rank's
+  512 intermediate values (32 KiB). The BF16 partial goes to the rank that
+  owns those columns (``rr``), which sums the 8 ranks' partials.
 
-A CTA with an ex2 task issues its w2 loads (:func:`ex2_issue`) before its
-ex1 task, once routing names the experts: both weight streams start then,
-not one after the other. Expert weights cannot load earlier: routing picks
-them.
+Expert weights cannot load before routing picks the experts. So that both
+weight streams start then, and every CTA reads the same 96 KiB, a CTA runs
+its ex1 and ex2 tasks in parts: :func:`ex1_prep` (the pooled row is ready
+before routing), then :func:`ex1_issue` and :func:`ex2_issue`, then
+:func:`ex1_finish`, and :func:`ex2_finish` at ex2's place in the plan. The
+prep polls before the loads are issued: a poll waits for every earlier load
+of its wave (``vmcnt`` counts in order).
 """
 
 from __future__ import annotations
@@ -73,8 +74,8 @@ NB1 = gl.constexpr(8)  # W13_N // BLOCK_N
 NB2 = gl.constexpr(32)  # POOLED // BLOCK_N
 EX1_TASKS = gl.constexpr(256)  # TOP_K * NB1 * KSPLIT
 ACT_TASKS = gl.constexpr(64)  # TOP_K * NB1
-EX2_BLOCKS = gl.constexpr(2)  # 128-column blocks of an ex2 task
-EX2_TASKS = gl.constexpr(128)  # TOP_K * NB2 // EX2_BLOCKS
+EX2_BLOCKS = gl.constexpr(1)  # 128-column blocks of an ex2 task
+EX2_TASKS = gl.constexpr(256)  # TOP_K * NB2 // EX2_BLOCKS
 OWNED_OUT = gl.constexpr(512)  # output columns a rank reduces: POOLED / WORLD
 INTER_WORDS = gl.constexpr(72)  # a pick's MXFP4 intermediate: 64 words + 8 scale words
 PRE_EPS = gl.constexpr(1e-5)
@@ -191,50 +192,27 @@ def _stage_a(packed, scales):
 
 
 @gluon.jit
-def ex1_stage(
-    mb,
-    task,
-    w13,
-    w13s,
-    stride_we,
-    stride_se,
-    stride_slin,
-    stride_snb,
-    pre_gain,
-    STAGE: gl.constexpr,
-):
-    """Ex1 task ``task`` = (pick, column block, K quarter).
+def ex1_prep(mb, task, active, pre_gain, STAGE: gl.constexpr):
+    """The A operand of ex1 task ``task``: poll the whole pooled row (the
+    norm needs every value), apply the pre-expert RMS norm, and quantize the
+    task's K quarter to MXFP4 in LDS. Returns the LDS (values, scales).
+
+    Every CTA calls it (Gluon cannot carry values out of a branch); an
+    inactive CTA (``active`` false) stamps nothing.
 
     Args:
-        w13, w13s: The rank's preprocessed w13 bytes ``[256, 2048, 1024]`` and
-            scales (as ``decode_stage1`` takes them), with their strides.
         pre_gain: FP32 ``bf16(w + 1)`` of the pre-expert norm ``[4096]``.
     """
-    mb.stamp(STAGE, trace.START)
-    pick = task // (NB1 * KSPLIT)
-    blk = (task // KSPLIT) % NB1
+    if active:
+        mb.stamp(STAGE, trace.START)
     ks = task % KSPLIT
-    expert = _expert(mb, pick)
-    tiles = _load_b(
-        w13,
-        w13s,
-        expert,
-        stride_we,
-        stride_se,
-        stride_slin,
-        stride_snb,
-        blk * BLOCK_N,
-        ks * (K_SLICE // 128),
-        K_SLICE // 128,
-        W13_N,
-    )
-    # The whole pooled row: the norm needs every value; quarter ks feeds A.
     nw: gl.constexpr = gl.num_warps()
     ql: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [1, nw], [1, 0])
     q = gl.arange(0, KSPLIT, gl.SliceLayout(1, ql))
     j = gl.arange(0, K_SLICE // 2, gl.SliceLayout(0, ql))
     (got,) = mb.poll_many(("cg",), (q[:, None] * (K_SLICE // 2) + j[None, :],))
-    mb.stamp(STAGE, trace.READY)
+    if active:
+        mb.stamp(STAGE, trace.READY)
     lo = (got << 16).to(gl.float32, bitcast=True)
     hi = (got & -65536).to(gl.float32, bitcast=True)
     inv = gl.rsqrt(gl.sum(gl.sum(lo * lo + hi * hi, axis=1), axis=0) / POOLED + PRE_EPS)
@@ -246,15 +224,52 @@ def ex1_stage(
     hi = hi * inv * gl.load(pre_gain + c + 1)
     x = gl.reshape(gl.join(lo, hi), [K_SLICE])
     x16 = (
-        gl.zeros(
-            [M_DUP, 1], gl.float32, gl.BlockedLayout([1, 1], [1, 64], [1, nw], [1, 0])
-        )
-        + gl.convert_layout(
-            x, gl.SliceLayout(0, gl.BlockedLayout([1, 1], [1, 64], [1, nw], [1, 0]))
-        )[None, :]
+        gl.zeros([M_DUP, 1], gl.float32, ql)
+        + gl.convert_layout(x, gl.SliceLayout(0, ql))[None, :]
     )
     packed, scales = _mxfp4_quantize_tile(x16)
-    p_smem, s_smem = _stage_a(packed, scales)
+    return _stage_a(packed, scales)
+
+
+@gluon.jit
+def ex1_issue(
+    mb, task, active, w13, w13s, stride_we, stride_se, stride_slin, stride_snb
+):
+    """Issue ex1 task ``task``'s w13 loads (pick, column block, K quarter);
+    nothing loads when ``active`` is false.
+
+    Args:
+        w13, w13s: The rank's preprocessed w13 bytes ``[256, 2048, 1024]`` and
+            scales (as ``decode_stage1`` takes them), with their strides.
+    """
+    pick = task // (NB1 * KSPLIT)
+    blk = (task // KSPLIT) % NB1
+    ks = task % KSPLIT
+    expert = _expert(mb, pick)
+    return _load_b(
+        w13,
+        w13s,
+        expert,
+        stride_we,
+        stride_se,
+        stride_slin,
+        stride_snb,
+        blk * BLOCK_N,
+        ks * (K_SLICE // 128),
+        K_SLICE // 128,
+        W13_N,
+        active,
+    )
+
+
+@gluon.jit
+def ex1_finish(mb, task, a, tiles, STAGE: gl.constexpr):
+    """Ex1 task ``task`` after :func:`ex1_prep` (``a``) and :func:`ex1_issue`
+    (``tiles``): multiply and publish the FP32 partial sums."""
+    pick = task // (NB1 * KSPLIT)
+    blk = (task // KSPLIT) % NB1
+    ks = task % KSPLIT
+    p_smem, s_smem = a
     acc = _mma_row(p_smem, s_smem, tiles)
     mb.stamp(STAGE, trace.COMPUTED)
     n = gl.arange(0, BLOCK_N, acc.type.layout)
@@ -347,15 +362,17 @@ def ex2_issue(
     stride_snb,
     STAGE: gl.constexpr,
 ):
-    """Issue ex2 task ``task``'s w2 loads (pick, two column blocks); nothing
-    loads when ``active`` is false. Every CTA calls it (Gluon cannot carry
-    the tiles out of a branch); :func:`ex2_finish` uses them.
+    """Issue ex2 task ``task``'s w2 loads (pick, column block); nothing
+    loads (and nothing stamps) when ``active`` is false. Every CTA calls it
+    (Gluon cannot carry the tiles out of a branch); :func:`ex2_finish` uses
+    them.
 
     Args:
         w2, w2s: The rank's preprocessed w2 bytes ``[256, 256, 4096]`` and
             scales, with their strides.
     """
-    mb.stamp(STAGE, trace.START)
+    if active:
+        mb.stamp(STAGE, trace.START)
     TASKS_PER_PICK: gl.constexpr = NB2 // EX2_BLOCKS
     pick = task // TASKS_PER_PICK
     blk0 = (task % TASKS_PER_PICK) * EX2_BLOCKS
