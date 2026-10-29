@@ -20,13 +20,15 @@
 
 """Attention of one Muse Spark rank: 16 q heads, 2 KV heads, one token row.
 
-* head, 18 tasks: q head ``t`` (``t < 16``) or k head ``t - 16``. The per-head
-  RMS norm in FP32 (q gain 5.473, k gain 1), then interleaved RoPE (GPT-J
-  pairs) on sliding layers, then one BF16 rounding: published in ``qn`` /
-  ``kn``. A k task also writes the rotated k and the raw v to the KV cache
-  slot of the token. Attention in this launch takes them from the mailbox:
-  a CTA never reads another CTA's plain store of the same launch.
-* attn, ``2 * SPLITS`` tasks: KV head ``g``, split ``s``. The attended keys
+* head, 2 tasks: KV head ``g``. The per-head RMS norm of k in FP32 (gain
+  1), then interleaved RoPE (GPT-J pairs) on sliding layers, then one BF16
+  rounding; the rotated k and the raw v go to the KV cache slot of the
+  token.
+* attn, ``2 * SPLITS`` tasks: KV head ``g``, split ``s``. A task forms the
+  rotated q of its 8 q heads (q gain 5.473) and the token's k itself, as
+  head does, from the projection: no hand-off between them. It takes the
+  token's k and v from there, not from the cache: a CTA never reads
+  another CTA's plain store of the same launch. The attended keys
   are ``max(0, L - WINDOW + 1) .. L`` (all of ``0 .. L`` on a full layer);
   split ``s`` takes ``ceil(n / SPLITS)`` of them, in chunks of 128 with an
   online base-2 softmax. It publishes FP32 ``acc / l`` and the LSE of the 8 q
@@ -60,15 +62,13 @@ EPS = gl.constexpr(1e-5)
 Q_GAIN = gl.constexpr(5.473006248474121)  # qk_scale_factor as an FP32 norm gain
 # exp2 softmax of (q . k) / sqrt(64).
 QK_SCALE = gl.constexpr(0.125 * 1.4426950408889634)
-HEAD_TASKS = gl.constexpr(Q_HEADS + KV_HEADS)
+HEAD_TASKS = KV_HEADS
 MERGE_TASKS = Q_HEADS
 
 
 def regions(splits: int) -> tuple[tuple[str, int], ...]:
     heads, kv, group, head = int(Q_HEADS), int(KV_HEADS), int(GROUP), int(HEAD)
     return (
-        ("qn", heads * head // 2),  # BF16 pairs
-        ("kn", kv * head // 2),
         ("part", splits * kv * group * head),  # FP32
         ("lse", splits * heads),  # FP32
         ("z", heads * head // 2),  # BF16 pairs
@@ -78,12 +78,12 @@ def regions(splits: int) -> tuple[tuple[str, int], ...]:
 def stages(bases: dict[str, int], splits: int) -> tuple[Stage, ...]:
     head, attn, merge = placement(bases, ("head", "attn", "merge"))
     return (
-        Stage("head", int(HEAD_TASKS), head, reads=("qkvg",), writes=("qn", "kn")),
+        Stage("head", int(HEAD_TASKS), head, reads=("qkvg",)),
         Stage(
             "attn",
             int(KV_HEADS) * splits,
             attn,
-            reads=("qn", "kn", "qkvg"),
+            reads=("qkvg",),
             writes=("part", "lse"),
         ),
         Stage(
@@ -118,13 +118,6 @@ def _norm_rope(lo, hi, gain, cos_sin, pos, j, ROPE: gl.constexpr):
 
 
 @gluon.jit
-def _pack(lo, hi):
-    return (lo.to(gl.int16, bitcast=True).to(gl.int32) & 0xFFFF) | (
-        hi.to(gl.int16, bitcast=True).to(gl.int32) << 16
-    )
-
-
-@gluon.jit
 def head_stage(
     mb,
     task,
@@ -136,7 +129,7 @@ def head_stage(
     ROPE: gl.constexpr,
     STAGE: gl.constexpr,
 ):
-    """Head task ``task``: q head ``task``, or k head ``task - 16``.
+    """Head task ``task``: k head ``task`` to the KV cache.
 
     Args:
         seq_len: int32 ``L + 1`` for the token at position ``L``.
@@ -150,29 +143,21 @@ def head_stage(
     j = gl.arange(0, HEAD // 2, lanes)
     pos = gl.load(seq_len) - 1
     slot_at = gl.load(slot).to(gl.int64) * KV_STRIDE + 2 * j
-    if task < Q_HEADS:
-        (words,) = mb.poll_many(("qkvg",), (task * (HEAD // 2) + j,))
-        mb.stamp(STAGE, trace.READY)
-        lo, hi = _halves(words)
-        lo, hi = _norm_rope(lo, hi, Q_GAIN, cos_sin, pos, j, ROPE)
-        mb.put("qn", task * (HEAD // 2) + j, _pack(lo, hi))
-    else:
-        g = task - Q_HEADS
-        kw, vw = mb.poll_many(
-            ("qkvg", "qkvg"),
-            ((K_ROW + g * HEAD) // 2 + j, (V_ROW + g * HEAD) // 2 + j),
-        )
-        mb.stamp(STAGE, trace.READY)
-        lo, hi = _halves(kw)
-        lo, hi = _norm_rope(lo, hi, 1.0, cos_sin, pos, j, ROPE)
-        mb.put("kn", g * (HEAD // 2) + j, _pack(lo, hi))
-        # The cache keeps the rotated k and the raw v.
-        at = slot_at + g * HEAD
-        gl.store(k_cache + at, lo)
-        gl.store(k_cache + at + 1, hi)
-        vlo, vhi = _halves(vw)
-        gl.store(v_cache + at, vlo.to(gl.bfloat16))
-        gl.store(v_cache + at + 1, vhi.to(gl.bfloat16))
+    g = task
+    kw, vw = mb.poll_many(
+        ("qkvg", "qkvg"),
+        ((K_ROW + g * HEAD) // 2 + j, (V_ROW + g * HEAD) // 2 + j),
+    )
+    mb.stamp(STAGE, trace.READY)
+    lo, hi = _halves(kw)
+    lo, hi = _norm_rope(lo, hi, 1.0, cos_sin, pos, j, ROPE)
+    # The cache keeps the rotated k and the raw v.
+    at = slot_at + g * HEAD
+    gl.store(k_cache + at, lo)
+    gl.store(k_cache + at + 1, hi)
+    vlo, vhi = _halves(vw)
+    gl.store(v_cache + at, vlo.to(gl.bfloat16))
+    gl.store(v_cache + at + 1, vhi.to(gl.bfloat16))
     mb.stamp(STAGE, trace.END)
 
 
@@ -235,6 +220,8 @@ def attn_stage(
     table,
     k_cache,
     v_cache,
+    cos_sin,
+    ROPE: gl.constexpr,
     SPLITS: gl.constexpr,
     WINDOW: gl.constexpr,
     STAGE: gl.constexpr,
@@ -243,6 +230,7 @@ def attn_stage(
 
     Args:
         table: int32 page table of the row (``PAGE`` tokens a page).
+        cos_sin, ROPE: As head_stage takes them.
         WINDOW: Attended positions of a sliding layer, 0 on a full layer.
     """
     gl.static_assert(schedule.rows(mb.plan) == 1, "attention serves one row")
@@ -275,22 +263,45 @@ def attn_stage(
         table, k_cache, v_cache, g, lo, hi, L, dk, dv, k_layout, v_load
     )
 
-    # q of the 8 heads (rows 8 .. 15 zero), and the token's k and v.
-    ql: gl.constexpr = gl.BlockedLayout([1, 2], [2, 32], [nw, 1], [1, 0])
+    # q of the 8 heads (rows 8 .. 15 zero), and the token's k and v. A
+    # thread holds one pair, 32 lanes a head: the norm sums in head_stage's
+    # order.
+    ql: gl.constexpr = gl.BlockedLayout([1, 1], [2, 32], [nw, 1], [1, 0])
     qr = gl.arange(0, 16, gl.SliceLayout(1, ql))[:, None]
     qp = gl.arange(0, HEAD // 2, gl.SliceLayout(0, ql))[None, :]
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
     tp = gl.arange(0, HEAD // 2, lanes)
+    if ROPE:
+        # The RoPE rows load before the poll: a load after a poll would
+        # start only when the poll returns.
+        cq = gl.load(cos_sin + L * HEAD + qp)
+        sq = gl.load(cos_sin + L * HEAD + HEAD // 2 + qp)
+        ck = gl.load(cos_sin + L * HEAD + tp)
+        sk = gl.load(cos_sin + L * HEAD + HEAD // 2 + tp)
     got_q, got_k, got_v = mb.poll_many(
-        ("qn", "kn", "qkvg"),
+        ("qkvg", "qkvg", "qkvg"),
         (
             (g * GROUP + gl.minimum(qr, GROUP - 1)) * (HEAD // 2) + qp,
-            g * (HEAD // 2) + tp,
+            (K_ROW + g * HEAD) // 2 + tp,
             (V_ROW + g * HEAD) // 2 + tp,
         ),
     )
     mb.stamp(STAGE, trace.READY)
     q_lo, q_hi = _halves(got_q)
+    inv_q = gl.rsqrt(gl.sum(q_lo * q_lo + q_hi * q_hi, axis=1) / HEAD + EPS)[:, None]
+    q_lo = q_lo * inv_q * Q_GAIN
+    q_hi = q_hi * inv_q * Q_GAIN
+    k_lo, k_hi = _halves(got_k)
+    inv_k = gl.rsqrt(gl.sum(k_lo * k_lo + k_hi * k_hi, axis=0) / HEAD + EPS)
+    k_lo = k_lo * inv_k * 1.0
+    k_hi = k_hi * inv_k * 1.0
+    if ROPE:
+        q_lo, q_hi = gl.fma(q_lo, cq, -(q_hi * sq)), gl.fma(q_hi, cq, q_lo * sq)
+        k_lo, k_hi = gl.fma(k_lo, ck, -(k_hi * sk)), gl.fma(k_hi, ck, k_lo * sk)
+    q_lo = q_lo.to(gl.bfloat16).to(gl.float32)
+    q_hi = q_hi.to(gl.bfloat16).to(gl.float32)
+    k_lo = k_lo.to(gl.bfloat16).to(gl.float32)
+    k_hi = k_hi.to(gl.bfloat16).to(gl.float32)
     q = gl.reshape(gl.join(q_lo, q_hi), [16, HEAD])
     q = gl.where(
         gl.arange(0, 16, gl.SliceLayout(1, q.type.layout))[:, None] < GROUP, q, 0.0
@@ -299,7 +310,6 @@ def attn_stage(
     line: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
     cur_k = gl.allocate_shared_memory(gl.bfloat16, [HEAD], line)
     cur_v = gl.allocate_shared_memory(gl.bfloat16, [HEAD], line)
-    k_lo, k_hi = _halves(got_k)
     v_lo, v_hi = _halves(got_v)
     cur_k.store(gl.reshape(gl.join(k_lo, k_hi), [HEAD]).to(gl.bfloat16))
     cur_v.store(gl.reshape(gl.join(v_lo, v_hi), [HEAD]).to(gl.bfloat16))
