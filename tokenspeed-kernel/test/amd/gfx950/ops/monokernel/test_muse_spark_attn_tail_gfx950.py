@@ -114,11 +114,10 @@ def _reference(launch: int):
         z, w = _rank_inputs(r, launch)
         b = b + (z.float() @ w.float().T).to(torch.bfloat16).float()
     b = b.to(torch.bfloat16).float()
-    b = b * torch.rsqrt(b.pow(2).mean() + 1e-8)
     h, alpha, beta, pre_gain = _shared_inputs(launch)
-    hp = beta * b + alpha * h
+    hp = beta * b * torch.rsqrt(b.pow(2).mean() + 1e-8) + alpha * h
     u = hp * torch.rsqrt(hp.pow(2).mean() + 1e-5) * pre_gain
-    return hp, u
+    return b, hp, u
 
 
 def _worker(rank: int, port: int) -> None:
@@ -161,7 +160,12 @@ def _worker(rank: int, port: int) -> None:
                 num_warps=8,
             )
             torch.cuda.synchronize()
-            want_hp, want_u = _reference(k)
+            want_b, want_hp, want_u = _reference(k)
+            # The router's input: the reduced, BF16-rounded o_proj columns.
+            b = payloads(scratch, plan, "bq", OWNED, launch_tag(step, 0))
+            torch.testing.assert_close(
+                b.view(torch.float32).cpu(), want_b[own], rtol=2**-7, atol=1e-3
+            )
             hp = payloads(scratch, plan, "hp", OWNED, launch_tag(step, 0)).view(
                 torch.float32
             )

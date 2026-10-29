@@ -28,18 +28,21 @@ output projection (a reduce-scatter).
   (BF16 ``[8192, 1024]``, 128 KiB a task) of the gated head-norm output
   ``z``, rounded to BF16 like the regular path's partial. A task puts its
   columns into the owner rank's ``red`` slot of this rank.
-* tail1, tail2, tail3, 8 tasks of 128 owned columns on the same CTAs (each
-  task keeps its values in registers from one stage to the next):
+* tail1, tail2, 8 tasks of 128 owned columns on the same CTAs (each task
+  keeps its values in registers from one stage to the next):
 
-  - tail1 sums the 8 ranks' partials in rank order, rounds to BF16 (``b``),
-    and puts ``sum b^2`` of its columns into every rank's ``ss1``.
-  - tail2: ``b rsqrt(mean(b^2) + 1e-8)`` (the weightless post-attention
-    norm over all 8192 columns), then the residual gate ``h' = beta b +
-    alpha h``, published in ``hp``; puts ``sum h'^2``.
-  - tail3: ``u = h' rsqrt(mean(h'^2) + 1e-5) bf16(w + 1)`` (the pre-FFN
-    norm), published as BF16 in every rank's ``xin`` (the MoE input, which
-    the pooler reads whole). The router does not wait for it: it reads
-    ``hp`` and ``ss2`` (see moe_route).
+  - tail1 sums the 8 ranks' partials in rank order and rounds to BF16
+    (``b``). It puts four partial sums of its columns into every rank's
+    ``ss1``: of ``b^2``, ``(beta b)^2``, ``(alpha h)(beta b)`` and ``(alpha
+    h)^2``.
+  - tail2, after one exchange: ``inv = rsqrt(mean(b^2) + 1e-8)`` (the
+    weightless post-attention norm over all 8192 columns), the residual
+    gate ``h' = beta b inv + alpha h`` (published in ``hp``), and ``u = h'
+    rsqrt(mean(h'^2) + 1e-5) bf16(w + 1)`` (the pre-FFN norm), whose sum of
+    squares is the expansion of ``(beta b inv + alpha h)^2`` in the four
+    sums (:func:`norm_scales`). ``u`` goes as BF16 into every rank's
+    ``xin`` (the MoE input, which the pooler reads whole). The router does
+    not wait for it: it reads ``hp`` and ``ss1`` (see moe_route).
 """
 
 from __future__ import annotations
@@ -54,19 +57,20 @@ OPROJ_TASKS = gl.constexpr(128)
 OPROJ_COLS = gl.constexpr(64)
 TAIL_TASKS = gl.constexpr(8)
 TAIL_COLS = gl.constexpr(128)
+SUMS = gl.constexpr(4)  # partial sums a tail task puts (see tail_stages)
 POST_EPS = gl.constexpr(1e-8)
 PRE_EPS = gl.constexpr(1e-5)
 
-PEERS = ("red", "ss1", "ss2", "xin")
+PEERS = ("red", "ss1", "xin")
 
 
 def regions() -> tuple[tuple[str, int], ...]:
     world, owned, tasks = int(WORLD), int(OWNED), int(TAIL_TASKS)
     return (
         ("red", world * owned // 2),  # BF16 pairs [source rank][owned column]
-        ("ss1", world * tasks),  # FP32 partial sums of squares [rank][task]
-        ("ss2", world * tasks),
+        ("ss1", world * tasks * int(SUMS)),  # FP32 partial sums [rank][task][sum]
         ("hp", owned),  # FP32 owned slice of the residual after attention (h')
+        ("bq", owned),  # FP32 owned slice of the reduced, BF16-rounded o_proj (b)
         ("xin", world * owned // 2),  # BF16 pairs of the whole MoE input, rank-major
     )
 
@@ -76,9 +80,8 @@ def stages(bases: dict[str, int]) -> tuple[Stage, ...]:
     tasks = int(TAIL_TASKS)
     return (
         Stage("oproj", int(OPROJ_TASKS), oproj, reads=("z",), writes=("red",)),
-        Stage("tail1", tasks, tail, reads=("red",), writes=("ss1",)),
-        Stage("tail2", tasks, tail, reads=("ss1",), writes=("ss2", "hp")),
-        Stage("tail3", tasks, tail, reads=("ss2",), writes=("xin",)),
+        Stage("tail1", tasks, tail, reads=("red",), writes=("bq", "ss1")),
+        Stage("tail2", tasks, tail, reads=("ss1",), writes=("hp", "xin")),
     )
 
 
@@ -121,29 +124,41 @@ def oproj_stage(mb, task, w, RANK: gl.constexpr, STAGE: gl.constexpr):
     mb.stamp(STAGE, trace.END)
 
 
-@gluon.jit
-def _put_all(mb, region: gl.constexpr, index, value):
-    """Put the scalar ``value`` at ``index`` of every rank's ``region``."""
-    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
-    one = gl.arange(0, 1, lanes)
-    word = (gl.zeros([1], gl.float32, lanes) + value).to(gl.int32, bitcast=True)
-    for p in gl.static_range(WORLD):
-        mb.put_peer(region, p, index + one, word)
+@gluon.constexpr_function
+def sums_layout(num_warps):
+    """Layout of the ``[WORLD * TAIL_TASKS, SUMS]`` partial sums in ``ss1``."""
+    return gl.BlockedLayout([1, SUMS], [64, 1], [num_warps, 1], [1, 0])
 
 
 @gluon.jit
-def _total(mb, region: gl.constexpr):
-    """Sum of every rank's partials in ``region``, rank-major order."""
-    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
-    i = gl.arange(0, WORLD * TAIL_TASKS, lanes)
-    (got,) = mb.poll_many((region,), (i,))
-    return gl.sum(got.to(gl.float32, bitcast=True), axis=0)
+def sums_index(num_warps: gl.constexpr):
+    """The ``ss1`` pair index of every partial sum, in :func:`sums_layout`."""
+    sl: gl.constexpr = sums_layout(num_warps)
+    rt = gl.arange(0, WORLD * TAIL_TASKS, gl.SliceLayout(1, sl))[:, None]
+    q = gl.arange(0, SUMS, gl.SliceLayout(0, sl))[None, :]
+    return rt * SUMS + q
+
+
+@gluon.jit
+def norm_scales(got):
+    """The post-attention and pre-FFN norm scales ``(inv, inv2)`` from the
+    polled ``ss1`` pairs (:func:`sums_index`)."""
+    total = gl.sum(got.to(gl.float32, bitcast=True), axis=0)  # [SUMS]
+    q = gl.arange(0, SUMS, total.type.layout)
+    ss_b = gl.sum(gl.where(q == 0, total, 0.0), axis=0)
+    ss_bb = gl.sum(gl.where(q == 1, total, 0.0), axis=0)
+    ss_x = gl.sum(gl.where(q == 2, total, 0.0), axis=0)
+    ss_ah = gl.sum(gl.where(q == 3, total, 0.0), axis=0)
+    inv = gl.rsqrt(ss_b / HIDDEN + POST_EPS)
+    # The sum of h'^2 over all columns: inv^2 ss_bb + 2 inv ss_x + ss_ah.
+    ss_h = gl.maximum(inv * inv * ss_bb + 2.0 * inv * ss_x + ss_ah, 0.0)
+    return inv, gl.rsqrt(ss_h / HIDDEN + PRE_EPS)
 
 
 @gluon.jit
 def tail_stages(mb, task, h, alpha, beta, pre_gain, RANK: gl.constexpr):
-    """Tail tasks ``task`` of tail1, tail2 and tail3: owned columns
-    ``128 task ..`` (of the rank's 1024).
+    """Tail tasks ``task`` of tail1 and tail2: owned columns ``128 task ..``
+    (of the rank's 1024).
 
     Args:
         h: The rank's FP32 residual slice ``[1024]`` (the previous launch's).
@@ -178,28 +193,40 @@ def tail_stages(mb, task, h, alpha, beta, pre_gain, RANK: gl.constexpr):
         hi += gl.sum(gl.where(src[:, None] == p, hi_all, 0.0), axis=0)
     lo = lo.to(gl.bfloat16).to(gl.float32)
     hi = hi.to(gl.bfloat16).to(gl.float32)
-    _put_all(mb, "ss1", RANK * TAIL_TASKS + task, gl.sum(lo * lo + hi * hi, axis=0))
+    # The router needs only b (see moe_route): it does not wait for the norm.
+    mb.put("bq", c, lo.to(gl.int32, bitcast=True))
+    mb.put("bq", c + 1, hi.to(gl.int32, bitcast=True))
+    bb_lo = beta_lo * lo
+    bb_hi = beta_hi * hi
+    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
+    q = gl.arange(0, SUMS, lanes)
+    sums = gl.where(
+        q == 0,
+        gl.sum(lo * lo + hi * hi, axis=0),
+        gl.where(
+            q == 1,
+            gl.sum(bb_lo * bb_lo + bb_hi * bb_hi, axis=0),
+            gl.where(
+                q == 2,
+                gl.sum(ah_lo * bb_lo + ah_hi * bb_hi, axis=0),
+                gl.sum(ah_lo * ah_lo + ah_hi * ah_hi, axis=0),
+            ),
+        ),
+    )
+    word = gl.convert_layout(sums, lanes).to(gl.int32, bitcast=True)
+    for p in gl.static_range(WORLD):
+        mb.put_peer("ss1", p, (RANK * TAIL_TASKS + task) * SUMS + q, word)
     mb.stamp("tail1", trace.END)
 
     mb.stamp("tail2", trace.START)
-    inv = gl.rsqrt(_total(mb, "ss1") / HIDDEN + POST_EPS)
+    (got,) = mb.poll_many(("ss1",), (sums_index(nw),))
     mb.stamp("tail2", trace.READY)
+    inv, inv2 = norm_scales(got)
     hp_lo = gl.fma(beta_lo, lo * inv, ah_lo)
     hp_hi = gl.fma(beta_hi, hi * inv, ah_hi)
     # The MoE tail reads h' on other CTAs: through the mailbox, not memory.
     mb.put("hp", c, hp_lo.to(gl.int32, bitcast=True))
     mb.put("hp", c + 1, hp_hi.to(gl.int32, bitcast=True))
-    _put_all(
-        mb,
-        "ss2",
-        RANK * TAIL_TASKS + task,
-        gl.sum(hp_lo * hp_lo + hp_hi * hp_hi, axis=0),
-    )
-    mb.stamp("tail2", trace.END)
-
-    mb.stamp("tail3", trace.START)
-    inv2 = gl.rsqrt(_total(mb, "ss2") / HIDDEN + PRE_EPS)
-    mb.stamp("tail3", trace.READY)
     u_lo = hp_lo * inv2 * gain_lo
     u_hi = hp_hi * inv2 * gain_hi
     word = (u_lo.to(gl.bfloat16).to(gl.int16, bitcast=True).to(gl.int32) & 0xFFFF) | (
@@ -207,4 +234,4 @@ def tail_stages(mb, task, h, alpha, beta, pre_gain, RANK: gl.constexpr):
     )
     for p in gl.static_range(WORLD):
         mb.put_peer("xin", p, RANK * (OWNED // 2) + c // 2, word)
-    mb.stamp("tail3", trace.END)
+    mb.stamp("tail2", trace.END)
