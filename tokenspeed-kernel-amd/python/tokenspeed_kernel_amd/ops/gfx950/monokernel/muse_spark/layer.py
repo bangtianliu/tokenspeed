@@ -215,7 +215,9 @@ def gluon_muse_spark_layer_gfx950(
         attn_tail.tail_stages(mb, task, h_in, alpha1, beta1, pre_gain, RANK)
     task, active = schedule.stage_task(PLAN, "router")
     if active:
-        moe_route.router_stage(mb, task, router_w, pre_gain, RANK, "router")
+        moe_route.router_stage(
+            mb, task, router_w, pre_gain, h_in, alpha1, beta1, RANK, "router"
+        )
     task, active = schedule.stage_task(PLAN, "topk")
     if active:
         moe_route.topk_stage(mb, router_bias, "topk")
