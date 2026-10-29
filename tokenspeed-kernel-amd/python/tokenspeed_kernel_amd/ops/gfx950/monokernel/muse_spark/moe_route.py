@@ -85,7 +85,9 @@ def router_stage(mb, task, w, pre_gain, RANK: gl.constexpr, STAGE: gl.constexpr)
     """
     mb.stamp(STAGE, trace.START)
     nw: gl.constexpr = gl.num_warps()
-    wl: gl.constexpr = gl.BlockedLayout([1, 4], [1, 64], [nw, 1], [1, 0])
+    # The waves split the columns: each wave polls only its 128 values of
+    # h' (fewer polls of the same lines), and one sum crosses the waves.
+    wl: gl.constexpr = gl.BlockedLayout([1, 4], [2, 32], [1, nw], [1, 0])
     e = task * ROUTER_ROWS + gl.arange(0, ROUTER_ROWS, gl.SliceLayout(1, wl))
     k = gl.arange(0, OWNED, gl.SliceLayout(0, wl))
     weights = gl.load(w + e[:, None] * OWNED + k[None, :])
