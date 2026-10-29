@@ -229,11 +229,12 @@ def gluon_muse_spark_layer_gfx950(
     task2, active2 = schedule.stage_task(PLAN, "ex2")
     task2 = gl.where(active2, task2, 0)
     a1 = moe_experts.ex1_prep(mb, task1, active1, pre_exp_gain, "ex1")
+    e1, e2 = moe_experts.expert_ids(mb, task1, task2)
     loads1 = moe_experts.ex1_issue(
-        mb, task1, active1, w13, w13s, s13_we, s13_se, s13_lin, s13_nb
+        task1, active1, e1, w13, w13s, s13_we, s13_se, s13_lin, s13_nb
     )
     loads2 = moe_experts.ex2_issue(
-        mb, task2, active2, w2, w2s, s2_we, s2_se, s2_lin, s2_nb, "ex2"
+        mb, task2, active2, e2, w2, w2s, s2_we, s2_se, s2_lin, s2_nb, "ex2"
     )
     if active1:
         moe_experts.ex1_finish(mb, task1, a1, loads1, "ex1")
