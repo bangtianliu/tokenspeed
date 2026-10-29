@@ -63,7 +63,6 @@ def tail_kernel(
     bases,
     w,
     h,
-    h_out,
     alpha,
     beta,
     pre_gain,
@@ -77,7 +76,7 @@ def tail_kernel(
         attn_tail.oproj_stage(mb, task, w, RANK, "oproj")
     task, active = schedule.stage_task(PLAN, "tail1")
     if active:
-        attn_tail.tail_stages(mb, task, h, h_out, alpha, beta, pre_gain, RANK)
+        attn_tail.tail_stages(mb, task, h, alpha, beta, pre_gain, RANK)
 
 
 def _plan() -> Plan:
@@ -148,14 +147,12 @@ def _worker(rank: int, port: int) -> None:
             fill(
                 scratch, plan, "z", z.view(torch.int32).to(device), launch_tag(step, 0)
             )
-            h_out = torch.empty(OWNED, device=device)
             tail_kernel[(plan.grid,)](
                 scratch,
                 torch.full((1,), step, dtype=torch.int32, device=device),
                 group.bases,
                 bf16_tiles(w).to(device),
                 h[own].to(device),
-                h_out,
                 alpha[own].to(device),
                 beta[own].to(device),
                 pre_gain[own].to(device),
@@ -168,7 +165,10 @@ def _worker(rank: int, port: int) -> None:
                 torch.float32
             )
             want_hp, want_u = _reference(k)
-            torch.testing.assert_close(h_out.cpu(), want_hp[own], rtol=2**-7, atol=1e-3)
+            hp = payloads(scratch, plan, "hp", OWNED, launch_tag(step, 0)).view(
+                torch.float32
+            )
+            torch.testing.assert_close(hp.cpu(), want_hp[own], rtol=2**-7, atol=1e-3)
             torch.testing.assert_close(u.cpu(), want_u[own], rtol=2**-7, atol=1e-3)
             # Every rank holds the whole BF16 MoE input, rank-major.
             xin = payloads(
