@@ -214,6 +214,39 @@ def _with_extras(region, extra_regions):
 
 
 @gluon.jit
+def load_global_rows(x, row_stride, k0, KS: gl.constexpr, R: gl.constexpr):
+    """:func:`load_rows` of BF16 rows in global memory that an earlier launch
+    wrote (row ``r`` at ``x + r * row_stride``), values ``k0 .. k0 + KS - 1``.
+    ``row_stride`` and ``k0`` are even.
+
+    Returns:
+        ``x_smem [RP, KP, 32] bf16``, as :func:`load_rows`.
+    """
+    gl.static_assert(KS % 32 == 0)
+    KI: gl.constexpr = KS // 32
+    KP: gl.constexpr = triton.next_power_of_2(KI)
+    RP: gl.constexpr = triton.next_power_of_2(R)
+    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
+    p = gl.arange(0, RP * KP * 16, lanes)
+    row = gl.minimum(p // (KP * 16), R - 1)
+    at = p % (KP * 16)
+    words_ptr = x.to(gl.pointer_type(gl.int32), bitcast=True)
+    got = gl.load(
+        words_ptr + (row * row_stride + k0) // 2 + gl.minimum(at, KS // 2 - 1),
+        mask=at < KS // 2,
+        other=0,
+    )
+    words = gl.allocate_shared_memory(
+        gl.int32, [RP, KP, 16], mx._padded_rows([RP, KP, 16], KP * 16, 8)
+    )
+    words.store(gl.reshape(got, [RP, KP, 16]))
+    gl.barrier()
+    return words.reinterpret(
+        gl.bfloat16, [RP, KP, 32], mx._padded_rows([RP, KP, 32], KP * 32, 16)
+    )
+
+
+@gluon.jit
 def load_rows(
     mb,
     region: gl.constexpr,
