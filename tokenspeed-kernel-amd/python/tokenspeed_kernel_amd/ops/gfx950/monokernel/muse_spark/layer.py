@@ -69,7 +69,7 @@ BASES = {
     "pool": 192,
     "ex1": 0,
     "act": 0,
-    "ex2": 0,
+    "ex2": 128,
     "comb": 64,
     "unpool": 128,
     "fin": 200,
@@ -224,6 +224,21 @@ def gluon_muse_spark_layer_gfx950(
     task, active = schedule.stage_task(PLAN, "pool")
     if active:
         moe_pool.pool_stage(mb, task, w_pool, RANK, "pool")
+    # Both expert weight streams start once routing names the experts: a CTA
+    # with an ex2 task issues its w2 loads before its ex1 task.
+    task2, active2 = schedule.stage_task(PLAN, "ex2")
+    loads2 = moe_experts.ex2_issue(
+        mb,
+        gl.where(active2, task2, 0),
+        active2,
+        w2,
+        w2s,
+        s2_we,
+        s2_se,
+        s2_lin,
+        s2_nb,
+        "ex2",
+    )
     task, active = schedule.stage_task(PLAN, "ex1")
     if active:
         moe_experts.ex1_stage(
@@ -232,11 +247,8 @@ def gluon_muse_spark_layer_gfx950(
     task, active = schedule.stage_task(PLAN, "act")
     if active:
         moe_experts.act_stage(mb, task, "act")
-    task, active = schedule.stage_task(PLAN, "ex2")
-    if active:
-        moe_experts.ex2_stage(
-            mb, task, w2, w2s, s2_we, s2_se, s2_lin, s2_nb, RANK, "ex2"
-        )
+    if active2:
+        moe_experts.ex2_finish(mb, task2, loads2, RANK, "ex2")
     task, active = schedule.stage_task(PLAN, "comb1")
     if active:
         moe_tail.comb_stages(mb, task, pen_gain, RANK)

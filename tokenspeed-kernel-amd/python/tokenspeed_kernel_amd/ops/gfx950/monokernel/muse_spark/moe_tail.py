@@ -27,7 +27,8 @@ columns ``1024 r ..`` of the residual (one row).
   sum of the 8 ranks' BF16 route partials, rounded to BF16, times the
   post-expert gain; then each route's RMS norm over all 4096 columns (one
   exchange of partial sums of squares per route), and the weighted sum of
-  the 8 routes in pick order, rounded to BF16, put into every rank's ``cmb``.
+  the 8 routes (a tree within a wave, not the regular path's pick order),
+  rounded to BF16, put into every rank's ``cmb``.
 * unpool, 64 tasks of 16 owned hidden columns: the post-expert projection
   (BF16 ``[1024, 4096]``, 128 KiB a task) of the whole combined row.
 * fin1..fin3, 8 tasks of 128 owned hidden columns (same CTAs): the post-FFN
@@ -113,7 +114,11 @@ def comb_stages(mb, task, pen_gain, RANK: gl.constexpr):
     """
     mb.stamp("comb1", trace.START)
     nw: gl.constexpr = gl.num_warps()
-    L3: gl.constexpr = gl.BlockedLayout([1, 1, 1], [1, 2, 32], [1, nw, 1], [2, 1, 0])
+    gl.static_assert(nw == 8, "comb lays out 8 waves")
+    # [source, route, pair]: the 8 source ranks in a thread's registers, so
+    # the rank-order sum stays in a thread; the routes over 2 lanes and 4
+    # waves; the pairs over 32 lanes (2 waves repeat them).
+    L3: gl.constexpr = gl.BlockedLayout([WORLD, 1, 1], [1, 2, 32], [1, 4, 2], [2, 1, 0])
     src = gl.arange(0, WORLD, gl.SliceLayout(1, gl.SliceLayout(2, L3)))[:, None, None]
     k = gl.arange(0, TOP_K, gl.SliceLayout(0, gl.SliceLayout(2, L3)))[None, :, None]
     j = gl.arange(0, COMB_COLS // 2, gl.SliceLayout(0, gl.SliceLayout(1, L3)))[
@@ -126,6 +131,7 @@ def comb_stages(mb, task, pen_gain, RANK: gl.constexpr):
     lo_all = (got << 16).to(gl.float32, bitcast=True)
     hi_all = (got & -65536).to(gl.float32, bitcast=True)
     L2: gl.constexpr = gl.SliceLayout(0, L3)
+    # The rank order of the regular path's reduction: 0, then 1, ...
     lo = gl.zeros([TOP_K, COMB_COLS // 2], gl.float32, L2)
     hi = gl.zeros([TOP_K, COMB_COLS // 2], gl.float32, L2)
     for p in gl.static_range(WORLD):
@@ -154,13 +160,8 @@ def comb_stages(mb, task, pen_gain, RANK: gl.constexpr):
     scale = gl.convert_layout(inv, gl.SliceLayout(1, L2)) * gl.convert_layout(
         got_w.to(gl.float32, bitcast=True), gl.SliceLayout(1, L2)
     )
-    out_lo = gl.zeros([COMB_COLS // 2], gl.float32, gl.SliceLayout(0, L2))
-    out_hi = gl.zeros([COMB_COLS // 2], gl.float32, gl.SliceLayout(0, L2))
-    for r in gl.static_range(TOP_K):
-        on = kk[:, None] == r
-        s_r = gl.sum(gl.where(kk == r, scale, 0.0), axis=0)
-        out_lo += gl.sum(gl.where(on, lo, 0.0), axis=0) * s_r
-        out_hi += gl.sum(gl.where(on, hi, 0.0), axis=0) * s_r
+    out_lo = gl.sum(lo * scale[:, None], axis=0)
+    out_hi = gl.sum(hi * scale[:, None], axis=0)
     word = _bf16_word(out_lo, out_hi)
     for p in gl.static_range(WORLD):
         mb.put_peer("cmb", p, (RANK * OWNED_OUT + task * COMB_COLS) // 2 + jj, word)

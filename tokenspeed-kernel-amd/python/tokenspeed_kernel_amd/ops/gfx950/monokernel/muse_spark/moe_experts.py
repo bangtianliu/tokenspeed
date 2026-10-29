@@ -34,9 +34,15 @@ them): a second copy of every expert would not fit.
 * act, 64 tasks: the 4 partials in K order, SwiGLU (``silu(gate) up``),
   then the regular path's BF16 rounding and MXFP4 requantization (2 groups
   of 32), published in ``inter``.
-* ex2, 256 tasks: pick ``k``, 128 of the 4096 output columns over the
-  rank's 512 intermediate values (32 KiB). The BF16 partial goes to the rank
-  that owns those columns (``rr``), which sums the 8 ranks' partials.
+* ex2, 128 tasks: pick ``k``, 256 of the 4096 output columns (two blocks of
+  128 with one owner rank) over the rank's 512 intermediate values (64 KiB).
+  The BF16 partial goes to the rank that owns those columns (``rr``), which
+  sums the 8 ranks' partials.
+
+A CTA with an ex2 task issues its w2 loads (:func:`ex2_issue`) before its
+ex1 task, once routing names the experts: both weight streams start then,
+not one after the other. Expert weights cannot load earlier: routing picks
+them.
 """
 
 from __future__ import annotations
@@ -67,7 +73,8 @@ NB1 = gl.constexpr(8)  # W13_N // BLOCK_N
 NB2 = gl.constexpr(32)  # POOLED // BLOCK_N
 EX1_TASKS = gl.constexpr(256)  # TOP_K * NB1 * KSPLIT
 ACT_TASKS = gl.constexpr(64)  # TOP_K * NB1
-EX2_TASKS = gl.constexpr(256)  # TOP_K * NB2
+EX2_BLOCKS = gl.constexpr(2)  # 128-column blocks of an ex2 task
+EX2_TASKS = gl.constexpr(128)  # TOP_K * NB2 // EX2_BLOCKS
 OWNED_OUT = gl.constexpr(512)  # output columns a rank reduces: POOLED / WORLD
 INTER_WORDS = gl.constexpr(72)  # a pick's MXFP4 intermediate: 64 words + 8 scale words
 PRE_EPS = gl.constexpr(1e-5)
@@ -117,9 +124,11 @@ def _load_b(
     kt0,
     KT: gl.constexpr,
     N_PHYS: gl.constexpr,
+    active=True,
 ):
     """Issue the B tiles of K tiles ``kt0 ..`` (128 values each) of columns
-    ``n0 .. n0 + 127``: ``KT`` (weights, scales) pairs."""
+    ``n0 .. n0 + 127``: ``KT`` (weights, scales) pairs. Nothing loads when
+    ``active`` is false."""
     layouts: gl.constexpr = _direct_mxfp4_mfma_layouts(
         M_DUP, BLOCK_N, 4, gl.num_warps()
     )
@@ -139,12 +148,14 @@ def _load_b(
             _gluon_dot_preshuffled_w_offset(w_off, kt * 64 + bk, bn, N_PHYS).to(
                 gl.int32
             ),
+            mask=(bk >= 0) & active,
         )
         s = gl.amd.cdna4.buffer_load(
             ws,
             _cdna4_swizzled_mxfp4_scale_offset(
                 s_off, sn, kt * 4 + sk, stride_slin, stride_snb
             ).to(gl.int32),
+            mask=(sk >= 0) & active,
         )
         tiles += ((b, s),)
     return tiles
@@ -324,41 +335,59 @@ def act_stage(mb, task, STAGE: gl.constexpr):
 
 
 @gluon.jit
-def ex2_stage(
+def ex2_issue(
     mb,
     task,
+    active,
     w2,
     w2s,
     stride_we,
     stride_se,
     stride_slin,
     stride_snb,
-    RANK: gl.constexpr,
     STAGE: gl.constexpr,
 ):
-    """Ex2 task ``task`` = (pick, output column block).
+    """Issue ex2 task ``task``'s w2 loads (pick, two column blocks); nothing
+    loads when ``active`` is false. Every CTA calls it (Gluon cannot carry
+    the tiles out of a branch); :func:`ex2_finish` uses them.
 
     Args:
         w2, w2s: The rank's preprocessed w2 bytes ``[256, 256, 4096]`` and
             scales, with their strides.
     """
     mb.stamp(STAGE, trace.START)
-    pick = task // NB2
-    blk = task % NB2
+    TASKS_PER_PICK: gl.constexpr = NB2 // EX2_BLOCKS
+    pick = task // TASKS_PER_PICK
+    blk0 = (task % TASKS_PER_PICK) * EX2_BLOCKS
     expert = _expert(mb, pick)
-    tiles = _load_b(
-        w2,
-        w2s,
-        expert,
-        stride_we,
-        stride_se,
-        stride_slin,
-        stride_snb,
-        blk * BLOCK_N,
-        0,
-        INTER // 128,
-        POOLED,
-    )
+    loads = ()
+    for i in gl.static_range(EX2_BLOCKS):
+        loads += (
+            _load_b(
+                w2,
+                w2s,
+                expert,
+                stride_we,
+                stride_se,
+                stride_slin,
+                stride_snb,
+                (blk0 + i) * BLOCK_N,
+                0,
+                INTER // 128,
+                POOLED,
+                active,
+            ),
+        )
+    return loads
+
+
+@gluon.jit
+def ex2_finish(mb, task, loads, RANK: gl.constexpr, STAGE: gl.constexpr):
+    """Ex2 task ``task`` after :func:`ex2_issue`: poll the pick's MXFP4
+    intermediate, multiply, and put the BF16 partial to the owner rank."""
+    TASKS_PER_PICK: gl.constexpr = NB2 // EX2_BLOCKS
+    pick = task // TASKS_PER_PICK
+    blk0 = (task % TASKS_PER_PICK) * EX2_BLOCKS
     nw: gl.constexpr = gl.num_warps()
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
     i = gl.arange(0, 128, lanes)  # INTER_WORDS, rounded up to a power of two
@@ -396,12 +425,15 @@ def ex2_stage(
         + gl.convert_layout(sbytes, gl.SliceLayout(0, bl))[None, :]
     )
     p_smem, s_smem = _stage_a(p16.to(gl.uint8), s16.to(gl.uint8))
-    acc = _mma_row(p_smem, s_smem, tiles)
+    owner = (blk0 * BLOCK_N) // OWNED_OUT
+    for b in gl.static_range(EX2_BLOCKS):
+        acc = _mma_row(p_smem, s_smem, loads[b])
+        out = gl.reshape(acc.to(gl.bfloat16), [BLOCK_N // 2, 2])
+        word = mx.pack_bf16_pairs(out)
+        p = gl.arange(0, BLOCK_N // 2, word.type.layout)
+        col = ((blk0 + b) * BLOCK_N) % OWNED_OUT
+        mb.put_peer(
+            "rr", owner, ((RANK * TOP_K + pick) * OWNED_OUT + col) // 2 + p, word
+        )
     mb.stamp(STAGE, trace.COMPUTED)
-    out = gl.reshape(acc.to(gl.bfloat16), [BLOCK_N // 2, 2])
-    word = mx.pack_bf16_pairs(out)
-    p = gl.arange(0, BLOCK_N // 2, word.type.layout)
-    owner = (blk * BLOCK_N) // OWNED_OUT
-    col = (blk * BLOCK_N) % OWNED_OUT
-    mb.put_peer("rr", owner, ((RANK * TOP_K + pick) * OWNED_OUT + col) // 2 + p, word)
     mb.stamp(STAGE, trace.END)

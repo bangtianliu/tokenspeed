@@ -99,27 +99,31 @@ def topk_stage(mb, bias, STAGE: gl.constexpr):
     ll: gl.constexpr = gl.BlockedLayout([WORLD, 1], [1, 64], [1, nw], [0, 1])
     src = gl.arange(0, WORLD, gl.SliceLayout(1, ll))
     e = gl.arange(0, EXPERTS, gl.SliceLayout(0, ll))
-    b = gl.load(bias + e)
     (got,) = mb.poll_many(("lg",), (src[:, None] * EXPERTS + e[None, :],))
     mb.stamp(STAGE, trace.READY)
     parts = got.to(gl.float32, bitcast=True)
     logit = gl.zeros([EXPERTS], gl.float32, gl.SliceLayout(0, ll))
     for p in gl.static_range(WORLD):
         logit += gl.sum(gl.where(src[:, None] == p, parts, 0.0), axis=0)
+    # Every wave holds all 256 experts (4 a lane), so each argmax below
+    # reduces within a wave: no LDS round trip and barrier per pass.
+    wl: gl.constexpr = gl.BlockedLayout([EXPERTS // 64], [64], [nw], [0])
+    logit = gl.convert_layout(logit, wl)
+    ew = gl.arange(0, EXPERTS, wl)
     # An exact division: the scores decide which experts a near tie picks.
     score = 1.0 / (1.0 + gl.exp(-(logit * ROUTER_SCALE)))
-    choice = score + b
-    ids = gl.zeros([TOP_K], gl.int32, gl.SliceLayout(0, ll))
-    picked = gl.zeros([TOP_K], gl.float32, gl.SliceLayout(0, ll))
-    slot = gl.arange(0, TOP_K, gl.SliceLayout(0, ll))
+    choice = score + gl.load(bias + ew)
+    slot = gl.arange(0, TOP_K, gl.BlockedLayout([1], [64], [nw], [0]))
+    ids = gl.zeros([TOP_K], gl.int32, slot.type.layout)
+    picked = gl.zeros([TOP_K], gl.float32, slot.type.layout)
     for k in gl.static_range(TOP_K):
         best = gl.max(choice, axis=0)
-        first = gl.min(gl.where(choice == best, e, EXPERTS), axis=0)
+        first = gl.min(gl.where(choice == best, ew, EXPERTS), axis=0)
         ids = gl.where(slot == k, first, ids)
         picked = gl.where(
-            slot == k, gl.sum(gl.where(e == first, score, 0.0), axis=0), picked
+            slot == k, gl.sum(gl.where(ew == first, score, 0.0), axis=0), picked
         )
-        choice = gl.where(e == first, float("-inf"), choice)
+        choice = gl.where(ew == first, float("-inf"), choice)
     total = gl.sum(picked, axis=0)
     weight = picked / gl.where(total == 0.0, 1.0, total)
     mb.stamp(STAGE, trace.COMPUTED)
