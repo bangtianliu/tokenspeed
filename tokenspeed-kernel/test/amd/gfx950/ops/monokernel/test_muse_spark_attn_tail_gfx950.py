@@ -170,6 +170,13 @@ def _worker(rank: int, port: int) -> None:
             want_hp, want_u = _reference(k)
             torch.testing.assert_close(h_out.cpu(), want_hp[own], rtol=2**-7, atol=1e-3)
             torch.testing.assert_close(u.cpu(), want_u[own], rtol=2**-7, atol=1e-3)
+            # Every rank holds the whole BF16 MoE input, rank-major.
+            xin = payloads(
+                scratch, plan, "xin", HIDDEN // 2, launch_tag(step, 0), copy=step & 1
+            )
+            torch.testing.assert_close(
+                xin.view(torch.bfloat16).float().cpu(), want_u, rtol=2**-7, atol=1e-3
+            )
             dist.barrier()
     finally:
         dist.destroy_process_group()
