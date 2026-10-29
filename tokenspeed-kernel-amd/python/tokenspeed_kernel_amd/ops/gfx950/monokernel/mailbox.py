@@ -38,6 +38,12 @@ Memory rules on gfx950 (coarse-grained VRAM):
   :func:`pre_poll` lets one wave spin on one hint pair per producer before the
   payload :func:`poll`. The poll then usually succeeds on its first load.
 
+Across ranks (a plan of ``world`` > 1 on Iris's symmetric heap), a stage
+puts into another rank's copy of a peer region (:meth:`Mailbox.put_peer`):
+a system-scope store over the GPU links. A poll of a peer region is
+system-scope (``sc0 sc1``), so the local L2 never serves a stale line of
+it.
+
 Fail-stop: a poll gives up after ``MAX_RETRIES`` retries (at least about 8 s;
 a launch takes about 100 us) and executes ``s_trap 2``. The runtime then reports
 a GPU exception and the process stops. A deadlock or a missing producer thus
@@ -77,9 +83,14 @@ def put(scratch, offsets, payload, tag, mask=None):
         tag: This launch's tag.
         mask: Optional lanes to publish.
     """
+    _put(scratch + offsets, payload, tag, mask, "gpu")
+
+
+@gluon.jit
+def _put(ptrs, payload, tag, mask, SCOPE: gl.constexpr):
     bits = payload.to(gl.int32, bitcast=True).to(gl.int64) & 0xFFFFFFFF
     pair = (tag.to(gl.int64) << 32) | bits
-    gl.atomic_store(scratch + offsets, pair, mask=mask, sem="relaxed", scope="gpu")
+    gl.atomic_store(ptrs, pair, mask=mask, sem="relaxed", scope=SCOPE)
 
 
 @gluon.constexpr_function
@@ -106,8 +117,23 @@ def _poll_constraints(groups):
     )
 
 
+# Load modifiers of a poll by scope: agent scope bypasses the vL1D; system
+# scope also bypasses the L2, which another GPU's stores do not update.
+_POLL_CACHE = {"agent": "sc1", "system": "sc0 sc1"}
+
+
 @gluon.constexpr_function
-def _poll_asm(outputs, inputs):
+def _poll_asm_agent(outputs, inputs):
+    return _poll_asm(outputs, inputs, _POLL_CACHE["agent"])
+
+
+@gluon.constexpr_function
+def _poll_asm_system(outputs, inputs):
+    return _poll_asm(outputs, inputs, _POLL_CACHE["system"])
+
+
+@gluon.constexpr_function
+def _poll_asm(outputs, inputs, cache):
     """One wave-uniform retry loop over all of a thread's pairs.
 
     All loads issue before one ``vmcnt`` wait. While any lane's tag differs,
@@ -131,7 +157,7 @@ def _poll_asm(outputs, inputs):
         "s_cbranch_scc1 2f",
         f"s_mov_b32 {retries}, 0",
     ]
-    lines += [f"global_load_dwordx2 {p}, {a}, off sc1" for p, a in zip(pairs, ptrs)]
+    lines += [f"global_load_dwordx2 {p}, {a}, off {cache}" for p, a in zip(pairs, ptrs)]
     lines += ["1:", "s_waitcnt vmcnt(0)", f"s_mov_b64 {acc}, 0"]
     for p in pairs:
         lines += [
@@ -155,7 +181,7 @@ def _poll_asm(outputs, inputs):
             f"v_lshrrev_b64 {tmp}, 32, {p}",
             f"v_cmp_ne_u64 vcc, {tag}, {tmp}",
             f"s_and_b64 exec, {save}, vcc",
-            f"global_load_dwordx2 {p}, {a}, off sc1",
+            f"global_load_dwordx2 {p}, {a}, off {cache}",
             f"s_mov_b64 exec, {save}",
         ]
     lines += ["s_branch 1b", "3:", "s_trap 2", "2:"]
@@ -187,7 +213,7 @@ def _poll_types(offsets, num_warps):
 
 
 @gluon.jit
-def _poll_n(scratch, offsets, tag, spin):
+def _poll_n(scratch, offsets, tag, spin, SCOPE: gl.constexpr):
     """Spin until every pair at the index tensors ``offsets`` (a tuple, any
     layouts) carries ``tag``, in one round trip. Return the tuple of their
     pairs. Waves whose ``spin`` is zero skip the loop."""
@@ -197,8 +223,9 @@ def _poll_n(scratch, offsets, tag, spin):
     # The pair's high dword holds the tag's 32 bits and the poll shifts it
     # down zero-extended, so compare with the zero-extended tag. A
     # sign-extended tag never matches once the tag wraps past bit 31.
+    gl.static_assert(SCOPE == "agent" or SCOPE == "system", "scope: agent or system")
     out = gl.inline_asm(
-        _poll_asm,
+        _poll_asm_system if SCOPE == "system" else _poll_asm_agent,
         _poll_constraints(len(offsets)),
         ptrs + (tag.to(gl.int64) & 0xFFFFFFFF, spin),
         _poll_types(offsets.type, gl.num_warps()),
@@ -221,7 +248,7 @@ def poll(scratch, offsets, tag):
     Returns:
         ``int32`` payloads in ``offsets``'s layout.
     """
-    return _payload(_poll_n(scratch, (offsets,), tag, _spin_all())[0])
+    return _payload(_poll_n(scratch, (offsets,), tag, _spin_all(), "agent")[0])
 
 
 @gluon.jit
@@ -229,15 +256,20 @@ def poll_waves(scratch, offsets, tag, spin):
     """:func:`poll` by the waves whose ``spin`` (one value per thread, in
     :func:`lane_layout`) is non-zero. The other waves skip the loop, and
     their payloads are undefined."""
-    return _payload(_poll_n(scratch, (offsets,), tag, spin)[0])
+    return _payload(_poll_n(scratch, (offsets,), tag, spin, "agent")[0])
 
 
 @gluon.jit
 def poll_many_waves(scratch, offsets, tag, spin):
     """:func:`poll_waves` of a tuple of at most four index tensors (any
     layouts) in one round trip. Returns the tuple of their payloads."""
+    return _poll_many_waves(scratch, offsets, tag, spin, "agent")
+
+
+@gluon.jit
+def _poll_many_waves(scratch, offsets, tag, spin, SCOPE: gl.constexpr):
     gl.static_assert(len(offsets) <= 4, "one round trip polls four tensors")
-    pairs = _poll_n(scratch, offsets, tag, spin)
+    pairs = _poll_n(scratch, offsets, tag, spin, SCOPE)
     payloads = ()
     for k in gl.static_range(len(offsets)):
         payloads += (_payload(pairs[k]),)
@@ -248,12 +280,17 @@ def poll_many_waves(scratch, offsets, tag, spin):
 def poll_many(scratch, offsets, tag):
     """:func:`poll` of a tuple of index tensors (any layouts), four per round
     trip. Returns the tuple of their payloads."""
+    return _poll_many(scratch, offsets, tag, "agent")
+
+
+@gluon.jit
+def _poll_many(scratch, offsets, tag, SCOPE: gl.constexpr):
     payloads = ()
     for first in gl.static_range(0, len(offsets), 4):
         group = ()
         for k in gl.static_range(first, _group_end(first, len(offsets))):
             group += (offsets[k],)
-        pairs = _poll_n(scratch, group, tag, _spin_all())
+        pairs = _poll_n(scratch, group, tag, _spin_all(), SCOPE)
         for k in gl.static_range(len(group)):
             payloads += (_payload(pairs[k]),)
     return payloads
@@ -288,8 +325,13 @@ def pre_poll(scratch, hints, tag):
             :func:`lane_layout`. The function ignores the lanes of waves
             other than 0.
     """
+    _pre_poll(scratch, hints, tag, "agent")
+
+
+@gluon.jit
+def _pre_poll(scratch, hints, tag, SCOPE: gl.constexpr):
     lanes = gl.arange(0, 64 * gl.num_warps(), lane_layout(gl.num_warps()))
-    _poll_n(scratch, (hints,), tag, (lanes < 64).to(gl.int32))
+    _poll_n(scratch, (hints,), tag, (lanes < 64).to(gl.int32), SCOPE)
     gl.barrier()
 
 
@@ -299,11 +341,50 @@ def lane_layout(num_warps):
     return gl.BlockedLayout([1], [64], [num_warps], [0])
 
 
+@aggregate
+class Peers:
+    """A rank's view of the other ranks of a plan of ``world`` > 1.
+
+    ``bases`` points at the ``int64`` base address of every rank's
+    symmetric heap (Iris's ``IrisGroup.bases``); the mailbox buffer sits on
+    that heap, so a region has the same offset on every rank. ``parity``
+    (0 or 1) selects this launch's copy of every peer region: it must
+    alternate from one launch to the next on every rank.
+    """
+
+    bases: gl.tensor
+    rank: gl.constexpr
+    parity: gl.tensor
+
+    @gluon.constexpr_function
+    def __init__(self, bases, rank, parity):
+        self.bases = bases
+        self.rank = gl.constexpr(rank)
+        self.parity = parity
+
+    @gluon.jit
+    def translate(self, ptrs, peer):
+        """``ptrs`` (on this rank's heap) as seen on rank ``peer``'s heap."""
+        delta = gl.load(self.bases + peer) - gl.load(self.bases + self.rank)
+        return (ptrs.to(gl.int64) + delta).to(ptrs.dtype)
+
+
+@gluon.constexpr_function
+def _scope(plan, region):
+    return "system" if plan.plan.is_peer(region) else "agent"
+
+
+@gluon.constexpr_function
+def _scopes(plan, regions):
+    peer = any(plan.plan.is_peer(region) for region in regions)
+    return "system" if peer else "agent"
+
+
 # ``plan`` below is a ``PlanKey`` (see plan.py).
 @aggregate
 class Mailbox:
-    """A launch's mailbox buffer, tag, plan and optional LDS stamp table
-    (``trace.allocate``).
+    """A launch's mailbox buffer, tag, plan, optional LDS stamp table
+    (``trace.allocate``) and, for a plan of ``world`` > 1, its :class:`Peers`.
 
     A caller addresses a region by name, with pair indices relative to the
     region's row 0. :meth:`row` gives the view of another row, so a
@@ -314,13 +395,15 @@ class Mailbox:
     tag: gl.tensor
     plan: gl.constexpr
     trace: gl.shared_memory_descriptor | gl.constexpr
+    peers: Peers | gl.constexpr
 
     @gluon.constexpr_function
-    def __init__(self, scratch, tag, plan, trace_table):
+    def __init__(self, scratch, tag, plan, trace_table, peers=None):
         self.scratch = scratch
         self.tag = tag
         self.plan = gl.constexpr(plan)
         self.trace = gl.constexpr(None) if trace.disabled(trace_table) else trace_table
+        self.peers = gl.constexpr(None) if peers is None else peers
 
     @gluon.jit
     def row_offset(self, row):
@@ -340,6 +423,7 @@ class Mailbox:
             self.tag,
             self.plan,
             self.trace,
+            self.peers,
         )
 
     @gluon.jit
@@ -348,23 +432,59 @@ class Mailbox:
         trace.stamp(self.trace, schedule.stage_event(self.plan, stage, point))
 
     @gluon.jit
+    def _base(self, region: gl.constexpr):
+        """Pair offset of ``region`` in this launch: its copy by parity for a
+        peer region."""
+        if schedule.is_peer(self.plan, region):
+            return schedule.region(self.plan, region) + self.peers.parity * (
+                schedule.peer_copy(self.plan, region)
+            )
+        else:
+            return schedule.region(self.plan, region)
+
+    @gluon.jit
     def put(self, region: gl.constexpr, index, payload, mask=None):
-        put(
-            self.scratch + schedule.region(self.plan, region),
-            index,
+        """Publish ``payload`` at ``index`` of this rank's copy of ``region``."""
+        _put(
+            self.scratch + self._base(region) + index,
             payload,
             self.tag,
             mask,
+            "sys" if schedule.is_peer(self.plan, region) else "gpu",
         )
 
     @gluon.jit
+    def put_peer(self, region: gl.constexpr, peer, index, payload, mask=None):
+        """Publish ``payload`` at ``index`` of rank ``peer``'s copy of peer
+        region ``region`` (a system-scope store; ``peer`` may be this rank)."""
+        gl.static_assert(
+            schedule.is_peer(self.plan, region), "put_peer needs a peer region"
+        )
+        ptrs = self.peers.translate(self.scratch + self._base(region) + index, peer)
+        _put(ptrs, payload, self.tag, mask, "sys")
+
+    @gluon.jit
     def poll(self, region: gl.constexpr, index):
-        return poll(self.scratch + schedule.region(self.plan, region), index, self.tag)
+        return _payload(
+            _poll_n(
+                self.scratch + self._base(region),
+                (index,),
+                self.tag,
+                _spin_all(),
+                _scope(self.plan, region),
+            )[0]
+        )
 
     @gluon.jit
     def poll_waves(self, region: gl.constexpr, index, spin):
-        return poll_waves(
-            self.scratch + schedule.region(self.plan, region), index, self.tag, spin
+        return _payload(
+            _poll_n(
+                self.scratch + self._base(region),
+                (index,),
+                self.tag,
+                spin,
+                _scope(self.plan, region),
+            )[0]
         )
 
     @gluon.jit
@@ -374,29 +494,31 @@ class Mailbox:
         offsets = ()
         for k in gl.static_range(len(regions)):
             offsets += (self.pairs(regions[k], indices[k]),)
-        return poll_many_waves(self.scratch, offsets, self.tag, spin)
+        return _poll_many_waves(
+            self.scratch, offsets, self.tag, spin, _scopes(self.plan, regions)
+        )
 
     @gluon.jit
     def poll_many(self, regions: gl.constexpr, indices):
         """Poll ``indices[k]`` (pairs from region ``regions[k]``'s row 0) for
         every ``k``, four index tensors per round trip. Returns the tuple of
-        payloads."""
+        payloads. A poll that includes a peer region is system-scope."""
         offsets = ()
         for k in gl.static_range(len(regions)):
             offsets += (self.pairs(regions[k], indices[k]),)
-        return poll_many(self.scratch, offsets, self.tag)
+        return _poll_many(self.scratch, offsets, self.tag, _scopes(self.plan, regions))
 
     @gluon.jit
     def pairs(self, region: gl.constexpr, index):
         """Mailbox pair offsets of pairs ``index`` of ``region``, for
-        :meth:`poll_pairs` (one index tensor may then mix regions)."""
-        return index + schedule.region(self.plan, region)
+        :meth:`poll_pairs` (one index tensor may then mix local regions)."""
+        return index + self._base(region)
 
     @gluon.jit
     def poll_pairs(self, offsets):
-        """Poll a tuple of tensors of :meth:`pairs` offsets, four per round
-        trip."""
-        return poll_many(self.scratch, offsets, self.tag)
+        """Poll a tuple of tensors of :meth:`pairs` offsets of local regions,
+        four per round trip. Poll peer regions with :meth:`poll_many`."""
+        return _poll_many(self.scratch, offsets, self.tag, "agent")
 
     @gluon.jit
     def poll_rows(self, regions: gl.constexpr, indices, ROWS: gl.constexpr):
@@ -428,12 +550,18 @@ class Mailbox:
 
     @gluon.jit
     def pre_poll(self, region: gl.constexpr, hints):
-        pre_poll(self.scratch + schedule.region(self.plan, region), hints, self.tag)
+        _pre_poll(
+            self.scratch + self._base(region),
+            hints,
+            self.tag,
+            _scope(self.plan, region),
+        )
 
 
 __all__ = [
     "LAYER_SLOTS",
     "Mailbox",
+    "Peers",
     "lane_layout",
     "launch_tag",
     "poll",

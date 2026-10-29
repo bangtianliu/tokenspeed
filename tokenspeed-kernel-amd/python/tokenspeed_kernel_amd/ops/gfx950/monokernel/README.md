@@ -116,6 +116,21 @@ Memory rules on gfx950 (coarse-grained VRAM):
   `pre_poll` (or `pre_poll_spread`) lets wave 0 spin on one hint pair for each
   producer. The full poll then usually succeeds on its first load.
 
+Across ranks (`Plan(world=..., peers=...)`), the buffer comes from Iris's
+symmetric heap (`ctx.zeros`), and `Mailbox(..., peers=Peers(bases, rank,
+parity))` adds the other ranks: `bases` is `IrisGroup.bases`, and `parity`
+alternates from launch to launch.
+
+- `put_peer(region, peer, index, payload, mask)` stores into rank `peer`'s
+  copy of a peer region (system scope). A one-shot all-reduce puts each
+  rank's partial into a slot per source rank on every rank, then polls the
+  slots and adds them in rank order, so every rank gets the same bits.
+- Polls of a peer region load with `sc0 sc1`. `poll_pairs` serves local
+  regions only; poll peer regions by name.
+- On 8 MI350X GPUs, one handoff to another GPU takes about 0.9 us, and a
+  one-shot all-reduce of 8192 FP32 values in a launch of its own takes
+  about 9 us in a graph (`test_peer_mailbox_gfx950.py`).
+
 `Mailbox(scratch, tag, plan, trace_table)` is the view that a stage gets:
 
 | Method | Use |
@@ -127,6 +142,7 @@ Memory rules on gfx950 (coarse-grained VRAM):
 | `row(r)`, `row_offset(row)` | Address the copies of another row. |
 | `pre_poll(region, hints)`, `pre_poll_spread(region, N)` | Let wave 0 spin on hint pairs before a wide poll. |
 | `stamp(stage, point)` | Records a trace point. |
+| `put_peer(region, peer, index, payload, mask)` | Publishes into another rank's copy of a peer region. |
 
 `mx.load_mxfp4_rows` polls the MXFP4 rows of a GEMV input in one round trip.
 
