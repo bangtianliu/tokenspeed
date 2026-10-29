@@ -72,6 +72,11 @@ def _inputs(seed: int):
     pre_gain = (torch.randn(HIDDEN, generator=g) * 0.1 + 1.0).to(torch.bfloat16).float()
     w = torch.randn(EXPERTS, HIDDEN, generator=g) / HIDDEN**0.5
     bias = torch.randn(EXPERTS, generator=g) * 0.1
+    if seed == 3:
+        # An exact tie at the top: experts 5 and 9 have the same weights and
+        # bias, so the same score + bias. The lower id must come first.
+        w[9] = w[5]
+        bias[5] = bias[9] = 2.0
     return hp, pre_gain, w, bias
 
 
@@ -136,9 +141,14 @@ def _worker(rank: int, port: int) -> None:
             u = hp.double() * torch.rsqrt(hp.double().pow(2).mean() + 1e-5) * pre_gain
             logit = (w.double() @ u) * 0.17677669529663687
             score = torch.sigmoid(logit)
-            ids = torch.topk(score + bias.double(), TOP_K).indices
+            # Largest first, a tie to the lowest id.
+            ids = torch.sort(
+                score + bias.double(), descending=True, stable=True
+            ).indices[:TOP_K]
             weights = score[ids] / score[ids].sum()
             assert torch.equal(got[:TOP_K].long(), ids)
+            if seed == 3:
+                assert ids[:2].tolist() == [5, 9]
             torch.testing.assert_close(
                 got[TOP_K:].view(torch.float32).double(), weights, rtol=1e-5, atol=1e-6
             )
