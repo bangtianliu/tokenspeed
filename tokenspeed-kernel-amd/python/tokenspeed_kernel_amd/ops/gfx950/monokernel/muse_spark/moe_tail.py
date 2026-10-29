@@ -29,12 +29,16 @@ columns ``1024 r ..`` of the residual (one row).
   exchange of partial sums of squares per route), and the weighted sum of
   the 8 routes (a tree within a wave, not the regular path's pick order),
   rounded to BF16, put into every rank's ``cmb``.
-* unpool, 64 tasks of 16 owned hidden columns: the post-expert projection
-  (BF16 ``[1024, 4096]``, 128 KiB a task) of the whole combined row.
-* fin1..fin3, 8 tasks of 128 owned hidden columns (same CTAs): the post-FFN
-  norm (gain, then RMS over 8192 columns), the residual gate ``h'' = beta y +
+* unpool, fin, 64 tasks of 16 owned hidden columns (same CTAs): the
+  post-expert projection (BF16 ``[1024, 4096]``, 128 KiB a task) of the whole
+  combined row, rounded to BF16, times the post-FFN gain. Each task puts
+  four partial sums into every rank's ``ss4``: of ``y^2``, ``(beta y)^2``,
+  ``(alpha h')(beta y)`` and ``(alpha h')^2``. Then, after one exchange: the
+  post-FFN norm (RMS over 8192 columns), the residual gate ``h'' = beta y +
   alpha h'`` (stored: the launch's residual output), and the next layer's
-  input norm, rounded to BF16 and put into every rank's ``anext``.
+  input norm, whose sum of squares is the expansion of ``(beta y inv + alpha
+  h')^2`` in the four sums. The result is rounded to BF16 and put into every
+  rank's ``anext``.
 * out, 16 tasks: the whole next attention input to memory, for the next
   launch.
 """
@@ -55,13 +59,13 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Stage, placement
 COMB_TASKS = gl.constexpr(8)
 COMB_COLS = gl.constexpr(64)
 UNPOOL_TASKS = gl.constexpr(64)
-FIN_TASKS = gl.constexpr(8)
-FIN_COLS = gl.constexpr(128)
+UNPOOL_COLS = gl.constexpr(16)
+SUMS = gl.constexpr(4)
 OUT_TASKS = gl.constexpr(16)
 POST_EPS = gl.constexpr(1e-8)
 PRE_EPS = gl.constexpr(1e-5)
 
-PEERS = ("ss3", "cmb", "ss4", "ss5", "anext")
+PEERS = ("ss3", "cmb", "ss4", "anext")
 
 
 def regions() -> tuple[tuple[str, int], ...]:
@@ -69,23 +73,19 @@ def regions() -> tuple[tuple[str, int], ...]:
     return (
         ("ss3", world * int(COMB_TASKS) * k),  # FP32 [rank][task][route]
         ("cmb", int(POOLED) // 2),  # BF16 pairs of the combined row
-        ("yv", int(OWNED) // 2),  # BF16 pairs of the owned projection columns
-        ("ss4", world * int(FIN_TASKS)),
-        ("ss5", world * int(FIN_TASKS)),
+        ("ss4", world * int(UNPOOL_TASKS) * int(SUMS)),  # FP32 [rank][task][sum]
         ("anext", int(HIDDEN) // 2),  # BF16 pairs of the next attention input
     )
 
 
 def stages(bases: dict[str, int]) -> tuple[Stage, ...]:
-    comb, unpool, fin, out = placement(bases, ("comb", "unpool", "fin", "out"))
-    c, f = int(COMB_TASKS), int(FIN_TASKS)
+    comb, unpool, out = placement(bases, ("comb", "unpool", "out"))
+    c, u = int(COMB_TASKS), int(UNPOOL_TASKS)
     return (
         Stage("comb1", c, comb, reads=("rr", "route"), writes=("ss3",)),
         Stage("comb2", c, comb, reads=("ss3",), writes=("cmb",)),
-        Stage("unpool", int(UNPOOL_TASKS), unpool, reads=("cmb",), writes=("yv",)),
-        Stage("fin1", f, fin, reads=("yv",), writes=("ss4",)),
-        Stage("fin2", f, fin, reads=("ss4", "hp"), writes=("ss5",)),
-        Stage("fin3", f, fin, reads=("ss5",), writes=("anext",)),
+        Stage("unpool", u, unpool, reads=("cmb", "hp"), writes=("ss4",)),
+        Stage("fin", u, unpool, reads=("ss4",), writes=("anext",)),
         Stage("out", int(OUT_TASKS), out, reads=("anext",)),
     )
 
@@ -169,15 +169,22 @@ def comb_stages(mb, task, pen_gain, RANK: gl.constexpr):
 
 
 @gluon.jit
-def unpool_stage(mb, task, w, STAGE: gl.constexpr):
-    """Unpool task ``task``: owned hidden columns ``16 task ..``.
+def unpool_stages(
+    mb, task, w, post_gain, alpha, beta, in_gain, h_next, RANK: gl.constexpr
+):
+    """Unpool and fin task ``task``: owned hidden columns ``16 task ..``.
 
     Args:
         w: This rank's post-expert projection rows, BF16 ``[1024, 4096]``
             (``weights.bf16_tiles``).
+        post_gain: FP32 ``bf16(w + 1)`` of the post-FFN norm, owned columns.
+        alpha, beta: FP32 residual-gate coefficients of the FFN, owned columns.
+        in_gain: FP32 ``bf16(w + 1)`` of the next layer's input norm.
+        h_next: Where the owned FP32 residual ``h''`` goes.
     """
     gl.static_assert(schedule.rows(mb.plan) == 1, "the MoE tail serves one row")
-    mb.stamp(STAGE, trace.START)
+    nw: gl.constexpr = gl.num_warps()
+    mb.stamp("unpool", trace.START)
     tiles = bf16.load_weight_tiles(
         w,
         nb0=task,
@@ -190,80 +197,70 @@ def unpool_stage(mb, task, w, STAGE: gl.constexpr):
         GROUP_STRIDE=0,
     )
     x_smem, _ = bf16.load_rows(mb, "cmb", 0, POOLED, 1)
-    mb.stamp(STAGE, trace.READY)
-    out = bf16.gemv(x_smem, tiles, FIRST=0, ROWS=1)
-    mb.stamp(STAGE, trace.COMPUTED)
-    mx.put_bf16_rows(mb, "yv", task * 8, out)
-    mb.stamp(STAGE, trace.END)
-
-
-@gluon.jit
-def _total(mb, region: gl.constexpr):
-    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
-    (got,) = mb.poll_many((region,), (gl.arange(0, WORLD * FIN_TASKS, lanes),))
-    return gl.sum(got.to(gl.float32, bitcast=True), axis=0)
-
-
-@gluon.jit
-def fin_stages(mb, task, post_gain, alpha, beta, in_gain, h_next, RANK: gl.constexpr):
-    """Fin1..fin3 task ``task``: owned hidden columns ``128 task ..``.
-
-    Args:
-        post_gain: FP32 ``bf16(w + 1)`` of the post-FFN norm, owned columns.
-        alpha, beta: FP32 residual-gate coefficients of the FFN, owned columns.
-        in_gain: FP32 ``bf16(w + 1)`` of the next layer's input norm.
-        h_next: Where the owned FP32 residual ``h''`` goes.
-    """
-    mb.stamp("fin1", trace.START)
-    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
-    j = gl.arange(0, FIN_COLS // 2, lanes)
-    c = task * FIN_COLS + 2 * j
-    (got,) = mb.poll_many(("yv",), (c // 2,))
-    mb.stamp("fin1", trace.READY)
-    y_lo = (got << 16).to(gl.float32, bitcast=True) * gl.load(post_gain + c)
-    y_hi = (got & -65536).to(gl.float32, bitcast=True) * gl.load(post_gain + c + 1)
-    one = gl.arange(0, 1, lanes)
-    _put_all(
-        mb,
-        "ss4",
-        RANK * FIN_TASKS + task + one,
-        gl.zeros([1], gl.float32, lanes) + gl.sum(y_lo * y_lo + y_hi * y_hi, axis=0),
-    )
-    mb.stamp("fin1", trace.END)
-
-    mb.stamp("fin2", trace.START)
-    inv = gl.rsqrt(_total(mb, "ss4") / HIDDEN + POST_EPS)
+    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
+    j = gl.arange(0, UNPOOL_COLS // 2, lanes)
+    c = task * UNPOOL_COLS + 2 * j
     hp_lo, hp_hi = mb.poll_many(("hp", "hp"), (c, c + 1))
-    mb.stamp("fin2", trace.READY)
-    h_lo = gl.fma(
-        gl.load(beta + c),
-        y_lo * inv,
-        gl.load(alpha + c) * hp_lo.to(gl.float32, bitcast=True),
+    mb.stamp("unpool", trace.READY)
+    out = bf16.gemv(x_smem, tiles, FIRST=0, ROWS=1)  # [1, 16]
+    mb.stamp("unpool", trace.COMPUTED)
+    # split needs a pair's two values in one thread.
+    pairs: gl.constexpr = gl.BlockedLayout([1, 2], [1, 64], [nw, 1], [1, 0])
+    lo, hi = gl.split(
+        gl.reshape(gl.convert_layout(out, pairs), [1, UNPOOL_COLS // 2, 2])
     )
-    h_hi = gl.fma(
-        gl.load(beta + c + 1),
-        y_hi * inv,
-        gl.load(alpha + c + 1) * hp_hi.to(gl.float32, bitcast=True),
+    y_lo = gl.convert_layout(gl.sum(lo, axis=0), lanes)
+    y_hi = gl.convert_layout(gl.sum(hi, axis=0), lanes)
+    y_lo = y_lo.to(gl.bfloat16).to(gl.float32) * gl.load(post_gain + c)
+    y_hi = y_hi.to(gl.bfloat16).to(gl.float32) * gl.load(post_gain + c + 1)
+    b_lo = gl.load(beta + c)
+    b_hi = gl.load(beta + c + 1)
+    ah_lo = gl.load(alpha + c) * hp_lo.to(gl.float32, bitcast=True)
+    ah_hi = gl.load(alpha + c + 1) * hp_hi.to(gl.float32, bitcast=True)
+    by_lo = b_lo * y_lo
+    by_hi = b_hi * y_hi
+    q = gl.arange(0, SUMS, lanes)
+    sums = gl.where(
+        q == 0,
+        gl.sum(y_lo * y_lo + y_hi * y_hi, axis=0),
+        gl.where(
+            q == 1,
+            gl.sum(by_lo * by_lo + by_hi * by_hi, axis=0),
+            gl.where(
+                q == 2,
+                gl.sum(ah_lo * by_lo + ah_hi * by_hi, axis=0),
+                gl.sum(ah_lo * ah_lo + ah_hi * ah_hi, axis=0),
+            ),
+        ),
     )
+    _put_all(mb, "ss4", (RANK * UNPOOL_TASKS + task) * SUMS + q, sums)
+    mb.stamp("unpool", trace.END)
+
+    mb.stamp("fin", trace.START)
+    sl: gl.constexpr = gl.BlockedLayout([1, SUMS], [64, 1], [nw, 1], [1, 0])
+    rt = gl.arange(0, WORLD * UNPOOL_TASKS, gl.SliceLayout(1, sl))[:, None]
+    qt = gl.arange(0, SUMS, gl.SliceLayout(0, sl))
+    (got,) = mb.poll_many(("ss4",), (rt * SUMS + qt[None, :],))
+    mb.stamp("fin", trace.READY)
+    total = gl.sum(got.to(gl.float32, bitcast=True), axis=0)  # [4 sums]
+    ss_y = gl.sum(gl.where(qt == 0, total, 0.0), axis=0)
+    ss_by = gl.sum(gl.where(qt == 1, total, 0.0), axis=0)
+    ss_x = gl.sum(gl.where(qt == 2, total, 0.0), axis=0)
+    ss_ah = gl.sum(gl.where(qt == 3, total, 0.0), axis=0)
+    inv = gl.rsqrt(ss_y / HIDDEN + POST_EPS)
+    # The sum of h''^2 over all columns: inv^2 ss_by + 2 inv ss_x + ss_ah.
+    ss_h = gl.maximum(inv * inv * ss_by + 2.0 * inv * ss_x + ss_ah, 0.0)
+    inv2 = gl.rsqrt(ss_h / HIDDEN + PRE_EPS)
+    h_lo = gl.fma(b_lo, y_lo * inv, ah_lo)
+    h_hi = gl.fma(b_hi, y_hi * inv, ah_hi)
     gl.store(h_next + c, h_lo)
     gl.store(h_next + c + 1, h_hi)
-    _put_all(
-        mb,
-        "ss5",
-        RANK * FIN_TASKS + task + one,
-        gl.zeros([1], gl.float32, lanes) + gl.sum(h_lo * h_lo + h_hi * h_hi, axis=0),
-    )
-    mb.stamp("fin2", trace.END)
-
-    mb.stamp("fin3", trace.START)
-    inv2 = gl.rsqrt(_total(mb, "ss5") / HIDDEN + PRE_EPS)
-    mb.stamp("fin3", trace.READY)
     word = _bf16_word(
         h_lo * inv2 * gl.load(in_gain + c), h_hi * inv2 * gl.load(in_gain + c + 1)
     )
     for p in gl.static_range(WORLD):
         mb.put_peer("anext", p, (RANK * OWNED + c) // 2, word)
-    mb.stamp("fin3", trace.END)
+    mb.stamp("fin", trace.END)
 
 
 @gluon.jit

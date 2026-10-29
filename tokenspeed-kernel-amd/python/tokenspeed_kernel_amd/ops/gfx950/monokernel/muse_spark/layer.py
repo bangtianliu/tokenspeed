@@ -71,7 +71,6 @@ BASES = {
     "ex2": 0,
     "comb": 64,
     "unpool": 128,
-    "fin": 200,
     "out": 216,
 }
 
@@ -99,7 +98,7 @@ def layer_plan(full: bool) -> Plan:
         + moe_route.stages(_bases("router", "topk"))
         + moe_pool.stages(_bases("pool"))
         + moe_experts.stages(_bases("ex1", "ex2"))
-        + moe_tail.stages(_bases("comb", "unpool", "fin", "out"))
+        + moe_tail.stages(_bases("comb", "unpool", "out"))
     )
     peers = (
         attn_tail.PEERS
@@ -245,10 +244,9 @@ def gluon_muse_spark_layer_gfx950(
         moe_tail.comb_stages(mb, task, pen_gain, RANK)
     task, active = schedule.stage_task(PLAN, "unpool")
     if active:
-        moe_tail.unpool_stage(mb, task, w_post, "unpool")
-    task, active = schedule.stage_task(PLAN, "fin1")
-    if active:
-        moe_tail.fin_stages(mb, task, post_gain, alpha2, beta2, in_gain, h_next, RANK)
+        moe_tail.unpool_stages(
+            mb, task, w_post, post_gain, alpha2, beta2, in_gain, h_next, RANK
+        )
     task, active = schedule.stage_task(PLAN, "out")
     if active:
         moe_tail.out_stage(mb, task, a_out, "out")
