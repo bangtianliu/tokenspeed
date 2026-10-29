@@ -117,9 +117,9 @@ Memory rules on gfx950 (coarse-grained VRAM):
   producer. The full poll then usually succeeds on its first load.
 
 Across ranks (`Plan(world=..., peers=...)`), the buffer comes from Iris's
-symmetric heap (`ctx.zeros`), and `Mailbox(..., peers=Peers(bases, rank,
-parity))` adds the other ranks: `bases` is `IrisGroup.bases`, and `parity`
-alternates from launch to launch.
+symmetric heap (`ctx.zeros`), and `Mailbox(..., peers=load_peers(bases,
+rank, parity, world))` adds the other ranks: `bases` is `IrisGroup.bases`,
+read once a launch, and `parity` alternates from launch to launch.
 
 - `put_peer(region, peer, index, payload, mask)` stores into rank `peer`'s
   copy of a peer region (system scope). A one-shot all-reduce puts each
