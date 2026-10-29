@@ -124,23 +124,27 @@ def comb_stages(mb, task, pen_gain, RANK: gl.constexpr):
     j = gl.arange(0, COMB_COLS // 2, gl.SliceLayout(0, gl.SliceLayout(1, L3)))[
         None, None, :
     ]
+    L2: gl.constexpr = gl.SliceLayout(0, L3)
+    # The gains load before the poll: a load after a poll would start only
+    # when the poll returns.
+    jj = gl.arange(0, COMB_COLS // 2, gl.SliceLayout(0, L2))
+    c = task * COMB_COLS + 2 * jj
+    gain_lo = gl.load(pen_gain + c)
+    gain_hi = gl.load(pen_gain + c + 1)
     (got,) = mb.poll_many(
         ("rr",), (((src * TOP_K + k) * OWNED_OUT + task * COMB_COLS) // 2 + j,)
     )
     mb.stamp("comb1", trace.READY)
     lo_all = (got << 16).to(gl.float32, bitcast=True)
     hi_all = (got & -65536).to(gl.float32, bitcast=True)
-    L2: gl.constexpr = gl.SliceLayout(0, L3)
     # The rank order of the regular path's reduction: 0, then 1, ...
     lo = gl.zeros([TOP_K, COMB_COLS // 2], gl.float32, L2)
     hi = gl.zeros([TOP_K, COMB_COLS // 2], gl.float32, L2)
     for p in gl.static_range(WORLD):
         lo += gl.sum(gl.where(src == p, lo_all, 0.0), axis=0)
         hi += gl.sum(gl.where(src == p, hi_all, 0.0), axis=0)
-    jj = gl.arange(0, COMB_COLS // 2, gl.SliceLayout(0, L2))
-    c = task * COMB_COLS + 2 * jj
-    lo = lo.to(gl.bfloat16).to(gl.float32) * gl.load(pen_gain + c)[None, :]
-    hi = hi.to(gl.bfloat16).to(gl.float32) * gl.load(pen_gain + c + 1)[None, :]
+    lo = lo.to(gl.bfloat16).to(gl.float32) * gain_lo[None, :]
+    hi = hi.to(gl.bfloat16).to(gl.float32) * gain_hi[None, :]
     ssq = gl.sum(lo * lo + hi * hi, axis=1)  # [8 routes]
     kk = gl.arange(0, TOP_K, gl.SliceLayout(1, L2))
     _put_all(mb, "ss3", (RANK * COMB_TASKS + task) * TOP_K + kk, ssq)
@@ -196,10 +200,20 @@ def unpool_stages(
         GROUP=1,
         GROUP_STRIDE=0,
     )
-    x_smem, _ = bf16.load_rows(mb, "cmb", 0, POOLED, 1)
+    # The parameters load before the polls: a load after a poll would start
+    # only when the poll returns.
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
     j = gl.arange(0, UNPOOL_COLS // 2, lanes)
     c = task * UNPOOL_COLS + 2 * j
+    post_lo = gl.load(post_gain + c)
+    post_hi = gl.load(post_gain + c + 1)
+    b_lo = gl.load(beta + c)
+    b_hi = gl.load(beta + c + 1)
+    a_lo = gl.load(alpha + c)
+    a_hi = gl.load(alpha + c + 1)
+    in_lo = gl.load(in_gain + c)
+    in_hi = gl.load(in_gain + c + 1)
+    x_smem, _ = bf16.load_rows(mb, "cmb", 0, POOLED, 1)
     hp_lo, hp_hi = mb.poll_many(("hp", "hp"), (c, c + 1))
     mb.stamp("unpool", trace.READY)
     out = bf16.gemv(x_smem, tiles, FIRST=0, ROWS=1)  # [1, 16]
@@ -211,12 +225,10 @@ def unpool_stages(
     )
     y_lo = gl.convert_layout(gl.sum(lo, axis=0), lanes)
     y_hi = gl.convert_layout(gl.sum(hi, axis=0), lanes)
-    y_lo = y_lo.to(gl.bfloat16).to(gl.float32) * gl.load(post_gain + c)
-    y_hi = y_hi.to(gl.bfloat16).to(gl.float32) * gl.load(post_gain + c + 1)
-    b_lo = gl.load(beta + c)
-    b_hi = gl.load(beta + c + 1)
-    ah_lo = gl.load(alpha + c) * hp_lo.to(gl.float32, bitcast=True)
-    ah_hi = gl.load(alpha + c + 1) * hp_hi.to(gl.float32, bitcast=True)
+    y_lo = y_lo.to(gl.bfloat16).to(gl.float32) * post_lo
+    y_hi = y_hi.to(gl.bfloat16).to(gl.float32) * post_hi
+    ah_lo = a_lo * hp_lo.to(gl.float32, bitcast=True)
+    ah_hi = a_hi * hp_hi.to(gl.float32, bitcast=True)
     by_lo = b_lo * y_lo
     by_hi = b_hi * y_hi
     q = gl.arange(0, SUMS, lanes)
@@ -255,9 +267,7 @@ def unpool_stages(
     h_hi = gl.fma(b_hi, y_hi * inv, ah_hi)
     gl.store(h_next + c, h_lo)
     gl.store(h_next + c + 1, h_hi)
-    word = _bf16_word(
-        h_lo * inv2 * gl.load(in_gain + c), h_hi * inv2 * gl.load(in_gain + c + 1)
-    )
+    word = _bf16_word(h_lo * inv2 * in_lo, h_hi * inv2 * in_hi)
     for p in gl.static_range(WORLD):
         mb.put_peer("anext", p, (RANK * OWNED + c) // 2, word)
     mb.stamp("fin", trace.END)

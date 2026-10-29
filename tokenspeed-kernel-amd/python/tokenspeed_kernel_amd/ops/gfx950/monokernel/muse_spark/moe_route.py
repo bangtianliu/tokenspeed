@@ -110,6 +110,11 @@ def topk_stage(mb, bias, STAGE: gl.constexpr):
     src = gl.arange(0, WORLD, gl.SliceLayout(1, ll))
     e = gl.arange(0, EXPERTS, gl.SliceLayout(0, ll))
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
+    # Every wave holds all 256 experts (4 a lane), so each argmax below
+    # reduces within a wave: no LDS round trip and barrier per pass.
+    wl: gl.constexpr = gl.BlockedLayout([EXPERTS // 64], [64], [nw], [0])
+    ew = gl.arange(0, EXPERTS, wl)
+    bias_w = gl.load(bias + ew)  # before the poll, not after it
     got, ss = mb.poll_many(
         ("lg", "ss2"),
         (src[:, None] * EXPERTS + e[None, :], gl.arange(0, WORLD * TAIL_TASKS, lanes)),
@@ -121,15 +126,10 @@ def topk_stage(mb, bias, STAGE: gl.constexpr):
     logit = gl.zeros([EXPERTS], gl.float32, gl.SliceLayout(0, ll))
     for p in gl.static_range(WORLD):
         logit += gl.sum(gl.where(src[:, None] == p, parts, 0.0), axis=0)
-    logit = logit * s
-    # Every wave holds all 256 experts (4 a lane), so each argmax below
-    # reduces within a wave: no LDS round trip and barrier per pass.
-    wl: gl.constexpr = gl.BlockedLayout([EXPERTS // 64], [64], [nw], [0])
-    logit = gl.convert_layout(logit, wl)
-    ew = gl.arange(0, EXPERTS, wl)
+    logit = gl.convert_layout(logit * s, wl)
     # An exact division: the scores decide which experts a near tie picks.
     score = 1.0 / (1.0 + gl.exp(-(logit * ROUTER_SCALE)))
-    choice = score + gl.load(bias + ew)
+    choice = score + bias_w
     slot = gl.arange(0, TOP_K, gl.BlockedLayout([1], [64], [nw], [0]))
     ids = gl.zeros([TOP_K], gl.int32, slot.type.layout)
     picked = gl.zeros([TOP_K], gl.float32, slot.type.layout)
