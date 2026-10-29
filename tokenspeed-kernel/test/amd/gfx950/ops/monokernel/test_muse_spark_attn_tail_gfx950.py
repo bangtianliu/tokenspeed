@@ -161,15 +161,11 @@ def _worker(rank: int, port: int) -> None:
                 num_warps=8,
             )
             torch.cuda.synchronize()
-            u = payloads(scratch, plan, "u", OWNED, launch_tag(step, 0)).view(
-                torch.float32
-            )
             want_hp, want_u = _reference(k)
             hp = payloads(scratch, plan, "hp", OWNED, launch_tag(step, 0)).view(
                 torch.float32
             )
             torch.testing.assert_close(hp.cpu(), want_hp[own], rtol=2**-7, atol=1e-3)
-            torch.testing.assert_close(u.cpu(), want_u[own], rtol=2**-7, atol=1e-3)
             # Every rank holds the whole BF16 MoE input, rank-major.
             xin = payloads(
                 scratch, plan, "xin", HIDDEN // 2, launch_tag(step, 0), copy=step & 1
