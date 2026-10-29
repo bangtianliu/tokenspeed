@@ -103,9 +103,6 @@ def experts_kernel(
     )
     if active1:
         moe_experts.ex1_finish(mb, task1, a1, loads1, "ex1")
-    task, active = schedule.stage_task(PLAN, "act")
-    if active:
-        moe_experts.act_stage(mb, task, "act")
     if active2:
         moe_experts.ex2_finish(mb, task2, loads2, RANK, "ex2")
 
@@ -187,7 +184,7 @@ def _worker(rank: int, port: int) -> None:
         group = IrisGroup(ctx, dist.group.WORLD, rank, device)
         plan = Plan(
             grid=256,
-            stages=moe_experts.stages({"ex1": 0, "act": 0, "ex2": 0}),
+            stages=moe_experts.stages({"ex1": 0, "ex2": 0}),
             regions=(("route", 2 * TOP_K), ("cg", POOLED // 2)) + moe_experts.regions(),
             rows=1,
             chain=1,
