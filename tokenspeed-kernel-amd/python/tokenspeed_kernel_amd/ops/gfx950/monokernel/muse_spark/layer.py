@@ -25,7 +25,7 @@ Rank ``r`` owns hidden columns ``1024 r ..``: it keeps that slice of the FP32
 residual, and every rank keeps the whole BF16 attention input. The stages,
 in plan order (see each module):
 
-* attention: QKVG, head, attn, merge (``qkvg``, ``attention``);
+* attention: QKVG, gate, head, attn, merge (``qkvg``, ``attention``);
 * output projection and attention tail (``attn_tail``);
 * routing, pooler, experts, combine, post-expert projection and boundary
   (``moe_route``, ``moe_pool``, ``moe_experts``, ``moe_tail``).
@@ -59,7 +59,8 @@ WINDOW = attention.WINDOW
 # earlier tasks first. The trace decides the next one.
 BASES = {
     "qkvg": 0,
-    "head": 144,
+    "gate": 0,
+    "head": 158,
     "attn": 162,
     "merge": 240,
     "oproj": 0,
@@ -92,7 +93,7 @@ def layer_plan(full: bool) -> Plan:
         + moe_tail.regions()
     )
     stages = (
-        qkvg.stages(_bases("qkvg"))
+        qkvg.stages(_bases("qkvg", "gate"))
         + attention.stages(_bases("head", "attn", "merge"), splits)
         + attn_tail.stages(_bases("oproj", "tail"))
         + moe_route.stages(_bases("router", "topk"))
@@ -194,6 +195,9 @@ def gluon_muse_spark_layer_gfx950(
     task, active = schedule.stage_task(PLAN, "qkvg")
     if active:
         qkvg.qkvg_stage(mb, task, w_qkvg, a_in, 0, "qkvg")
+    task, active = schedule.stage_task(PLAN, "gate")
+    if active:
+        qkvg.gate_stage(mb, task, w_qkvg, a_in, 0, "gate")
     task, active = schedule.stage_task(PLAN, "head")
     if active:
         attention.head_stage(

@@ -18,7 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Muse Spark QKVG stage: the fused q | k | v | gate projection of one rank."""
+"""Muse Spark QKVG and gate stages: the fused q | k | v | gate projection
+of one rank, in two K halves."""
 
 from __future__ import annotations
 
@@ -41,7 +42,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import (  # noqa: E402
     bf16_tiles,
 )
 
-HIDDEN, QKVG = 8192, 2304
+HIDDEN, QKVG, GATE_ROW = 8192, 2304, 1280
 
 
 @gluon.jit
@@ -50,12 +51,15 @@ def qkvg_kernel(scratch, step, w, a, a_stride, PLAN: gl.constexpr):
     task, active = schedule.stage_task(PLAN, "qkvg")
     if active:
         qkvg.qkvg_stage(mb, task, w, a, a_stride, "qkvg")
+    task, active = schedule.stage_task(PLAN, "gate")
+    if active:
+        qkvg.gate_stage(mb, task, w, a, a_stride, "gate")
 
 
 def _plan(rows: int) -> Plan:
     return Plan(
         grid=256,
-        stages=qkvg.stages({"qkvg": 0}),
+        stages=qkvg.stages({"qkvg": 0, "gate": 0}),
         regions=qkvg.REGIONS,
         rows=rows,
         chain=1,
@@ -63,7 +67,7 @@ def _plan(rows: int) -> Plan:
 
 
 @pytest.mark.parametrize("rows", [1, 2, 4])
-def test_qkvg_is_the_bf16_rounded_fp32_projection(rows):
+def test_qkvg_halves_sum_to_the_bf16_rounded_fp32_projection(rows):
     g = torch.Generator().manual_seed(rows)
     w = (torch.randn(QKVG, HIDDEN, generator=g) / HIDDEN**0.5).to(torch.bfloat16)
     # A row stride wider than the row checks the row addressing.
@@ -83,8 +87,13 @@ def test_qkvg_is_the_bf16_rounded_fp32_projection(rows):
     )
     torch.cuda.synchronize()
     want = (a.double() @ w.double().T).to(torch.bfloat16)
+    tag = launch_tag(step, 0)
     for r in range(rows):
-        got = payloads(scratch, plan, "qkvg", QKVG // 2, launch_tag(step, 0), row=r)
-        got = got.view(torch.bfloat16).cpu()
+        halves = []
+        for region, n in (("qkvg", GATE_ROW), ("gate", QKVG - GATE_ROW)):
+            got = payloads(scratch, plan, region, 2 * n, tag, row=r)
+            halves.append(got.view(torch.float32).cpu().view(2, n))
+        # The consumers' value: the FP32 sum of the halves, rounded to BF16.
+        got = torch.cat(halves, dim=1).sum(0).to(torch.bfloat16)
         # FP32 sums in another order than FP64: at most one BF16 rounding step.
         torch.testing.assert_close(got.float(), want[r].float(), rtol=2**-7, atol=1e-3)
