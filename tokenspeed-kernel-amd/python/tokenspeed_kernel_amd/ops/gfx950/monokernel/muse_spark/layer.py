@@ -60,7 +60,7 @@ WINDOW = attention.WINDOW
 BASES = {
     "qkvg": 0,
     "head": 144,
-    "attn": 160,
+    "attn": 162,
     "merge": 240,
     "oproj": 0,
     "tail": 128,
