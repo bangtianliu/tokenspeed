@@ -37,7 +37,8 @@ output projection (a reduce-scatter).
     norm over all 8192 columns), then the residual gate ``h' = beta b +
     alpha h``, stored as the rank's next residual slice; puts ``sum h'^2``.
   - tail3: ``u = h' rsqrt(mean(h'^2) + 1e-5) bf16(w + 1)`` (the pre-FFN
-    norm), published as FP32 in ``u`` for the MoE.
+    norm), published as FP32 in ``u`` for the router, and as BF16 in every
+    rank's ``xin`` (the MoE input, which the pooler reads whole).
 """
 
 from __future__ import annotations
@@ -55,7 +56,7 @@ TAIL_COLS = gl.constexpr(128)
 POST_EPS = gl.constexpr(1e-8)
 PRE_EPS = gl.constexpr(1e-5)
 
-PEERS = ("red", "ss1", "ss2")
+PEERS = ("red", "ss1", "ss2", "xin")
 
 
 def regions() -> tuple[tuple[str, int], ...]:
@@ -65,6 +66,7 @@ def regions() -> tuple[tuple[str, int], ...]:
         ("ss1", world * tasks),  # FP32 partial sums of squares [rank][task]
         ("ss2", world * tasks),
         ("u", owned),  # FP32 owned slice of the pre-FFN norm output
+        ("xin", world * owned // 2),  # BF16 pairs of the whole MoE input, rank-major
     )
 
 
@@ -75,7 +77,7 @@ def stages(bases: dict[str, int]) -> tuple[Stage, ...]:
         Stage("oproj", int(OPROJ_TASKS), oproj, reads=("z",), writes=("red",)),
         Stage("tail1", tasks, tail, reads=("red",), writes=("ss1",)),
         Stage("tail2", tasks, tail, reads=("ss1",), writes=("ss2",)),
-        Stage("tail3", tasks, tail, reads=("ss2",), writes=("u",)),
+        Stage("tail3", tasks, tail, reads=("ss2",), writes=("u", "xin")),
     )
 
 
@@ -196,4 +198,9 @@ def tail_stages(mb, task, h, h_out, alpha, beta, pre_gain, RANK: gl.constexpr):
     u_hi = hp_hi * inv2 * gl.load(pre_gain + c + 1)
     mb.put("u", c, u_lo.to(gl.int32, bitcast=True))
     mb.put("u", c + 1, u_hi.to(gl.int32, bitcast=True))
+    word = (u_lo.to(gl.bfloat16).to(gl.int16, bitcast=True).to(gl.int32) & 0xFFFF) | (
+        u_hi.to(gl.bfloat16).to(gl.int16, bitcast=True).to(gl.int32) << 16
+    )
+    for p in gl.static_range(WORLD):
+        mb.put_peer("xin", p, RANK * (OWNED // 2) + c // 2, word)
     mb.stamp("tail3", trace.END)
