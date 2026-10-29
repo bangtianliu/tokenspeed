@@ -30,12 +30,13 @@ them): a second copy of every expert would not fit.
   a quarter of K (64 KiB of weights). A task polls the whole pooled row,
   applies the pre-expert RMS norm, and quantizes its K quarter to MXFP4 (the
   regular path's "even" rule) in LDS. It publishes the FP32 partial sums.
-* act, 64 tasks: the 4 partials in K order, SwiGLU (``silu(gate) up``),
-  then the regular path's BF16 rounding and MXFP4 requantization (2 groups
-  of 32), published in ``inter``.
 * ex2, 256 tasks: pick ``k``, 128 of the 4096 output columns over the rank's
-  512 intermediate values (32 KiB). The BF16 partial goes to the rank that
-  owns those columns (``rr``), which sums the 8 ranks' partials.
+  512 intermediate values (32 KiB). A task polls its pick's ex1 partials,
+  sums the 4 in K order, applies SwiGLU (``silu(gate) up``) and the regular
+  path's MXFP4 requantization (groups of 32) itself: the 32 tasks of a pick
+  repeat this small step, so no stage hands the intermediate over. The BF16
+  partial goes to the rank that owns those columns (``rr``), which sums the
+  8 ranks' partials.
 
 Expert weights cannot load before routing picks the experts. So that both
 weight streams start then, and every CTA reads the same 96 KiB, a CTA runs
@@ -73,11 +74,9 @@ K_SLICE = gl.constexpr(1024)  # POOLED // KSPLIT
 NB1 = gl.constexpr(8)  # W13_N // BLOCK_N
 NB2 = gl.constexpr(32)  # POOLED // BLOCK_N
 EX1_TASKS = gl.constexpr(256)  # TOP_K * NB1 * KSPLIT
-ACT_TASKS = gl.constexpr(64)  # TOP_K * NB1
 EX2_BLOCKS = gl.constexpr(1)  # 128-column blocks of an ex2 task
 EX2_TASKS = gl.constexpr(256)  # TOP_K * NB2 // EX2_BLOCKS
 OWNED_OUT = gl.constexpr(512)  # output columns a rank reduces: POOLED / WORLD
-INTER_WORDS = gl.constexpr(72)  # a pick's MXFP4 intermediate: 64 words + 8 scale words
 PRE_EPS = gl.constexpr(1e-5)
 
 PEERS = ("rr",)
@@ -87,7 +86,6 @@ def regions() -> tuple[tuple[str, int], ...]:
     k, nb1, ks, bn = int(TOP_K), int(NB1), int(KSPLIT), int(BLOCK_N)
     return (
         ("p1", k * nb1 * ks * bn),  # FP32 [pick][block][K quarter][column]
-        ("inter", k * int(INTER_WORDS)),
         (
             "rr",
             int(WORLD) * k * int(OWNED_OUT) // 2,
@@ -96,11 +94,10 @@ def regions() -> tuple[tuple[str, int], ...]:
 
 
 def stages(bases: dict[str, int]) -> tuple[Stage, ...]:
-    ex1, act, ex2 = placement(bases, ("ex1", "act", "ex2"))
+    ex1, ex2 = placement(bases, ("ex1", "ex2"))
     return (
         Stage("ex1", int(EX1_TASKS), ex1, reads=("route", "cg"), writes=("p1",)),
-        Stage("act", int(ACT_TASKS), act, reads=("p1",), writes=("inter",)),
-        Stage("ex2", int(EX2_TASKS), ex2, reads=("route", "inter"), writes=("rr",)),
+        Stage("ex2", int(EX2_TASKS), ex2, reads=("route", "p1"), writes=("rr",)),
     )
 
 
@@ -282,74 +279,6 @@ def ex1_finish(mb, task, a, tiles, STAGE: gl.constexpr):
 
 
 @gluon.jit
-def _pack_bytes(b, WORDS: gl.constexpr):
-    """``uint8 [4 WORDS]`` as ``int32 [WORDS]``, byte 0 lowest."""
-    q = gl.reshape(b.to(gl.int32) & 0xFF, [WORDS, 4])
-    shift = gl.arange(0, 4, gl.SliceLayout(0, q.type.layout))[None, :] * 8
-    return gl.sum(q << shift, axis=1)
-
-
-@gluon.jit
-def act_stage(mb, task, STAGE: gl.constexpr):
-    """Act task ``task`` = (pick, column block): 64 intermediate values."""
-    mb.stamp(STAGE, trace.START)
-    pick = task // NB1
-    blk = task % NB1
-    nw: gl.constexpr = gl.num_warps()
-    pl: gl.constexpr = gl.BlockedLayout([1, 2], [1, 64], [1, nw], [1, 0])
-    ks = gl.arange(0, KSPLIT, gl.SliceLayout(1, pl))
-    n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, pl))
-    (got,) = mb.poll_many(
-        ("p1",), (((pick * NB1 + blk) * KSPLIT + ks[:, None]) * BLOCK_N + n[None, :],)
-    )
-    mb.stamp(STAGE, trace.READY)
-    parts = got.to(gl.float32, bitcast=True)
-    acc = gl.zeros([BLOCK_N], gl.float32, gl.SliceLayout(0, pl))
-    for k in gl.static_range(KSPLIT):
-        acc += gl.sum(gl.where(ks[:, None] == k, parts, 0.0), axis=0)
-    gate, up = gl.split(gl.reshape(acc, [BLOCK_N // 2, 2]))
-    h = gate / (1.0 + gl.exp(-gate)) * up
-    h16 = (
-        gl.zeros(
-            [M_DUP, 1], gl.float32, gl.BlockedLayout([1, 1], [1, 64], [1, nw], [1, 0])
-        )
-        + gl.convert_layout(
-            h, gl.SliceLayout(0, gl.BlockedLayout([1, 1], [1, 64], [1, nw], [1, 0]))
-        )[None, :]
-    )
-    packed, scales = _mxfp4_quantize_tile(h16)
-    mb.stamp(STAGE, trace.COMPUTED)
-    row0p = gl.sum(
-        gl.where(
-            gl.arange(0, M_DUP, gl.SliceLayout(1, packed.type.layout))[:, None] == 0,
-            packed.to(gl.int32),
-            0,
-        ),
-        axis=0,
-    )
-    row0s = gl.sum(
-        gl.where(
-            gl.arange(0, M_DUP, gl.SliceLayout(1, scales.type.layout))[:, None] == 0,
-            scales.to(gl.int32),
-            0,
-        ),
-        axis=0,
-    )
-    words = _pack_bytes(row0p, 8)
-    base = pick * INTER_WORDS
-    mb.put("inter", base + blk * 8 + gl.arange(0, 8, words.type.layout), words)
-    # The block's two scale bytes in one word: group 2 blk low, 2 blk + 1 next.
-    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
-    sword = gl.sum(row0s << (gl.arange(0, 2, row0s.type.layout) * 8), axis=0)
-    mb.put(
-        "inter",
-        base + 64 + blk + gl.arange(0, 1, lanes),
-        gl.zeros([1], gl.int32, lanes) + sword,
-    )
-    mb.stamp(STAGE, trace.END)
-
-
-@gluon.jit
 def ex2_issue(
     mb,
     task,
@@ -400,48 +329,38 @@ def ex2_issue(
 
 @gluon.jit
 def ex2_finish(mb, task, loads, RANK: gl.constexpr, STAGE: gl.constexpr):
-    """Ex2 task ``task`` after :func:`ex2_issue`: poll the pick's MXFP4
-    intermediate, multiply, and put the BF16 partial to the owner rank."""
+    """Ex2 task ``task`` after :func:`ex2_issue`: poll the pick's ex1
+    partials, form the MXFP4 intermediate, multiply, and put the BF16
+    partial to the owner rank."""
     TASKS_PER_PICK: gl.constexpr = NB2 // EX2_BLOCKS
     pick = task // TASKS_PER_PICK
     blk0 = (task % TASKS_PER_PICK) * EX2_BLOCKS
     nw: gl.constexpr = gl.num_warps()
-    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
-    i = gl.arange(0, 128, lanes)  # INTER_WORDS, rounded up to a power of two
-    (got,) = mb.poll_many(
-        ("inter",), (pick * INTER_WORDS + gl.minimum(i, INTER_WORDS - 1),)
+    gl.static_assert(nw == NB1, "ex2 sums one ex1 column block a wave")
+    # [ex1 block, K quarter, column]: a wave per block, the K quarters in a
+    # lane's registers.
+    pl: gl.constexpr = gl.BlockedLayout(
+        [1, KSPLIT, 2], [1, 1, 64], [nw, 1, 1], [2, 1, 0]
     )
+    b1 = gl.arange(0, NB1, gl.SliceLayout(1, gl.SliceLayout(2, pl)))[:, None, None]
+    ks = gl.arange(0, KSPLIT, gl.SliceLayout(0, gl.SliceLayout(2, pl)))[None, :, None]
+    n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, gl.SliceLayout(1, pl)))[None, None, :]
+    (got,) = mb.poll_many(("p1",), (((pick * NB1 + b1) * KSPLIT + ks) * BLOCK_N + n,))
     mb.stamp(STAGE, trace.READY)
-    # Bytes of the packed values (words 0..63) and the 16 scales (2 per block word).
-    bl: gl.constexpr = gl.BlockedLayout([1, 4], [1, 64], [1, nw], [1, 0])
-    words_smem = gl.allocate_shared_memory(
-        gl.int32, [128], gl.SwizzledSharedLayout(1, 1, 1, [0])
+    parts = got.to(gl.float32, bitcast=True)
+    # The regular path's order: K quarter 0, then 1, ...
+    acc = gl.zeros([NB1, BLOCK_N], gl.float32, gl.SliceLayout(1, pl))
+    for k in gl.static_range(KSPLIT):
+        acc += gl.sum(gl.where(ks == k, parts, 0.0), axis=1)
+    gate, up = gl.split(gl.reshape(acc, [NB1, BLOCK_N // 2, 2]))
+    h = gl.reshape(gate / (1.0 + gl.exp(-gate)) * up, [INTER])
+    ql: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [1, nw], [1, 0])
+    h16 = (
+        gl.zeros([M_DUP, 1], gl.float32, ql)
+        + gl.convert_layout(h, gl.SliceLayout(0, ql))[None, :]
     )
-    words_smem.store(got)
-    gl.barrier()
-    pw = words_smem.slice(0, 64).load(
-        gl.SliceLayout(1, gl.BlockedLayout([1, 4], [64, 1], [nw, 1], [1, 0]))
-    )
-    sh = gl.arange(
-        0, 4, gl.SliceLayout(0, gl.BlockedLayout([1, 4], [64, 1], [nw, 1], [1, 0]))
-    )
-    pbytes = gl.reshape((pw[:, None] >> (sh[None, :] * 8)) & 0xFF, [INTER // 2])
-    sw = words_smem.slice(64, 8).load(
-        gl.SliceLayout(1, gl.BlockedLayout([1, 2], [32, 2], [nw, 1], [1, 0]))
-    )
-    s2 = gl.arange(
-        0, 2, gl.SliceLayout(0, gl.BlockedLayout([1, 2], [32, 2], [nw, 1], [1, 0]))
-    )
-    sbytes = gl.reshape((sw[:, None] >> (s2[None, :] * 8)) & 0xFF, [INTER // 32])
-    p16 = (
-        gl.zeros([M_DUP, 1], gl.int32, bl)
-        + gl.convert_layout(pbytes, gl.SliceLayout(0, bl))[None, :]
-    )
-    s16 = (
-        gl.zeros([M_DUP, 1], gl.int32, bl)
-        + gl.convert_layout(sbytes, gl.SliceLayout(0, bl))[None, :]
-    )
-    p_smem, s_smem = _stage_a(p16.to(gl.uint8), s16.to(gl.uint8))
+    packed, scales = _mxfp4_quantize_tile(h16)
+    p_smem, s_smem = _stage_a(packed, scales)
     owner = (blk0 * BLOCK_N) // OWNED_OUT
     for b in gl.static_range(EX2_BLOCKS):
         acc = _mma_row(p_smem, s_smem, loads[b])
