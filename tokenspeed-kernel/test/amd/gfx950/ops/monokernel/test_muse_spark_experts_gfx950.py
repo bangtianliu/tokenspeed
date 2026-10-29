@@ -88,6 +88,21 @@ def experts_kernel(
 ):
     peers = mailbox.load_peers(bases, RANK, gl.load(step) & 1, 8)
     mb = mailbox.Mailbox(scratch, mailbox.launch_tag(step, 0), PLAN, None, peers)
+    # Both expert weight streams start once routing names the experts: a CTA
+    # with an ex2 task issues its w2 loads before its ex1 task.
+    task2, active2 = schedule.stage_task(PLAN, "ex2")
+    loads2 = moe_experts.ex2_issue(
+        mb,
+        gl.where(active2, task2, 0),
+        active2,
+        w2,
+        w2s,
+        s2_we,
+        s2_se,
+        s2_lin,
+        s2_nb,
+        "ex2",
+    )
     task, active = schedule.stage_task(PLAN, "ex1")
     if active:
         moe_experts.ex1_stage(
@@ -96,11 +111,8 @@ def experts_kernel(
     task, active = schedule.stage_task(PLAN, "act")
     if active:
         moe_experts.act_stage(mb, task, "act")
-    task, active = schedule.stage_task(PLAN, "ex2")
-    if active:
-        moe_experts.ex2_stage(
-            mb, task, w2, w2s, s2_we, s2_se, s2_lin, s2_nb, RANK, "ex2"
-        )
+    if active2:
+        moe_experts.ex2_finish(mb, task2, loads2, RANK, "ex2")
 
 
 def _raw_experts(rank: int):
