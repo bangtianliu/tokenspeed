@@ -69,7 +69,7 @@ BASES = {
     "pool": 192,
     "ex1": 0,
     "act": 0,
-    "ex2": 128,
+    "ex2": 0,
     "comb": 64,
     "unpool": 128,
     "fin": 200,
@@ -224,26 +224,21 @@ def gluon_muse_spark_layer_gfx950(
     task, active = schedule.stage_task(PLAN, "pool")
     if active:
         moe_pool.pool_stage(mb, task, w_pool, RANK, "pool")
-    # Both expert weight streams start once routing names the experts: a CTA
-    # with an ex2 task issues its w2 loads before its ex1 task.
+    # A CTA's ex1 and ex2 tasks run in parts (see moe_experts): the A
+    # operand first, then both weight streams once routing names the experts.
+    task1, active1 = schedule.stage_task(PLAN, "ex1")
+    task1 = gl.where(active1, task1, 0)
     task2, active2 = schedule.stage_task(PLAN, "ex2")
-    loads2 = moe_experts.ex2_issue(
-        mb,
-        gl.where(active2, task2, 0),
-        active2,
-        w2,
-        w2s,
-        s2_we,
-        s2_se,
-        s2_lin,
-        s2_nb,
-        "ex2",
+    task2 = gl.where(active2, task2, 0)
+    a1 = moe_experts.ex1_prep(mb, task1, active1, pre_exp_gain, "ex1")
+    loads1 = moe_experts.ex1_issue(
+        mb, task1, active1, w13, w13s, s13_we, s13_se, s13_lin, s13_nb
     )
-    task, active = schedule.stage_task(PLAN, "ex1")
-    if active:
-        moe_experts.ex1_stage(
-            mb, task, w13, w13s, s13_we, s13_se, s13_lin, s13_nb, pre_exp_gain, "ex1"
-        )
+    loads2 = moe_experts.ex2_issue(
+        mb, task2, active2, w2, w2s, s2_we, s2_se, s2_lin, s2_nb, "ex2"
+    )
+    if active1:
+        moe_experts.ex1_finish(mb, task1, a1, loads1, "ex1")
     task, active = schedule.stage_task(PLAN, "act")
     if active:
         moe_experts.act_stage(mb, task, "act")
