@@ -27,6 +27,7 @@ import os
 import sys
 
 import pytest
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -42,10 +43,15 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa:
 from tokenspeed.runtime.execution.output_layout import (  # noqa: E402
     ForwardOutputLayout,
 )
+from tokenspeed.runtime.layers.moe.weights.loaders import (  # noqa: E402
+    load_w2,
+    load_w13,
+)
 from tokenspeed.runtime.models.muse_spark_monokernel import (  # noqa: E402
     NOT_TP8,
     OTHER_CONSTANTS,
     OTHER_SHAPES,
+    _rank_slices,
     model_reasons,
     takes_monokernels,
 )
@@ -160,14 +166,67 @@ def _mapping(moe_tp: int, moe_ep: int) -> Mapping:
     )
 
 
-def test_muse_spark_open_at_tp8_has_monokernels() -> None:
-    assert model_reasons(_config(), _mapping(8, 1)) == []
+@pytest.mark.parametrize("moe_tp, moe_ep", [(8, 1), (1, 8)])
+def test_muse_spark_open_at_tp8_has_monokernels(moe_tp, moe_ep) -> None:
+    """Both MoE splits of a TP8 server: an EP8 server gathers each rank's
+    expert slices for the kernel."""
+    assert model_reasons(_config(), _mapping(moe_tp, moe_ep)) == []
 
 
-def test_expert_parallel_moe_keeps_the_regular_path() -> None:
-    """A launch computes every expert's 1/8 slice: experts split across
-    ranks have no monokernel."""
-    assert model_reasons(_config(), _mapping(4, 2)) == [NOT_TP8]
+@pytest.mark.parametrize("moe_tp, moe_ep", [(4, 2), (2, 4)])
+def test_other_moe_splits_keep_the_regular_path(moe_tp, moe_ep) -> None:
+    assert model_reasons(_config(), _mapping(moe_tp, moe_ep)) == [NOT_TP8]
+
+
+def _loaded(
+    gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor, rank: int, size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One expert's w13 and w2 as the MoE loader of TP rank ``rank`` of
+    ``size`` stores them."""
+    inter = gate.shape[0] // size
+    w13 = torch.zeros(2 * inter, gate.shape[1], dtype=gate.dtype)
+    w2 = torch.zeros(down.shape[0], down.shape[1] // size, dtype=down.dtype)
+    for shard_id, weight in (("w1", gate), ("w3", up)):
+        load_w13(w13, weight, shard_id, 0, rank, False, False, False, size)
+    load_w2(w2, down, "w2", 1, rank, False, False, False, size)
+    return w13, w2
+
+
+def test_ep8_slices_match_the_ep1_loaders_shards() -> None:
+    """The slices an EP8 server sends, in the order the all-to-all delivers
+    them, are the shards an EP1 server's loader holds: the same intermediate
+    values of each expert's gate, up and down projections."""
+    world, experts, inter, width = 8, 16, 64, 24
+    g = torch.Generator().manual_seed(0)
+
+    def rand(*shape):
+        return torch.randint(0, 256, shape, dtype=torch.uint8, generator=g)
+
+    gate, up = rand(experts, inter, width), rand(experts, inter, width)
+    down = rand(experts, width, inter)
+    per_rank = experts // world
+    # Each EP8 rank holds whole experts and slices them by destination.
+    sent = []
+    for owner in range(world):
+        mine = range(owner * per_rank, (owner + 1) * per_rank)
+        whole = [_loaded(gate[e], up[e], down[e], 0, 1) for e in mine]
+        sent.append(
+            (
+                _rank_slices(
+                    torch.stack([w for w, _ in whole]), 1, world, gate_up=True
+                ),
+                _rank_slices(
+                    torch.stack([w for _, w in whole]), 2, world, gate_up=False
+                ),
+            )
+        )
+    for rank in range(world):
+        # The all-to-all gives rank ``rank`` every owner's slice ``rank``.
+        w13 = torch.cat([s[0][rank] for s in sent])
+        w2 = torch.cat([s[1][rank] for s in sent])
+        shards = [_loaded(gate[e], up[e], down[e], rank, world) for e in range(experts)]
+        assert torch.equal(w13, torch.stack([w for w, _ in shards]))
+        assert torch.equal(w2, torch.stack([w for _, w in shards]))
 
 
 @pytest.mark.parametrize(

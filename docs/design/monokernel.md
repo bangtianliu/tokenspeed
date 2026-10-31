@@ -11,7 +11,8 @@ its weights while earlier stages still compute.
 The users are on gfx950, behind `--decode-monokernel`:
 Qwen3.8-Flash-Next (`qwen4_exp`), whose Gated DeltaNet and QSA attention
 layers each have one monokernel, and Muse Spark Open (`muse_spark`), whose
-decoder layers 1 to 60 have one monokernel per rank of a TP8 group.
+decoder layers 1 to 60 have one monokernel per rank of a TP8 group (MoE TP8
+/ EP1 or MoE TP1 / EP8).
 
 ## Where the pieces live
 
@@ -190,6 +191,12 @@ layout, and the BF16 hyper-connection weights, which it re-encodes exactly
 as MXFP4. Muse Spark's BF16 dense weights are row-major, so its packer
 copies them once into the BF16 GEMV's tile order, and only the rows a rank
 computes; its MXFP4 experts are read in place from the gluon MoE's layout.
+The kernel computes each rank's slice of every picked expert, which spreads
+one token's 8 picks evenly over the ranks. So on an EP8 server, where a rank
+holds 32 whole experts, the seam gathers each rank's slices of all 256 experts
+once at load (about 0.8 GB per layer and rank) rather than adding an EP
+expert stage, in which the rank with the most picks would set the layer's
+time.
 
 ## Placement
 

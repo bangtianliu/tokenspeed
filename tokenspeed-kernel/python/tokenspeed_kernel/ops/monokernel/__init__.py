@@ -46,6 +46,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 __all__ = [
     "FusedDecodeLayer",
     "muse_spark_layer_decode",
+    "prepare_muse_spark_experts",
     "prepare_muse_spark_layer",
     "qwen4_exp_mtp_front",
     "select_qwen4_exp_mtp_front",
@@ -355,6 +356,32 @@ def prepare_muse_spark_layer(
         scratch_pairs=scratch_pairs,
         late_weights=late_weights,
     )
+
+
+def prepare_muse_spark_experts(
+    *, tensors: dict[str, Any], override: str | None = None
+) -> tuple[torch.Tensor, ...] | None:
+    """Prepare one TP8 rank's slices of all 256 Muse Spark experts for the
+    monokernel, as the regular gluon MoE prepares them on an EP1 server. An
+    EP8 server, whose ranks hold whole experts, gathers the slices first.
+
+    Args:
+        tensors: The slices in the MoE loader's layout by role (see
+            ``tokenspeed_kernel_amd...muse_spark.weights.prepare_experts``).
+            The function consumes them.
+        override: Optional registered kernel name to force.
+
+    Returns:
+        ``prepare_muse_spark_layer``'s ``experts`` tuple, or None when no
+        monokernel serves the layer here.
+    """
+    try:
+        prepare = _select("muse_spark_experts_prepare", 1, override)
+    except NoKernelFoundError:
+        if override is not None:
+            raise
+        return None
+    return prepare(tensors=tensors)
 
 
 def muse_spark_layer_decode(
