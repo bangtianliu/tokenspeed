@@ -39,7 +39,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import bf16_tiles
 
 WORLD = 8
@@ -150,6 +149,72 @@ def _mismatch(name: str, t: torch.Tensor, shape: tuple, dtype: torch.dtype) -> l
     return [f"{name}: expected {dtype} {shape}, got {t.dtype} {tuple(t.shape)}"]
 
 
+def prepare_experts(
+    *,
+    w13: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w13_input_layout: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare one TP8 rank's slices of all 256 experts as the regular path's
+    gluon MoE prepares them on an EP1 server, for ``pack_layer``'s
+    ``experts``. An EP8 server holds whole experts, so its caller gathers
+    these slices from the other ranks first. The function consumes the
+    inputs.
+
+    Args:
+        w13, w13_scale: uint8 ``[256, 1024, 2048]`` and ``[256, 1024, 128]``:
+            the rank's 512 gate and 512 up rows of each expert, in the MoE
+            loader's layout (``w13_input_layout``), with their E8M0 scales.
+        w2, w2_scale: uint8 ``[256, 4096, 256]`` and ``[256, 4096, 16]``: the
+            down projection's columns of the same 512 intermediate values.
+        w13_input_layout: The MoE layer's ``w13_input_layout``.
+
+    Returns:
+        ``(w13, w13 scales, w2, w2 scales)``: the raw tensors of the prepared
+        triton tensors.
+
+    Raises:
+        ValueError: A tensor has an unexpected shape or dtype.
+    """
+    # Imported here: only an EP8 server prepares experts this way.
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
+        _extract_gluon_raw_s,
+        _extract_gluon_raw_w,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (
+        preprocess_gluon_mxfp4_gfx950_moe_weights,
+    )
+
+    u8 = torch.uint8
+    errors = []
+    errors += _mismatch("w13", w13, (EXPERTS, 2 * INTER, POOLED // 2), u8)
+    errors += _mismatch("w13_scale", w13_scale, (EXPERTS, 2 * INTER, POOLED // 32), u8)
+    errors += _mismatch("w2", w2, (EXPERTS, POOLED, INTER // 2), u8)
+    errors += _mismatch("w2_scale", w2_scale, (EXPERTS, POOLED, INTER // 32), u8)
+    if errors:
+        raise ValueError("; ".join(errors))
+    # The regular path's preprocessing runs on a module that holds the
+    # loader's parameters, so the slices get the EP1 layout bit for bit.
+    module = torch.nn.Module()
+    module.w13_input_layout = w13_input_layout
+    for name, t in (
+        ("w13_weight", w13),
+        ("w13_weight_scale", w13_scale),
+        ("w2_weight", w2),
+        ("w2_weight_scale", w2_scale),
+    ):
+        module.register_parameter(name, torch.nn.Parameter(t, requires_grad=False))
+    preprocess_gluon_mxfp4_gfx950_moe_weights({}, module, preshuffle=True)
+    return (
+        _extract_gluon_raw_w(module.w13_weight_triton_tensor),
+        _extract_gluon_raw_s(module.w13_precision_config.b_mx_scale),
+        _extract_gluon_raw_w(module.w2_weight_triton_tensor),
+        _extract_gluon_raw_s(module.w2_precision_config.b_mx_scale),
+    )
+
+
 def pack_layer(
     *,
     rank: int,
@@ -252,4 +317,4 @@ def pack_layer(
     )
 
 
-__all__ = ["LayerWeights", "pack_layer"]
+__all__ = ["LayerWeights", "pack_layer", "prepare_experts"]

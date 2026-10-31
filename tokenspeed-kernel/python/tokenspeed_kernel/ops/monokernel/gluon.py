@@ -268,3 +268,18 @@ if _muse_spark_layer is not None:
             trace_buf=None,
             **operands,
         )
+
+    @register_kernel(
+        "monokernel",
+        "muse_spark_experts_prepare",
+        name="gluon_muse_spark_experts_prepare_gfx950",
+        solution="gluon",
+        capability=_MUSE_GFX950,
+        signatures=format_signatures("h", "dense", {torch.bfloat16}),
+        priority=Priority.SPECIALIZED,
+        traits=_MUSE_TRAITS,
+    )
+    def gluon_muse_spark_experts_prepare_gfx950(
+        *, tensors: dict[str, Any]
+    ) -> tuple[torch.Tensor, ...]:
+        return _muse_spark_weights.prepare_experts(**tensors)

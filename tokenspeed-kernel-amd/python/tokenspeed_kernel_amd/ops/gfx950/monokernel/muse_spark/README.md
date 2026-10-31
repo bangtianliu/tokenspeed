@@ -2,7 +2,8 @@
 
 These kernels run one decoder layer of Muse Spark Open (`muse_spark`) as one
 persistent launch per rank of a TP8 group (attention TP8, MoE TP8 / EP1), for
-one token row. They use the building blocks in [`../README.md`](../README.md).
+one token row. On a TP8 / EP8 server (MoE TP1 / EP8) they run on gathered
+expert slices (see [Weights](#weights)). They use the building blocks in [`../README.md`](../README.md).
 That file also gives the launch contract and the rules for writing a stage.
 
 ## Kernels
@@ -44,7 +45,7 @@ seam. The switch `--decode-monokernel` enables it.
 
 - Layers 1 to 60 are eligible. Layers 0 and 61 hand over to the embedding
   and the LM head, and keep the regular path.
-- A model is eligible at attention TP8 and MoE TP8 / EP1, with Muse Spark
+- A model is eligible at attention TP8 and MoE TP8 / EP1 or TP1 / EP8, with Muse Spark
   Open's dimensions and the constants the kernel bakes in (`KERNEL_CONSTANTS`),
   BF16 dense projections and norms, and routed experts on a gluon MXFP4 MoE
   kernel. The seam decides this once, at load, and logs every other layer
@@ -81,6 +82,16 @@ docstring gives its math and task split):
   path keeps its weights for prefill.
 - The routed MXFP4 experts are read in place, in the layout of the regular
   path's gluon MoE (`preprocess_gluon_mxfp4_gfx950_moe_weights`).
+- On an EP8 server a rank holds 32 whole experts, and the kernel reads the
+  rank's 1/8 slice of all 256. While the weights load, before the gluon MoE
+  prepares them, the seam (`prepare_ep8_experts`) sends each rank its slices
+  of the local experts (one all-to-all per tensor), and `prepare_experts`
+  prepares them with the same gluon preprocessing as an EP1 server's. The
+  copy is about 0.8 GB per layer and rank, 48 GB for 60 layers, taken from
+  the KV cache. The EP8 weights stay for the regular path. A kernel that runs
+  whole experts on their owners would need no copy, but one token's 8 picks
+  then land on the ranks unevenly, and the busiest rank sets the layer's
+  time.
 - The router takes the owned columns of the FP32 router weight. The norm
   gains are the FP32 `bf16(w + offset)`. The residual gate coefficients stay
   views of the regular path's tensors.
@@ -112,9 +123,10 @@ QKVG and attention tests need 8 GPUs.
 | `test_muse_spark_pool_gfx950.py` | The pooler. |
 | `test_muse_spark_experts_gfx950.py` | The experts, on the regular path's preprocessed weights. |
 | `test_muse_spark_moe_tail_gfx950.py` | The combine, post-expert projection and boundary. |
-| `test_muse_spark_layer_gfx950.py` | The whole layer through the packer and the launcher, no recompiles across layers, steps and lengths, and the packer's errors. |
+| `test_muse_spark_layer_gfx950.py` | The whole layer through the packer and the launcher, no recompiles across layers, steps and lengths, CUDA graph replays against eager launches, and the packer's errors. |
 
 Each stage test runs a slice of the real plan and compares it with a torch
 reference of TokenSpeed's math (`muse_spark_reference.py`).
 `test/runtime/test_muse_spark_monokernel_seam.py` covers which forwards and
-models the seam serves.
+models the seam serves, and that an EP8 server's expert slices are the shards
+of an EP1 server's loader.
