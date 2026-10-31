@@ -166,6 +166,39 @@ def _reference(sh, length, full, kernel_pooled, kernel_hp):
     return pooled, hp, (sh["beta1"] * b).abs(), h2, a, (sh["beta2"] * y).abs()
 
 
+def _pack(rank: int, dev: torch.device, sh: dict, length: int, full: bool):
+    """Pack ``rank``'s layer from the regular path's tensors."""
+    w = _rank_weights(rank, length)
+    w13, w13s, w2, w2s = ref.preprocessed_experts(rank, EXPERTS, dev)
+    # The packer takes the regular path's tensors: the replicated pooler
+    # and post-expert weights, and the router as the regular path stores
+    # it (logits are x @ router); it slices this rank's part.
+    return pack_layer(
+        rank=rank,
+        full=full,
+        qkvg=w["w_qkvg"].to(dev),
+        o=w["w_o"].to(dev),
+        alpha1=sh["alpha1"].to(dev),
+        beta1=sh["beta1"].to(dev),
+        pre_gain=sh["pre_gain"].to(dev),
+        router=sh["router"].t().to(dev),
+        router_bias=sh["bias"].to(dev),
+        pool=torch.cat([_rank_weights(r, length)["w_pool"] for r in range(WORLD)]).to(
+            dev
+        ),
+        experts=tuple(_all_experts(t) for t in (w13, w13s, w2, w2s)),
+        pre_exp_gain=sh["pre_exp_gain"].to(dev),
+        pen_gain=sh["pen_gain"].to(dev),
+        post=torch.cat([_rank_weights(r, length)["w_post"] for r in range(WORLD)]).to(
+            dev
+        ),
+        post_gain=sh["post_gain"].to(dev),
+        alpha2=sh["alpha2"].to(dev),
+        beta2=sh["beta2"].to(dev),
+        in_gain=sh["in_gain"].to(dev),
+    )
+
+
 def _worker(rank: int, port: int, length: int, full: bool) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
@@ -183,36 +216,9 @@ def _worker(rank: int, port: int, length: int, full: bool) -> None:
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         sh = _shared(42, length)
         w = _rank_weights(rank, length)
-        w13, w13s, w2, w2s = ref.preprocessed_experts(rank, EXPERTS, dev)
+        weights = _pack(rank, dev, sh, length, full)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         k_cache, v_cache = w["k_cache"].to(dev), w["v_cache"].to(dev)
-        # The packer takes the regular path's tensors: the replicated pooler
-        # and post-expert weights, and the router as the regular path stores
-        # it (logits are x @ router); it slices this rank's part.
-        weights = pack_layer(
-            rank=rank,
-            full=full,
-            qkvg=w["w_qkvg"].to(dev),
-            o=w["w_o"].to(dev),
-            alpha1=sh["alpha1"].to(dev),
-            beta1=sh["beta1"].to(dev),
-            pre_gain=sh["pre_gain"].to(dev),
-            router=sh["router"].t().to(dev),
-            router_bias=sh["bias"].to(dev),
-            pool=torch.cat(
-                [_rank_weights(r, length)["w_pool"] for r in range(WORLD)]
-            ).to(dev),
-            experts=tuple(_all_experts(t) for t in (w13, w13s, w2, w2s)),
-            pre_exp_gain=sh["pre_exp_gain"].to(dev),
-            pen_gain=sh["pen_gain"].to(dev),
-            post=torch.cat(
-                [_rank_weights(r, length)["w_post"] for r in range(WORLD)]
-            ).to(dev),
-            post_gain=sh["post_gain"].to(dev),
-            alpha2=sh["alpha2"].to(dev),
-            beta2=sh["beta2"].to(dev),
-            in_gain=sh["in_gain"].to(dev),
-        )
         h_in = sh["h"][own].to(dev)
         a_in = sh["a_in"].to(dev)
         h_next = torch.empty(OWNED, device=dev)
@@ -312,6 +318,104 @@ def test_layer_matches_the_regular_path_math(full):
         sock.bind(("", 0))
         port = sock.getsockname()[1]
     mp.spawn(_worker, args=(port, 3000, full), nprocs=WORLD, join=True)
+
+
+def _graph_worker(rank: int, port: int, length: int) -> None:
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://localhost:{port}",
+        rank=rank,
+        world_size=WORLD,
+        timeout=timedelta(seconds=900),
+    )
+    try:
+        dev = torch.device(f"cuda:{rank}")
+        ctx = get_or_create_context(heap_size=256 << 20)
+        group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
+        plan = layer.layer_plan(False)
+        scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
+        sh = _shared(42, length)
+        weights = _pack(rank, dev, sh, length, False)
+        w = _rank_weights(rank, length)
+        own = slice(rank * OWNED, (rank + 1) * OWNED)
+        k_cache, v_cache = w["k_cache"].to(dev), w["v_cache"].to(dev)
+        h_in = sh["h"][own].to(dev)
+        a_in = sh["a_in"].to(dev)
+        h_out = torch.empty(OWNED, device=dev)
+        a_out = torch.empty(HIDDEN, dtype=torch.bfloat16, device=dev)
+        # The per-step operands are device tensors that the decode metadata
+        # refreshes in place, as in serving.
+        step = torch.zeros(1, dtype=torch.int32, device=dev)
+        seq_len = torch.empty(1, dtype=torch.int32, device=dev)
+        slot = torch.empty(1, dtype=torch.int32, device=dev)
+        page_table = sh["table"].to(dev)
+        cos_sin = ref.rope_table(length + 1).to(dev)
+
+        def forward() -> None:
+            layer.launch_gluon_muse_spark_layer_gfx950(
+                weights,
+                h=h_in,
+                a=a_in,
+                h_out=h_out,
+                a_out=a_out,
+                seq_len=seq_len,
+                slot=slot,
+                page_table=page_table,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                cos_sin=cos_sin,
+                scratch=scratch,
+                step=step,
+                peer_bases=group.bases,
+                layer=2,
+                trace_buf=None,
+            )
+            # The seam moves the tag base once per forward, in the graph.
+            step.add_(1)
+
+        def refresh(n: int) -> None:
+            pos = n - 1
+            seq_len.fill_(n)
+            slot.fill_(int(sh["table"][pos // 64]) * 64 + pos % 64)
+
+        group.finish_prepare()
+        refresh(length)
+        forward()
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            forward()
+        dist.barrier()
+        for k, n in enumerate((length, length - 1, length - 70)):
+            refresh(n)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert int(step) == 2 + 2 * k
+            replayed = h_out.clone(), a_out.clone()
+            dist.barrier()
+            # An eager launch of the same step (under the next tag) gives
+            # the same bits.
+            forward()
+            torch.cuda.synchronize()
+            assert torch.equal(h_out, replayed[0])
+            assert torch.equal(a_out, replayed[1])
+            dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_graph_replays_match_eager_launches():
+    """The decode graph captures the launch: a replay reads the step, the
+    length and the write slot from device tensors, so each replay with
+    refreshed values equals an eager launch of the same step."""
+    if torch.cuda.device_count() < WORLD:
+        pytest.skip(f"requires {WORLD} GPUs")
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_graph_worker, args=(port, 3000), nprocs=WORLD, join=True)
 
 
 def test_the_packer_names_every_tensor_of_another_layout():

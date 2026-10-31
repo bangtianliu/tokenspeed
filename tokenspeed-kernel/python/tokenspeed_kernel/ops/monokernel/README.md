@@ -21,7 +21,9 @@ through `select_kernel("monokernel", ...)` with the trait `rows`:
 Muse Spark's ops serve one row and have no MXFP4 dense projections:
 `prepare_muse_spark_layer(tensors=)` and `muse_spark_layer_decode(layer, *,
 h, a, h_out, a_out, ...)`, where `h` is the rank's owned residual columns and
-`a` the whole attention input.
+`a` the whole attention input. `prepare_muse_spark_experts(tensors=)` prepares
+a rank's expert slices that an EP8 server gathers, in the layout that
+`prepare_muse_spark_layer` reads.
 
 The caller owns two values that every layer of a step shares:
 
