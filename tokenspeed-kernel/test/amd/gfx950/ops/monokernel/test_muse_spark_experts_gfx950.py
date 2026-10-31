@@ -88,20 +88,22 @@ def experts_kernel(
 ):
     peers = mailbox.load_peers(bases, RANK, gl.load(step) & 1, 8)
     mb = mailbox.Mailbox(scratch, mailbox.launch_tag(step, 0), PLAN, None, peers)
-    # A CTA's ex1 and ex2 tasks run in parts (see moe_experts): the A
-    # operand first, then both weight streams once routing names the experts.
+    # A CTA's ex1 and ex2 tasks run in parts (see moe_experts): both weight
+    # streams once routing names the experts, then the A operand meanwhile.
     task1, active1 = schedule.stage_task(PLAN, "ex1")
     task1 = gl.where(active1, task1, 0)
     task2, active2 = schedule.stage_task(PLAN, "ex2")
     task2 = gl.where(active2, task2, 0)
-    a1 = moe_experts.ex1_prep(mb, task1, active1, pre_gain, "ex1")
-    e1, e2 = moe_experts.expert_ids(mb, task1, task2)
+    got1, gain_lo, gain_hi, e1, e2 = moe_experts.ex1_poll(
+        mb, task1, task2, active1, pre_gain, "ex1"
+    )
     loads1 = moe_experts.ex1_issue(
         task1, active1, e1, w13, w13s, s13_we, s13_se, s13_lin, s13_nb
     )
     loads2 = moe_experts.ex2_issue(
         mb, task2, active2, e2, w2, w2s, s2_we, s2_se, s2_lin, s2_nb, "ex2"
     )
+    a1 = moe_experts.ex1_operand(task1, got1, gain_lo, gain_hi)
     if active1:
         moe_experts.ex1_finish(mb, task1, a1, loads1, "ex1")
     if active2:

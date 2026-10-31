@@ -78,7 +78,7 @@ def fill(
     as the stage that writes the region would (``copy``: the launch parity's
     copy of a peer region)."""
     start = _start(plan, region, copy)
-    words = payload.contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    words = payload.reshape(-1).view(torch.int32).to(torch.int64) & 0xFFFFFFFF
     scratch[start : start + words.numel()] = (tag << 32) | words
 
 
