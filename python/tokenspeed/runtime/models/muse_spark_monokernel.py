@@ -34,6 +34,15 @@ places:
 * the layer loop runs ``step.layer(i)`` in place of layer ``i`` where it is
   not None, and calls ``step.finish()`` after the loop.
 
+Both MoE splits of a TP8 server are served: MoE TP8 / EP1 and MoE TP1 /
+EP8. The kernel computes each rank's slice of every picked expert, so on an
+EP8 server, where a rank holds 32 whole experts, :func:`prepare_ep8_experts`
+gathers the rank's slices of all 256 experts once while the weights load: a
+copy of about 0.8 GB per layer and rank (EP8's own weights stay for the
+regular path). An EP8 kernel that runs whole experts on their owners would
+read no copy, but the rank with the most of a token's 8 picks would set the
+layer's time.
+
 The launch boundary: rank ``r`` keeps hidden columns ``1024 r ..`` of the
 FP32 residual and the whole BF16 attention input of the next layer (normed by
 that layer's input norm). The regular layers hand over the whole residual
@@ -53,10 +62,11 @@ import torch.distributed as dist
 from tokenspeed_kernel.ops.monokernel import (
     FusedDecodeLayer,
     muse_spark_layer_decode,
+    prepare_muse_spark_experts,
     prepare_muse_spark_layer,
 )
 
-from tokenspeed.runtime.distributed.comm_ops import all_gather
+from tokenspeed.runtime.distributed.comm_ops import all_gather, all_to_all_single
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.models.decode_monokernel import coverage
@@ -67,6 +77,8 @@ logger = logging.getLogger(__name__)
 # One token row per launch: decode steps of one request.
 MAX_ROWS = 1
 WORLD = 8
+# The served MoE splits, as (MoE TP size, EP size).
+MOE_SPLITS = frozenset({(WORLD, 1), (1, WORLD)})
 HIDDEN = 8192
 OWNED = HIDDEN // WORLD
 PAGE_SIZE = 64
@@ -97,7 +109,7 @@ EXPERT_KERNELS = frozenset(
 
 # Why a layer has no monokernel. The startup report groups layers by these.
 BOUNDARY_LAYER = "the first and last layers hand over to the embedding and LM head"
-NOT_TP8 = "attention and MoE are not one TP8 group with EP1"
+NOT_TP8 = "attention and MoE are not one TP8 group with MoE TP8 / EP1 or TP1 / EP8"
 OTHER_SHAPES = "model dimensions other than the kernel's"
 OTHER_CONSTANTS = "model constants other than the kernel's"
 NOT_BF16 = "a dense projection or norm gain is not BF16"
@@ -122,11 +134,20 @@ def _bf16(proj: torch.nn.Module) -> torch.Tensor | None:
     return weight if weight.dtype == torch.bfloat16 else None
 
 
-def _experts(experts: torch.nn.Module) -> tuple[torch.Tensor, ...] | None:
+def _gluon_experts(mlp: torch.nn.Module) -> bool:
+    """Whether the routed experts of ``mlp`` (a ``MuseSparkMoE``) run a gluon
+    MXFP4 kernel, whose weight layout the monokernel reads."""
+    return (
+        mlp.quantized_experts
+        and mlp.experts.plan["apply_kernel_name"] in EXPERT_KERNELS
+    )
+
+
+def _experts(experts: torch.nn.Module) -> tuple[torch.Tensor, ...]:
     """``(w13, w13 scales, w2, w2 scales)`` of the regular gluon MXFP4 MoE's
-    prepared weights, else None."""
-    if experts.plan["apply_kernel_name"] not in EXPERT_KERNELS:
-        return None
+    prepared weights."""
+    # The monokernel reads the gluon MoE's prepared storage in place; the
+    # registry selects kernels, not another solution's weight layout.
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
         _extract_gluon_raw_s,
         _extract_gluon_raw_w,
@@ -146,8 +167,7 @@ def model_reasons(config, mapping) -> list[str]:
     reasons = []
     if not (
         mapping.attn.tp_size == WORLD
-        and mapping.moe.tp_size == WORLD
-        and mapping.moe.ep_size == 1
+        and (mapping.moe.tp_size, mapping.moe.ep_size) in MOE_SPLITS
         and mapping.attn.tp_group == mapping.moe.tp_ep_group
         and mapping.pp_size == 1
     ):
@@ -197,9 +217,15 @@ def prepare_layer(model: torch.nn.Module, index: int) -> FusedDecodeLayer | list
     ]
     if any(t is None for t in dense + gains):
         return [NOT_BF16]
-    experts = _experts(mlp.experts) if mlp.quantized_experts else None
-    if experts is None:
+    if not _gluon_experts(mlp):
         return [NOT_SUPPORTED_EXPERTS]
+    if mlp.ep_size == 1:
+        experts = _experts(mlp.experts)
+    elif mlp.monokernel_experts is not None:
+        experts = mlp.monokernel_experts
+    else:
+        # prepare_ep8_experts found no kernel for the slices.
+        return [NO_KERNEL]
     _, o, pool, post = dense
     # The fused projection may hold every rank's rows (rank major, for large
     # batches); the kernel reads this rank's q | k | v | gate rows.
@@ -240,6 +266,72 @@ def _pack(model, index, window, qkvg, o, pool, post, gains, experts):
             "beta2": beta2,
             "in_gain": in_gain,
         }
+    )
+
+
+def _rank_slices(
+    weight: torch.Tensor, dim: int, world: int, *, gate_up: bool
+) -> torch.Tensor:
+    """The TP slices of ``weight`` (whole experts, ``[experts, ...]``) along
+    ``dim``, stacked by destination rank. With ``gate_up``, ``dim`` holds the
+    gate rows then the up rows (the MoE loader's concatenated w13), and a
+    slice takes the same intermediate values of both, as the loader of an EP1
+    server shards them."""
+    if gate_up:
+        gate, up = weight.chunk(2, dim)
+        parts = [
+            torch.cat(pair, dim)
+            for pair in zip(gate.chunk(world, dim), up.chunk(world, dim))
+        ]
+    else:
+        parts = weight.chunk(world, dim)
+    return torch.stack(parts)
+
+
+def prepare_ep8_experts(mlp: torch.nn.Module) -> tuple[torch.Tensor, ...] | None:
+    """On an EP8 server with ``--decode-monokernel``, gather this rank's TP8
+    slices of every expert of ``mlp`` (a ``MuseSparkMoE``, whose experts hold
+    the loaded weights) and prepare them for the monokernel.
+
+    Every rank calls this for every layer in the same order (one all-to-all
+    per tensor). The EP8 weights stay as loaded for the regular path.
+
+    Returns:
+        :func:`prepare_muse_spark_experts`'s tuple, or None when the layer
+        gets no monokernel on this server.
+    """
+    mapping = mlp.mapping
+    if not (
+        global_server_args_dict["decode_monokernel"]
+        and mapping.moe.ep_size == WORLD
+        and not model_reasons(mlp.config, mapping)
+        and 0 < mlp.layer_id < mlp.config.num_hidden_layers - 1
+        and _gluon_experts(mlp)
+        and mlp.experts.w13_input_layout == "concatenated"
+        # Contiguous expert ownership, and the received slice is the one the
+        # kernel's rank (the attention TP rank) computes.
+        and mlp.experts.num_local_experts * WORLD == mlp.num_experts
+        and mapping.moe.ep_rank == mapping.attn.tp_rank
+    ):
+        return None
+    experts = mlp.experts
+
+    def gather(weight: torch.Tensor, dim: int, gate_up: bool) -> torch.Tensor:
+        sent = _rank_slices(weight.data, dim, WORLD, gate_up=gate_up)
+        received = torch.empty_like(sent)
+        # Rank r sends its experts (32 r ..) to every rank, so the received
+        # slices are in global expert order.
+        all_to_all_single(received, sent, mapping.moe.ep_group)
+        return received.flatten(0, 1)
+
+    slices = {
+        "w13": gather(experts.w13_weight, 1, True),
+        "w13_scale": gather(experts.w13_weight_scale, 1, True),
+        "w2": gather(experts.w2_weight, 2, False),
+        "w2_scale": gather(experts.w2_weight_scale, 2, False),
+    }
+    return prepare_muse_spark_experts(
+        tensors={**slices, "w13_input_layout": experts.w13_input_layout}
     )
 
 
@@ -300,6 +392,8 @@ class MuseSparkMonokernels:
                 self.fused[index] = prepared
             else:
                 self.unserved[index] = prepared
+                # Free an EP8 layer's expert slices that no launch reads.
+                self.layers[index].mlp.monokernel_experts = None
         self.steps: MonokernelSteps | None = None
 
     def prepare(self, group: dist.ProcessGroup, rank: int) -> None:
@@ -370,7 +464,9 @@ class MonokernelStep:
                 f"Muse Spark monokernel: KV page size {view.kernel_page_size}, "
                 f"the kernel reads {PAGE_SIZE}"
             )
-        k_cache, v_cache = ctx.token_to_kv_pool.get_kv_buffer(layer.comm_manager.layer_id)
+        k_cache, v_cache = ctx.token_to_kv_pool.get_kv_buffer(
+            layer.comm_manager.layer_id
+        )
         leaf = ctx.attn_backend.leaves[group_id]
         slot = ctx.attn_backend.write_locations(attn.attn, ctx.forward_mode)
         cos_sin = (
@@ -427,6 +523,18 @@ def enable_decode_monokernels(model: torch.nn.Module) -> None:
         f"Decode monokernel: {len(monokernels.fused)} of {len(monokernels.layers)} "
         f"{name} layers"
     )
+    slices = [
+        t
+        for layer in monokernels.layers
+        if layer.mlp.monokernel_experts is not None
+        for t in layer.mlp.monokernel_experts
+    ]
+    if slices:
+        size = sum(t.untyped_storage().nbytes() for t in slices) / 2**30
+        logger.info(
+            f"Decode monokernel: {size:.1f} GiB per rank of TP8 expert slices "
+            "(EP8 server)"
+        )
 
 
 __all__ = [
@@ -436,6 +544,7 @@ __all__ = [
     "MuseSparkMonokernels",
     "enable_decode_monokernels",
     "model_reasons",
+    "prepare_ep8_experts",
     "prepare_layer",
     "takes_monokernels",
 ]

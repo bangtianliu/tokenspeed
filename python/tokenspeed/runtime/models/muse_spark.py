@@ -121,6 +121,7 @@ from tokenspeed.runtime.models.muse_spark_audio import MuseSparkAudioTower
 from tokenspeed.runtime.models.muse_spark_monokernel import (
     MuseSparkMonokernels,
     enable_decode_monokernels,
+    prepare_ep8_experts,
 )
 from tokenspeed.runtime.models.muse_spark_vision import MuseSparkVisionTower
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
@@ -1173,6 +1174,9 @@ class MuseSparkMoE(nn.Module):
             raise ValueError("the expert count must divide evenly across EP ranks")
         if config.moe_intermediate_size % mapping.moe.tp_size:
             raise ValueError("the expert intermediate size must divide across TP ranks")
+        self.config = config
+        self.mapping = mapping
+        self.layer_id = layer_id
         self.num_experts = config.num_local_experts
         self.topk = config.num_experts_per_tok
         self.route_scale = config.routed_scaling_factor
@@ -1315,6 +1319,15 @@ class MuseSparkMoE(nn.Module):
         # Decode-sized batches route in the top-k kernel; each token count keeps its own GEMM workspace.
         self.prepared_routing: dict[int, PreparedNvfp4Routing] = {}
         self.iris_state: MuseIrisState | None = None
+        # This rank's TP8 slices of every expert for the decode monokernel on
+        # an EP8 server (prepare_ep8_experts), else None.
+        self.monokernel_experts: tuple[torch.Tensor, ...] | None = None
+
+    def process_weights_after_loading(self, _module: nn.Module) -> None:
+        """Gather the decode monokernel's expert slices on an EP8 server. The
+        loader runs this hook before the experts' own, which replaces the
+        loaded weights (``named_modules`` lists a module before its children)."""
+        self.monokernel_experts = prepare_ep8_experts(self)
 
     def _reduce_expert_routes(
         self,
