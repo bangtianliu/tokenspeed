@@ -41,10 +41,10 @@ from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
     get_or_create_context,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import layer  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import launch_tag  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import (  # noqa: E402
-    bf16_tiles,
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.weights import (  # noqa: E402
+    pack_layer,
 )
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import launch_tag  # noqa: E402
 
 WORLD, HIDDEN, POOLED, OWNED, EXPERTS = 8, 8192, 4096, 1024, 16
 QKVG, Q = 2304, 1024
@@ -98,6 +98,20 @@ def _rank_weights(rank: int, length: int):
         k_cache=torch.randn(slots, 2, 64, generator=g).to(torch.bfloat16),
         v_cache=torch.randn(slots, 2, 64, generator=g).to(torch.bfloat16),
     )
+
+
+def _all_experts(t: torch.Tensor) -> torch.Tensor:
+    """``t`` (the test's 16 experts) in a tensor of all 256 experts with the
+    same strides, as the packer requires: the bias routes only to the first
+    16, so the others are never read."""
+    if t.stride(0) != max(t.stride()):
+        raise AssertionError("experts are not the outer dimension")
+    full = torch.empty_strided(
+        (256, *t.shape[1:]), t.stride(), dtype=t.dtype, device=t.device
+    )
+    full.zero_()
+    full[: t.shape[0]].copy_(t)
+    return full
 
 
 def _reference(sh, length, full, kernel_pooled, kernel_hp):
@@ -171,66 +185,68 @@ def _worker(rank: int, port: int, length: int, full: bool) -> None:
         w = _rank_weights(rank, length)
         w13, w13s, w2, w2s = ref.preprocessed_experts(rank, EXPERTS, dev)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
-        own_pool = slice(rank * 512, (rank + 1) * 512)
-        L = length - 1
-        slot = int(sh["table"][L // 64]) * 64 + L % 64
         k_cache, v_cache = w["k_cache"].to(dev), w["v_cache"].to(dev)
+        # The packer takes the regular path's tensors: the replicated pooler
+        # and post-expert weights, and the router as the regular path stores
+        # it (logits are x @ router); it slices this rank's part.
+        weights = pack_layer(
+            rank=rank,
+            full=full,
+            qkvg=w["w_qkvg"].to(dev),
+            o=w["w_o"].to(dev),
+            alpha1=sh["alpha1"].to(dev),
+            beta1=sh["beta1"].to(dev),
+            pre_gain=sh["pre_gain"].to(dev),
+            router=sh["router"].t().to(dev),
+            router_bias=sh["bias"].to(dev),
+            pool=torch.cat(
+                [_rank_weights(r, length)["w_pool"] for r in range(WORLD)]
+            ).to(dev),
+            experts=tuple(_all_experts(t) for t in (w13, w13s, w2, w2s)),
+            pre_exp_gain=sh["pre_exp_gain"].to(dev),
+            pen_gain=sh["pen_gain"].to(dev),
+            post=torch.cat(
+                [_rank_weights(r, length)["w_post"] for r in range(WORLD)]
+            ).to(dev),
+            post_gain=sh["post_gain"].to(dev),
+            alpha2=sh["alpha2"].to(dev),
+            beta2=sh["beta2"].to(dev),
+            in_gain=sh["in_gain"].to(dev),
+        )
+        h_in = sh["h"][own].to(dev)
+        a_in = sh["a_in"].to(dev)
         h_next = torch.empty(OWNED, device=dev)
         a_out = torch.empty(HIDDEN, dtype=torch.bfloat16, device=dev)
-        attn_ops = (
-            bf16_tiles(w["w_qkvg"]).to(dev),
-            sh["a_in"].to(dev),
-            torch.full((1,), length, dtype=torch.int32, device=dev),
-            torch.full((1,), slot, dtype=torch.int32, device=dev),
-            sh["table"].to(dev),
-            k_cache,
-            v_cache,
-            ref.rope_table(length + 1).to(dev),
-            bf16_tiles(w["w_o"]).to(dev),
-            sh["h"][own].to(dev),
-            sh["alpha1"][own].to(dev),
-            sh["beta1"][own].to(dev),
-            sh["pre_gain"][own].to(dev),
-        )
-        moe_ops = (
-            sh["router"][:, own].contiguous().to(dev),
-            sh["bias"].to(dev),
-            bf16_tiles(w["w_pool"]).to(dev),
-            w13,
-            w13s,
-            w13.stride(0),
-            w13s.stride(0),
-            w13s.stride(1),
-            w13s.stride(2),
-            w2,
-            w2s,
-            w2.stride(0),
-            w2s.stride(0),
-            w2s.stride(1),
-            w2s.stride(2),
-            sh["pre_exp_gain"].to(dev),
-            sh["pen_gain"][own_pool].to(dev),
-            bf16_tiles(w["w_post"]).to(dev),
-            sh["post_gain"][own].to(dev),
-            sh["alpha2"][own].to(dev),
-            sh["beta2"][own].to(dev),
-            sh["in_gain"][own].to(dev),
-            h_next,
-            a_out,
-        )
+
+        def launch(index: int, step: int, seq_len: int) -> None:
+            pos = seq_len - 1
+            layer.launch_gluon_muse_spark_layer_gfx950(
+                weights,
+                h=h_in,
+                a=a_in,
+                h_out=h_next,
+                a_out=a_out,
+                seq_len=torch.full((1,), seq_len, dtype=torch.int32, device=dev),
+                slot=torch.full(
+                    (1,),
+                    int(sh["table"][pos // 64]) * 64 + pos % 64,
+                    dtype=torch.int32,
+                    device=dev,
+                ),
+                page_table=sh["table"].to(dev),
+                k_cache=k_cache,
+                v_cache=v_cache,
+                cos_sin=ref.rope_table(length + 1).to(dev),
+                scratch=scratch,
+                step=torch.full((1,), step, dtype=torch.int32, device=dev),
+                peer_bases=group.bases,
+                layer=index,
+                trace_buf=None,
+            )
+
         group.finish_prepare()
         lay = 1 if full else 2
-        layer.launch_layer(
-            scratch,
-            torch.full((1,), 3, dtype=torch.int32, device=dev),
-            lay,
-            group.bases,
-            attn_ops,
-            moe_ops,
-            None,
-            rank,
-            full,
-        )
+        launch(lay, 3, length)
         torch.cuda.synchronize()
         dist.barrier()
         kernel_pooled = (
@@ -273,21 +289,15 @@ def _worker(rank: int, port: int, length: int, full: bool) -> None:
             a_out.float().cpu(), a.float(), rtol=2**-6, atol=atol
         )
         dist.barrier()
-        # Other layers run the same binary: the index is a runtime argument.
+        # Serving moves the layer index, the step and the length every
+        # launch; they are runtime arguments: one binary serves them all.
         # Each step flips the peer copy (layer & 1), as serving does.
         with assert_no_triton_compile(layer.gluon_muse_spark_layer_gfx950):
-            for other in (lay + 1, lay + 18, lay + 35):
-                layer.launch_layer(
-                    scratch,
-                    torch.full((1,), 3, dtype=torch.int32, device=dev),
-                    other,
-                    group.bases,
-                    attn_ops,
-                    moe_ops,
-                    None,
-                    rank,
-                    full,
-                )
+            for step, (index, seq_len) in enumerate(
+                ((lay + 1, length), (lay + 18, length - 1), (lay + 35, length - 70)),
+                start=4,
+            ):
+                launch(index, step, seq_len)
             torch.cuda.synchronize()
         dist.barrier()
     finally:
@@ -302,3 +312,39 @@ def test_layer_matches_the_regular_path_math(full):
         sock.bind(("", 0))
         port = sock.getsockname()[1]
     mp.spawn(_worker, args=(port, 3000, full), nprocs=WORLD, join=True)
+
+
+def test_the_packer_names_every_tensor_of_another_layout():
+    """The regular path may hold the fused projection of every rank (rank
+    major) and stores the router transposed; the packer reports each such
+    tensor instead of tiling the wrong rows."""
+    f32, bf16 = torch.float32, torch.bfloat16
+    row = torch.empty(HIDDEN, dtype=f32)
+    pooled = torch.empty(POOLED, dtype=f32)
+    experts = (torch.empty(256, 1),) * 4
+    with pytest.raises(ValueError) as error:
+        pack_layer(
+            rank=0,
+            full=False,
+            qkvg=torch.empty(WORLD * QKVG, HIDDEN, dtype=bf16),
+            o=torch.empty(HIDDEN, Q, dtype=bf16),
+            alpha1=row,
+            beta1=row,
+            pre_gain=row,
+            router=torch.empty(256, HIDDEN, dtype=f32),
+            router_bias=torch.empty(256, dtype=f32),
+            pool=torch.empty(POOLED, HIDDEN, dtype=bf16),
+            experts=experts,
+            pre_exp_gain=pooled,
+            pen_gain=pooled,
+            post=torch.empty(HIDDEN, POOLED, dtype=bf16),
+            post_gain=row,
+            alpha2=row,
+            beta2=row,
+            in_gain=row,
+        )
+    assert str(error.value) == (
+        f"qkvg: expected torch.bfloat16 ({QKVG}, {HIDDEN}), got torch.bfloat16 "
+        f"({WORLD * QKVG}, {HIDDEN}); router: expected torch.float32 ({HIDDEN}, "
+        f"256), got torch.float32 (256, {HIDDEN})"
+    )

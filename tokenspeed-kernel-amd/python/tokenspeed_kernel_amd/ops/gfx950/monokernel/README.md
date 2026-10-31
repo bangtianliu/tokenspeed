@@ -30,6 +30,7 @@ Read these documents with this one:
 
 | Model directory | Model |
 |---|---|
+| [`muse_spark/`](muse_spark/README.md) | Muse Spark Open: TP8 decoder layers with MXFP4 routed experts. |
 | [`qwen4_exp/`](qwen4_exp/README.md) | Qwen3.8-Flash-Next: Gated DeltaNet and QSA attention layers. |
 
 ## Adding a model's kernels

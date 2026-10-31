@@ -118,6 +118,10 @@ from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import BaseCausalLM, BaseTransformerModel
 from tokenspeed.runtime.models.base.transformer_model import notify_target_capture
 from tokenspeed.runtime.models.muse_spark_audio import MuseSparkAudioTower
+from tokenspeed.runtime.models.muse_spark_monokernel import (
+    MuseSparkMonokernels,
+    enable_decode_monokernels,
+)
 from tokenspeed.runtime.models.muse_spark_vision import MuseSparkVisionTower
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
@@ -2374,6 +2378,10 @@ class MuseSparkModel(BaseTransformerModel):
             weight_offset=OUTPUT_GAIN_OFFSET,
         )
         self.iris_state: MuseIrisState | None = None
+        # The decode monokernels (--decode-monokernel), packed after loading
+        # by enable_decode_monokernels. None runs every step on the regular
+        # path.
+        self.monokernels: MuseSparkMonokernels | None = None
 
     def resolve_layers(
         self,
@@ -2480,6 +2488,13 @@ class MuseSparkModel(BaseTransformerModel):
         )
         rows, width = hidden_states.shape
         owned_global_rows = rows if self._can_use_owned_rows(rows, ctx) else None
+        # Decode monokernels: a plan for this forward, or None for the
+        # regular path.
+        step = (
+            self.monokernels.plan(rows, ctx)
+            if self.monokernels is not None and owned_global_rows is None
+            else None
+        )
         attention_input = None
         if owned_global_rows is not None:
             local_rows = (
@@ -2508,6 +2523,21 @@ class MuseSparkModel(BaseTransformerModel):
                     aux_hidden_states,
                     ctx,
                 )
+            fused = None if step is None else step.layer(layer_index)
+            if fused is not None:
+                # A fused run keeps the residual in the monokernel's owned
+                # slices: a tap inside it would read a stale row.
+                if layer_index in self.layers_to_capture:
+                    raise RuntimeError(
+                        f"Muse Spark monokernel fused layer {layer_index}, "
+                        "which a draft taps"
+                    )
+                hidden_states, attention_input = fused(
+                    hidden_states=hidden_states,
+                    attention_input=attention_input,
+                    ctx=ctx,
+                )
+                continue
             # Each FFN boundary emits the next layer's attention input rows.
             next_input_layernorm = (
                 self.layers[layer_index + 1].input_layernorm
@@ -2524,6 +2554,8 @@ class MuseSparkModel(BaseTransformerModel):
                 next_input_layernorm,
                 owned_global_rows,
             )
+        if step is not None:
+            step.finish()
         if taps_live:
             final_layer_index = len(self.layers) + 1
             if final_layer_index in self.layers_to_capture:
@@ -2963,6 +2995,12 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 state.intermediate_gather_min_rows,
                 intermediate_gather_max_rows,
             )
+        if self.model.monokernels is not None:
+            # The mailbox scratch lives on the same Iris heap.
+            self.model.monokernels.prepare(
+                process_group_manager.get_device_process_group(group),
+                group.index(dist.get_rank()),
+            )
         return True
 
     def __init__(
@@ -3239,6 +3277,7 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             if self._loaded_audio != audio_parameters:
                 missing = sorted(audio_parameters - self._loaded_audio)
                 raise ValueError(f"checkpoint is missing audio tensors: {missing[:5]}")
+        enable_decode_monokernels(self.model)
         bf16_mlps = [
             layer.mlp for layer in self.model.layers if not layer.mlp.quantized_experts
         ]
