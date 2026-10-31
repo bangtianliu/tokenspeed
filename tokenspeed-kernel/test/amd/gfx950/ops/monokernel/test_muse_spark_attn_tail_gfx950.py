@@ -162,9 +162,12 @@ def _worker(rank: int, port: int) -> None:
             torch.cuda.synchronize()
             want_b, want_hp, want_u = _reference(k)
             # The router's input: the reduced, BF16-rounded o_proj columns.
+            # A rank's BF16 partial can be one step off the reference's (its
+            # FP32 sums run in another order); with the final rounding the
+            # sum is then up to two BF16 steps off.
             b = payloads(scratch, plan, "bq", OWNED, launch_tag(step, 0))
             torch.testing.assert_close(
-                b.view(torch.float32).cpu(), want_b[own], rtol=2**-7, atol=1e-3
+                b.view(torch.float32).cpu(), want_b[own], rtol=2**-6, atol=1e-3
             )
             hp = payloads(scratch, plan, "hp", OWNED, launch_tag(step, 0)).view(
                 torch.float32

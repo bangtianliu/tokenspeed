@@ -320,6 +320,7 @@ class _AddLayer(torch.nn.Module):
 def test_forward_threads_attention_input_rows_between_layers() -> None:
     model = _stub(MuseSparkForConditionalGeneration.model_cls)
     model.layers = torch.nn.ModuleList(_AddLayer(float(i + 1)) for i in range(3))
+    model.monokernels = None
     hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     model._embed_hidden = lambda input_ids, input_embeds: input_embeds
     model.embed_tokens = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))

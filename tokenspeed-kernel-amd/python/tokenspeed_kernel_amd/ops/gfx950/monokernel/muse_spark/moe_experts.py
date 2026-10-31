@@ -40,13 +40,13 @@ them): a second copy of every expert would not fit.
 
 Expert weights cannot load before routing picks the experts. So that both
 weight streams start then, and every CTA reads the same 96 KiB, a CTA runs
-its ex1 and ex2 tasks in parts: :func:`ex1_prep` (the pooled row is ready
-before routing), then :func:`expert_ids` (one poll for both tasks' experts),
-:func:`ex1_issue` and :func:`ex2_issue`, then :func:`ex1_finish`, and
-:func:`ex2_finish` at ex2's place in the plan. The polls come before the
-loads: a poll waits for every earlier load of its wave (``vmcnt`` counts in
-order), so a poll between the two weight streams would start the second
-only when the first has arrived.
+its ex1 and ex2 tasks in parts: :func:`ex1_poll` (one poll for the pooled
+row and both tasks' experts), :func:`ex1_issue` and :func:`ex2_issue`, then
+:func:`ex1_operand` (the norm and quantization of the A operand, while the
+weights stream), :func:`ex1_finish`, and :func:`ex2_finish` at ex2's place
+in the plan. The polls come before the loads: a poll waits for every earlier
+load of its wave (``vmcnt`` counts in order), so a poll between the two
+weight streams would start the second only when the first has arrived.
 """
 
 from __future__ import annotations
@@ -104,16 +104,13 @@ def stages(bases: dict[str, int]) -> tuple[Stage, ...]:
 
 
 @gluon.jit
-def expert_ids(mb, task1, task2):
-    """The expert ids of ex1 task ``task1`` and ex2 task ``task2`` (from
-    ``route``), in one poll."""
+def _route_picks(task1, task2):
+    """The ``route`` indices of the picks of ex1 task ``task1`` (lane 0) and
+    ex2 task ``task2`` (lane 1), with the lane index."""
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     i = gl.arange(0, 2, lanes)
     pick = gl.where(i == 0, task1 // (NB1 * KSPLIT), task2 // (NB2 // EX2_BLOCKS))
-    (got,) = mb.poll_many(("route",), (pick,))
-    return gl.max(gl.where(i == 0, got, -1), axis=0), gl.max(
-        gl.where(i == 1, got, -1), axis=0
-    )
+    return i, pick
 
 
 @gluon.jit
@@ -196,10 +193,13 @@ def _stage_a(packed, scales):
 
 
 @gluon.jit
-def ex1_prep(mb, task, active, pre_gain, STAGE: gl.constexpr):
-    """The A operand of ex1 task ``task``: poll the whole pooled row (the
-    norm needs every value), apply the pre-expert RMS norm, and quantize the
-    task's K quarter to MXFP4 in LDS. Returns the LDS (values, scales).
+def ex1_poll(mb, task, task2, active, pre_gain, STAGE: gl.constexpr):
+    """The inputs of ex1 task ``task`` and the experts of it and of ex2 task
+    ``task2``: poll the whole pooled row (the norm needs every value) and
+    the two picks' expert ids in one round trip (routing ends before the
+    pooler, so the ids add no wait). Returns the polled row, the task's
+    pre-expert gains (low and high values of the pairs), then the ex1 and
+    ex2 expert ids, for :func:`ex1_operand`.
 
     Every CTA calls it (Gluon cannot carry values out of a branch); an
     inactive CTA (``active`` false) stamps nothing.
@@ -217,9 +217,31 @@ def ex1_prep(mb, task, active, pre_gain, STAGE: gl.constexpr):
     c = ks * K_SLICE + 2 * j
     gain_lo = gl.load(pre_gain + c)
     gain_hi = gl.load(pre_gain + c + 1)
-    (got,) = mb.poll_many(("cg",), (q[:, None] * (K_SLICE // 2) + j[None, :],))
+    i, pick = _route_picks(task, task2)
+    got, ids = mb.poll_many(
+        ("cg", "route"), (q[:, None] * (K_SLICE // 2) + j[None, :], pick)
+    )
     if active:
         mb.stamp(STAGE, trace.READY)
+    e1 = gl.max(gl.where(i == 0, ids, -1), axis=0)
+    e2 = gl.max(gl.where(i == 1, ids, -1), axis=0)
+    return got, gain_lo, gain_hi, e1, e2
+
+
+@gluon.jit
+def ex1_operand(task, got, gain_lo, gain_hi):
+    """The A operand of ex1 task ``task`` from :func:`ex1_poll`'s row and
+    gains: apply the pre-expert RMS norm and quantize the task's K quarter
+    to MXFP4 in LDS. Returns the LDS (values, scales).
+
+    It issues no global load, and its LDS barrier waits only for LDS, so it
+    runs while the weight loads that :func:`ex1_issue` and :func:`ex2_issue`
+    issued before it are in flight.
+    """
+    ks = task % KSPLIT
+    nw: gl.constexpr = gl.num_warps()
+    ql: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [1, nw], [1, 0])
+    q = gl.arange(0, KSPLIT, gl.SliceLayout(1, ql))
     lo = (got << 16).to(gl.float32, bitcast=True)
     hi = (got & -65536).to(gl.float32, bitcast=True)
     inv = gl.rsqrt(gl.sum(gl.sum(lo * lo + hi * hi, axis=1), axis=0) / POOLED + PRE_EPS)
@@ -242,7 +264,7 @@ def ex1_issue(
     task, active, expert, w13, w13s, stride_we, stride_se, stride_slin, stride_snb
 ):
     """Issue ex1 task ``task``'s w13 loads (pick, column block, K quarter) of
-    expert ``expert`` (:func:`expert_ids`); nothing loads when ``active`` is
+    expert ``expert`` (:func:`ex1_poll`); nothing loads when ``active`` is
     false.
 
     Args:
@@ -269,7 +291,7 @@ def ex1_issue(
 
 @gluon.jit
 def ex1_finish(mb, task, a, tiles, STAGE: gl.constexpr):
-    """Ex1 task ``task`` after :func:`ex1_prep` (``a``) and :func:`ex1_issue`
+    """Ex1 task ``task`` after :func:`ex1_operand` (``a``) and :func:`ex1_issue`
     (``tiles``): multiply and publish the FP32 partial sums."""
     pick = task // (NB1 * KSPLIT)
     blk = (task // KSPLIT) % NB1
@@ -301,7 +323,7 @@ def ex2_issue(
     STAGE: gl.constexpr,
 ):
     """Issue ex2 task ``task``'s w2 loads (pick, column block) of expert
-    ``expert`` (:func:`expert_ids`); nothing loads (and nothing stamps) when
+    ``expert`` (:func:`ex1_poll`); nothing loads (and nothing stamps) when
     ``active`` is false. Every CTA calls it
     (Gluon cannot carry the tiles out of a branch); :func:`ex2_finish` uses
     them.
