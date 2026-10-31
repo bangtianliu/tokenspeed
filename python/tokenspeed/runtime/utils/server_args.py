@@ -206,6 +206,7 @@ def _checkpoint_architectures(
 # Checkpoint architectures with decode monokernels (--decode-monokernel). A
 # model adds its architecture here with its monokernel seam.
 DECODE_MONOKERNEL_ARCHITECTURES = (
+    "MuseSparkForConditionalGeneration",
     "Qwen4ExpForCausalLM",
     "Qwen4ExpForConditionalGeneration",
 )

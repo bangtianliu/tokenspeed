@@ -47,14 +47,16 @@ from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (  #
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig  # noqa: E402
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig  # noqa: E402
+from tokenspeed.runtime.models.decode_monokernel import (  # noqa: E402
+    coverage,
+    unserved_report,
+)
 from tokenspeed.runtime.models.qwen4_exp_monokernel import (  # noqa: E402
     ATTENTION_TP,
     EXPERT_PARALLEL,
     NOT_MXFP4,
     DraftVerifyLengths,
-    coverage,
     forward_chain,
-    unserved_report,
 )
 from tokenspeed.runtime.utils.server_args import (  # noqa: E402
     DECODE_MONOKERNEL_ARCHITECTURES,

@@ -8,33 +8,45 @@ boundaries. Latency, not FLOPs, limits small-batch decode. One launch
 per layer removes about twenty kernel boundaries, and each stage can stream
 its weights while earlier stages still compute.
 
-The first user is Qwen3.8-Flash-Next (`qwen4_exp`) on gfx950, behind
-`--decode-monokernel`. Its Gated DeltaNet and QSA attention layers
-each have one monokernel.
+The users are on gfx950, behind `--decode-monokernel`:
+Qwen3.8-Flash-Next (`qwen4_exp`), whose Gated DeltaNet and QSA attention
+layers each have one monokernel, and Muse Spark Open (`muse_spark`), whose
+decoder layers 1 to 60 have one monokernel per rank of a TP8 group.
 
 ## Where the pieces live
 
 | Layer | Path | Holds |
 |---|---|---|
 | Runtime building blocks | `tokenspeed_kernel_amd/ops/gfx950/monokernel/` | `plan.py`: stages, placement, regions, the deadlock check. `schedule.py`: a kernel's view of its plan (which tasks this CTA runs). `mailbox.py`: tagged put / poll, throttling. `mx.py`: MXFP4 x MXFP4 split-K GEMV, MXFP4 and BF16 publishing. `bf16.py`: BF16 x BF16 GEMV. `trace.py`: per-stage timestamps. `warm.py`: warm tasks that read the next launch's weights into the memory-side cache. `weights.py`: tile and scale layouts. |
-| Model stages | `.../monokernel/qwen4_exp/` | One module per block (`hc.py`, `ple.py`, `gdn.py`, `qsa.py`, `out_proj.py`, `moe.py`) with its regions, stages and operand bundles. `dims.py`: shared dimensions. `layer.py`: the layer plans, kernels and launchers. `weights.py`: weight packing. |
+| Model stages | `.../monokernel/<model>/` (`qwen4_exp/`, `muse_spark/`) | One module per block (for `qwen4_exp`: `hc.py`, `ple.py`, `gdn.py`, `qsa.py`, `out_proj.py`, `moe.py`) with its regions, stages and operand bundles. `dims.py`: shared dimensions. `layer.py`: the layer plans, kernels and launchers. `weights.py`: weight packing. |
 | Kernel boundary | `tokenspeed_kernel/ops/monokernel/` | `prepare_*` and `*_decode`, through `select_kernel`. `prepare_*` packs once after loading and returns `None` when no kernel serves the layer. `README.md` is the guide for adding a model. |
-| Runtime seam | `runtime/models/qwen4_exp_monokernel.py` | `Qwen4ExpMonokernels`: eligibility with reasons, packing from the model's modules, the step counter, and `plan()` once per forward. `MonokernelStep.layer(i)`: the launch that replaces layer `i`. |
+| Runtime seam | `runtime/models/<model>_monokernel.py` | `Qwen4ExpMonokernels`, `MuseSparkMonokernels`: eligibility with reasons, packing from the model's modules, the step counter, and `plan()` once per forward. `MonokernelStep.layer(i)`: the launch that replaces layer `i`. `decode_monokernel.py`: the shared startup report. |
 
 ## Invariants
 
-**The layer boundary is the hyper-connection streams.** A fused layer takes
+**The layer boundary is the regular layers' hand-over.** A fused layer
+takes and returns what the model's regular layers pass each other, so fused
+and regular layers mix freely. A layer the monokernel does not serve keeps
+the regular path, and the step still gives the right result.
+
+In Qwen4-Exp the hand-over is the hyper-connection streams. A fused layer takes
 the streams `[rows, hc_count * hidden]` and returns new streams with no
 pending residual. Every Qwen4-Exp layer and the final mixer already accept
-that form, so fused and regular layers mix freely. A layer the monokernel
-does not serve keeps the regular path, and the step still gives the right
-result. The first layer may take one row `[rows, hidden]` (the embedding)
+that form. The first layer may take one row `[rows, hidden]` (the embedding)
 that stands for all streams: the kernel reads it with stream stride 0,
 without a copy.
 When the last layer is a QSA layer, its launch also runs the model's final
 mixer and writes the LM head's input. The mixer's stages f1 / f2 run on CTAs
 that are idle in the MoE tail. The layer then hands its streams to the mixer
 through region `h`.
+
+In Muse Spark the regular layers pass the whole FP32 residual row and the
+next layer's normed BF16 attention input. A TP8 launch keeps only its rank's
+1024 residual columns: from one fused layer to the next the owned slices
+stay on their ranks, and every rank writes the whole next attention input.
+The first launch of a run of fused layers reads its slice of the row. After
+the last one the seam gathers the 8 slices into a row (32 KiB) for the
+regular layer that follows.
 
 **Same caches, same layouts.** A monokernel reads and writes the KV cache,
 the GDN state pages and the QSA indexer caches exactly as the regular decode
@@ -173,8 +185,11 @@ post-verify commit stays the same.
 
 **Kernels read weights in place where the layout allows.** TokenSpeed's MFMA
 dense layout and its N16 MoE banks are the tile orders the GEMV reads. The
-packer copies only two things: the scales, into the GEMV's dword layout, and
-the BF16 hyper-connection weights, which it re-encodes exactly as MXFP4.
+Qwen4-Exp packer copies only two things: the scales, into the GEMV's dword
+layout, and the BF16 hyper-connection weights, which it re-encodes exactly
+as MXFP4. Muse Spark's BF16 dense weights are row-major, so its packer
+copies them once into the BF16 GEMV's tile order, and only the rows a rank
+computes; its MXFP4 experts are read in place from the gluon MoE's layout.
 
 ## Placement
 

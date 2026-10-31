@@ -37,6 +37,7 @@ steps too (layers 0 and 61 keep the regular path).
 
 from __future__ import annotations
 
+import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox, schedule, trace
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
@@ -238,20 +239,22 @@ def gluon_muse_spark_layer_gfx950(
     task, active = schedule.stage_task(PLAN, "pool")
     if active:
         moe_pool.pool_stage(mb, task, w_pool, RANK, "pool")
-    # A CTA's ex1 and ex2 tasks run in parts (see moe_experts): the A
-    # operand first, then both weight streams once routing names the experts.
+    # A CTA's ex1 and ex2 tasks run in parts (see moe_experts): both weight
+    # streams once routing names the experts, then the A operand meanwhile.
     task1, active1 = schedule.stage_task(PLAN, "ex1")
     task1 = gl.where(active1, task1, 0)
     task2, active2 = schedule.stage_task(PLAN, "ex2")
     task2 = gl.where(active2, task2, 0)
-    a1 = moe_experts.ex1_prep(mb, task1, active1, pre_exp_gain, "ex1")
-    e1, e2 = moe_experts.expert_ids(mb, task1, task2)
+    got1, gain_lo, gain_hi, e1, e2 = moe_experts.ex1_poll(
+        mb, task1, task2, active1, pre_exp_gain, "ex1"
+    )
     loads1 = moe_experts.ex1_issue(
         task1, active1, e1, w13, w13s, s13_we, s13_se, s13_lin, s13_nb
     )
     loads2 = moe_experts.ex2_issue(
         mb, task2, active2, e2, w2, w2s, s2_we, s2_se, s2_lin, s2_nb, "ex2"
     )
+    a1 = moe_experts.ex1_operand(task1, got1, gain_lo, gain_hi)
     if active1:
         moe_experts.ex1_finish(mb, task1, a1, loads1, "ex1")
     if active2:
@@ -292,8 +295,87 @@ def launch_layer(
     )
 
 
+def launch_gluon_muse_spark_layer_gfx950(
+    weights,
+    *,
+    h,
+    a,
+    h_out,
+    a_out,
+    seq_len,
+    slot,
+    page_table,
+    k_cache,
+    v_cache,
+    cos_sin,
+    scratch,
+    step,
+    peer_bases,
+    layer: int,
+    trace_buf,
+):
+    """One decode step of a packed layer (``weights.LayerWeights``) for one
+    token row.
+
+    Args:
+        weights: From ``weights.pack_layer``.
+        h, h_out: FP32 ``[1024]`` owned residual columns, in and out.
+        a, a_out: BF16 ``[8192]`` attention input of this layer and of the
+            next one (normed with the next layer's input gain).
+        seq_len, slot: int32 ``[1]``: the row's length including its token,
+            and the KV cache slot of the token.
+        page_table: int32 ``[pages]`` of the row (64 tokens a page, indexed
+            by absolute position).
+        k_cache, v_cache: BF16 ``[slots, 2, 64]``.
+        cos_sin: FP32 ``[positions, 64]`` rotary table (unused by a full,
+            NoPE layer).
+        scratch: int64 mailbox pairs on the Iris symmetric heap.
+        step: int32 ``[1]`` step counter.
+        peer_bases: int64 ``[8]`` heap bases of the group's ranks.
+        layer: The decoder layer index (the tag and the peer copy).
+        trace_buf: None, or a trace buffer (``trace.py``).
+    """
+    # The launch reads h and a while other CTAs already write the outputs.
+    if (
+        h.dtype != torch.float32
+        or h.numel() != 1024
+        or h.data_ptr() == h_out.data_ptr()
+    ):
+        raise ValueError("h: FP32 [1024] that does not alias h_out")
+    if (
+        a.dtype != torch.bfloat16
+        or a.numel() != 8192
+        or a.data_ptr() == a_out.data_ptr()
+    ):
+        raise ValueError("a: BF16 [8192] that does not alias a_out")
+    attn_ops, moe_ops = weights.kernel_args(
+        h=h,
+        a=a,
+        seq_len=seq_len,
+        slot=slot,
+        page_table=page_table,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cos_sin=cos_sin,
+        h_out=h_out,
+        a_out=a_out,
+    )
+    launch_layer(
+        scratch,
+        step,
+        layer,
+        peer_bases,
+        attn_ops,
+        moe_ops,
+        trace_buf,
+        weights.rank,
+        weights.full,
+    )
+
+
 __all__ = [
     "BASES",
+    "launch_gluon_muse_spark_layer_gfx950",
     "FULL_SPLITS",
     "SLIDING_SPLITS",
     "gluon_muse_spark_layer_gfx950",
