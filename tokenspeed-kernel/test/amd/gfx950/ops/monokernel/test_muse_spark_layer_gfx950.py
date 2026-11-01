@@ -439,6 +439,22 @@ def test_graph_replays_match_eager_launches():
     mp.spawn(_graph_worker, args=(port, 3000), nprocs=WORLD, join=True)
 
 
+@pytest.mark.parametrize("rows", range(1, layer.MAX_ROWS + 1))
+def test_both_kinds_of_layer_lay_the_scratch_out_alike(rows: int):
+    """Sliding and full launches share one scratch and alternate the peer
+    regions' copies. A rank a launch ahead must then put only into the copy
+    no slower rank still reads, which holds only if both plans place every
+    region, and both copies of each peer region, at the same pairs."""
+    sliding, full = layer.layer_plan(False, rows), layer.layer_plan(True, rows)
+    assert sliding.regions == full.regions
+    assert sliding.peers == full.peers
+    assert sliding.row_pairs == full.row_pairs
+    for name, _ in sliding.regions:
+        assert sliding.offset(name) == full.offset(name), name
+    for name in sliding.peers:
+        assert sliding.peer_copy(name) == full.peer_copy(name), name
+
+
 def test_the_packer_names_every_tensor_of_another_layout():
     """The regular path may hold the fused projection of every rank (rank
     major) and stores the router transposed; the packer reports each such
