@@ -404,6 +404,7 @@ def muse_spark_layer_decode(
     step: torch.Tensor,
     peer_bases: torch.Tensor,
     layer_index: int,
+    compile_only: bool,
 ) -> None:
     """One step of a packed Muse Spark layer for the rows of one request (a
     decode row, or a speculative verify's consecutive tokens), on every rank
@@ -430,6 +431,11 @@ def muse_spark_layer_decode(
         peer_bases: int64 ``[8]`` Iris heap bases of the group's ranks.
         layer_index: Decoder layer index, below 64. The launches of one
             forward alternate its parity.
+        compile_only: Only compile the launch for these operands, without
+            running it. A launch polls its peers' values for a few seconds
+            before it traps, so a rank that compiles much longer than its
+            peers stalls them: compile on every rank, synchronize the ranks,
+            then launch.
     """
     layer.decode(
         weights=layer.weights,
@@ -447,6 +453,7 @@ def muse_spark_layer_decode(
         step=step,
         peer_bases=peer_bases,
         layer_index=layer_index,
+        compile_only=compile_only,
     )
 
 
