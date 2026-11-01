@@ -50,7 +50,7 @@ columns ``1024 r ..`` of the residual.
 
 from __future__ import annotations
 
-from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import bf16, mx, schedule, trace
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.attn_tail import OWNED
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import HIDDEN, WORLD
@@ -188,11 +188,53 @@ def _ffn_norms(mb):
     """The inverse RMS of the post-FFN norm and of the next layer's input
     norm, from every rank's sums in ``ffn``. Fin and out share this, so both get the
     same values."""
+    (got,) = mb.poll_many(("ffn",), (_ffn_sums_index(),))
+    return _ffn_scales(got)
+
+
+@gluon.jit
+def _ffn_row_scales(mb):
+    """Every row's post-FFN norm scale (a tuple), as :func:`_ffn_norms`
+    gives it: four rows' sums a round trip and one reduction across the
+    waves per four rows."""
+    R: gl.constexpr = schedule.rows(mb.plan)
+    G: gl.constexpr = min(triton.next_power_of_2(R), 4)
+    nw: gl.constexpr = gl.num_warps()
+    L3: gl.constexpr = gl.BlockedLayout([1, 1, SUMS], [1, 64, 1], [1, nw, 1], [2, 1, 0])
+    gr = gl.arange(0, G, gl.SliceLayout(1, gl.SliceLayout(2, L3)))[:, None, None]
+    rt = gl.arange(0, WORLD * UNPOOL_TASKS, gl.SliceLayout(0, gl.SliceLayout(2, L3)))
+    qt = gl.arange(0, SUMS, gl.SliceLayout(0, gl.SliceLayout(1, L3)))
+    at = SUMS_AT + rt[None, :, None] * SUMS + qt[None, None, :]
+    q2 = gl.arange(0, SUMS, gl.SliceLayout(0, gl.SliceLayout(1, L3)))[None, :]
+    g2 = gl.arange(0, G, gl.SliceLayout(1, gl.SliceLayout(1, L3)))[:, None]
+    invs = ()
+    for g in gl.static_range(triton.cdiv(R, G)):
+        (got,) = mb.poll_many(("ffn",), (mb.row_offset(g * G + gr) + at,))
+        total = gl.sum(got.to(gl.float32, bitcast=True), axis=1)  # [G, 4 sums]
+        for r in gl.static_range(min(G, R - g * G)):
+            ss_y = gl.sum(
+                gl.sum(gl.where((g2 == r) & (q2 == 0), total, 0.0), axis=1), axis=0
+            )
+            invs += (gl.rsqrt(ss_y / HIDDEN + POST_EPS),)
+    return invs
+
+
+@gluon.jit
+def _ffn_sums_index():
+    """The ``ffn`` pair index of every rank's and task's 4 sums."""
     nw: gl.constexpr = gl.num_warps()
     sl: gl.constexpr = gl.BlockedLayout([1, SUMS], [64, 1], [nw, 1], [1, 0])
     rt = gl.arange(0, WORLD * UNPOOL_TASKS, gl.SliceLayout(1, sl))[:, None]
+    qt = gl.arange(0, SUMS, gl.SliceLayout(0, sl))[None, :]
+    return SUMS_AT + rt * SUMS + qt
+
+
+@gluon.jit
+def _ffn_scales(got):
+    """:func:`_ffn_norms` from the polled sums (:func:`_ffn_sums_index`)."""
+    nw: gl.constexpr = gl.num_warps()
+    sl: gl.constexpr = gl.BlockedLayout([1, SUMS], [64, 1], [nw, 1], [1, 0])
     qt = gl.arange(0, SUMS, gl.SliceLayout(0, sl))
-    (got,) = mb.poll_many(("ffn",), (SUMS_AT + rt * SUMS + qt[None, :],))
     total = gl.sum(got.to(gl.float32, bitcast=True), axis=0)  # [4 sums]
     ss_y = gl.sum(gl.where(qt == 0, total, 0.0), axis=0)
     ss_by = gl.sum(gl.where(qt == 1, total, 0.0), axis=0)
@@ -202,56 +244,6 @@ def _ffn_norms(mb):
     # The sum of h''^2 over all columns: inv^2 ss_by + 2 inv ss_x + ss_ah.
     ss_h = gl.maximum(inv * inv * ss_by + 2.0 * inv * ss_x + ss_ah, 0.0)
     return inv, gl.rsqrt(ss_h / HIDDEN + PRE_EPS)
-
-
-@gluon.jit
-def _unpool_row(
-    mb, task, y_lo, y_hi, hp_lo, hp_hi, post_lo, post_hi, b_lo, b_hi, a_lo, a_hi, RANK
-):
-    """One row's unpool epilogue: ``y`` from the raw sums ``y_lo``, ``y_hi``
-    of the owned columns' pairs, the four sums, and the put into every rank's
-    ``ffn``. Returns ``(y_lo, y_hi, (alpha h')_lo, (alpha h')_hi)`` for fin."""
-    nw: gl.constexpr = gl.num_warps()
-    y_lo = y_lo.to(gl.bfloat16).to(gl.float32) * post_lo
-    y_hi = y_hi.to(gl.bfloat16).to(gl.float32) * post_hi
-    ah_lo = a_lo * hp_lo.to(gl.float32, bitcast=True)
-    ah_hi = a_hi * hp_hi.to(gl.float32, bitcast=True)
-    by_lo = b_lo * y_lo
-    by_hi = b_hi * y_hi
-    s_y = gl.sum(y_lo * y_lo + y_hi * y_hi, axis=0)
-    s_by = gl.sum(by_lo * by_lo + by_hi * by_hi, axis=0)
-    s_x = gl.sum(ah_lo * by_lo + ah_hi * by_hi, axis=0)
-    s_ah = gl.sum(ah_lo * ah_lo + ah_hi * ah_hi, axis=0)
-    # One put per peer: rows y_lo, y_hi, (alpha h')_lo, (alpha h')_hi of the
-    # 8 pairs, then the 4 sums in row 4.
-    rows: gl.constexpr = gl.BlockedLayout([1, 1], [8, 8], [1, nw], [1, 0])
-    r = gl.arange(0, 8, gl.SliceLayout(1, rows))[:, None]
-    jr = gl.arange(0, UNPOOL_COLS // 2, gl.SliceLayout(0, rows))[None, :]
-    col = RANK * OWNED + task * UNPOOL_COLS + 2 * jr
-    yr_lo = gl.convert_layout(y_lo, gl.SliceLayout(0, rows))[None, :]
-    yr_hi = gl.convert_layout(y_hi, gl.SliceLayout(0, rows))[None, :]
-    ar_lo = gl.convert_layout(ah_lo, gl.SliceLayout(0, rows))[None, :]
-    ar_hi = gl.convert_layout(ah_hi, gl.SliceLayout(0, rows))[None, :]
-    sr = gl.where(jr == 0, s_y, gl.where(jr == 1, s_by, gl.where(jr == 2, s_x, s_ah)))
-    vals = gl.where(
-        r == 0,
-        yr_lo,
-        gl.where(
-            r == 1,
-            yr_hi,
-            gl.where(r == 2, ar_lo, gl.where(r == 3, ar_hi, sr)),
-        ),
-    )
-    idx = gl.where(
-        r < 4,
-        (r >> 1) * HIDDEN + col + (r & 1),
-        SUMS_AT + (RANK * UNPOOL_TASKS + task) * SUMS + jr,
-    )
-    word = vals.to(gl.int32, bitcast=True)
-    put = (r < 4) | ((r == 4) & (jr < SUMS))
-    for p in gl.static_range(WORLD):
-        mb.put_peer("ffn", p, idx, word, mask=put)
-    return y_lo, y_hi, ah_lo, ah_hi
 
 
 @gluon.jit
@@ -293,7 +285,15 @@ def unpool_stages(mb, task, w, post_gain, alpha, beta, h_next, RANK: gl.constexp
     a_lo = gl.load(alpha + c)
     a_hi = gl.load(alpha + c + 1)
     x_smem, _ = bf16.load_rows(mb, "cmb", 0, POOLED, R)
-    hp = mb.poll_rows(("hp", "hp"), (c, c + 1), R)
+    # Every row's h' of the task's pairs, in the epilogue's [row, pair] layout.
+    RPP: gl.constexpr = triton.next_power_of_2(R)
+    hl: gl.constexpr = gl.SliceLayout(
+        1, gl.BlockedLayout([1, 1, 1], [1, 8, 8], [nw, 1, 1], [2, 1, 0])
+    )
+    hr = gl.arange(0, RPP, gl.SliceLayout(1, hl))[:, None]
+    hc = task * UNPOOL_COLS + 2 * gl.arange(0, UNPOOL_COLS // 2, gl.SliceLayout(0, hl))
+    hat = mb.row_offset(hr) + hc[None, :]
+    hp = mb.poll_many(("hp", "hp"), (hat, hat + 1))
     mb.stamp("unpool", trace.READY)
     out = bf16.gemv(x_smem, tiles, FIRST=0, ROWS=R)  # [RP, 16]
     mb.stamp("unpool", trace.COMPUTED)
@@ -303,37 +303,71 @@ def unpool_stages(mb, task, w, post_gain, alpha, beta, h_next, RANK: gl.constexp
     lo, hi = gl.split(
         gl.reshape(gl.convert_layout(out, pairs), [RP, UNPOOL_COLS // 2, 2])
     )
-    rid = gl.arange(0, RP, gl.SliceLayout(1, lo.type.layout))[:, None]
-    kept = ()
-    for r in gl.static_range(R):
-        kept += (
-            _unpool_row(
-                mb.row(r),
-                task,
-                gl.convert_layout(gl.sum(gl.where(rid == r, lo, 0.0), axis=0), lanes),
-                gl.convert_layout(gl.sum(gl.where(rid == r, hi, 0.0), axis=0), lanes),
-                hp[r][0],
-                hp[r][1],
-                post_lo,
-                post_hi,
-                b_lo,
-                b_hi,
-                a_lo,
-                a_hi,
-                RANK,
+    # Every row at once: [row, kind, pair], a wave per row. Kinds 0 .. 3 are
+    # y_lo, y_hi, (alpha h')_lo, (alpha h')_hi of the 8 pairs; kind 4 holds
+    # the row's 4 sums. One put per peer serves every row.
+    L3: gl.constexpr = gl.BlockedLayout([1, 1, 1], [1, 8, 8], [nw, 1, 1], [2, 1, 0])
+    P2: gl.constexpr = gl.SliceLayout(1, L3)
+    r2 = gl.arange(0, RP, gl.SliceLayout(1, P2))[:, None]
+    j2 = gl.arange(0, UNPOOL_COLS // 2, gl.SliceLayout(0, P2))[None, :]
+    c2 = task * UNPOOL_COLS + 2 * j2
+    hp_lo = hp[0].to(gl.float32, bitcast=True)
+    hp_hi = hp[1].to(gl.float32, bitcast=True)
+    y_lo = gl.convert_layout(lo, P2).to(gl.bfloat16).to(gl.float32)
+    y_hi = gl.convert_layout(hi, P2).to(gl.bfloat16).to(gl.float32)
+    y_lo = y_lo * gl.convert_layout(post_lo, gl.SliceLayout(0, P2))[None, :]
+    y_hi = y_hi * gl.convert_layout(post_hi, gl.SliceLayout(0, P2))[None, :]
+    a2_lo = gl.convert_layout(a_lo, gl.SliceLayout(0, P2))[None, :]
+    a2_hi = gl.convert_layout(a_hi, gl.SliceLayout(0, P2))[None, :]
+    b2_lo = gl.convert_layout(b_lo, gl.SliceLayout(0, P2))[None, :]
+    b2_hi = gl.convert_layout(b_hi, gl.SliceLayout(0, P2))[None, :]
+    ah_lo = a2_lo * hp_lo
+    ah_hi = a2_hi * hp_hi
+    by_lo = b2_lo * y_lo
+    by_hi = b2_hi * y_hi
+    s_y = gl.sum(y_lo * y_lo + y_hi * y_hi, axis=1)[:, None]
+    s_by = gl.sum(by_lo * by_lo + by_hi * by_hi, axis=1)[:, None]
+    s_x = gl.sum(ah_lo * by_lo + ah_hi * by_hi, axis=1)[:, None]
+    s_ah = gl.sum(ah_lo * ah_lo + ah_hi * ah_hi, axis=1)[:, None]
+    sr = gl.where(j2 == 0, s_y, gl.where(j2 == 1, s_by, gl.where(j2 == 2, s_x, s_ah)))
+    k = gl.arange(0, 8, gl.SliceLayout(0, gl.SliceLayout(2, L3)))[None, :, None]
+    j3 = j2[:, None, :]
+    r3 = r2[:, None, :]
+    vals = gl.where(
+        k == 0,
+        y_lo[:, None, :],
+        gl.where(
+            k == 1,
+            y_hi[:, None, :],
+            gl.where(
+                k == 2,
+                ah_lo[:, None, :],
+                gl.where(k == 3, ah_hi[:, None, :], sr[:, None, :]),
             ),
-        )
+        ),
+    )
+    col = RANK * OWNED + task * UNPOOL_COLS + 2 * j3
+    idx = mb.row_offset(r3) + gl.where(
+        k < 4,
+        (k >> 1) * HIDDEN + col + (k & 1),
+        SUMS_AT + (RANK * UNPOOL_TASKS + task) * SUMS + j3,
+    )
+    word = vals.to(gl.int32, bitcast=True)
+    put = ((k < 4) | ((k == 4) & (j3 < SUMS))) & (r3 < R)
+    for p in gl.static_range(WORLD):
+        mb.put_peer("ffn", p, idx, word, mask=put)
     mb.stamp("unpool", trace.END)
 
     mb.stamp("fin", trace.START)
-    invs = ()
-    for r in gl.static_range(R):
-        invs += (_ffn_norms(mb.row(r))[0],)
+    invs = _ffn_row_scales(mb)
     mb.stamp("fin", trace.READY)
+    inv = gl.zeros([RP, 1], gl.float32, P2)
     for r in gl.static_range(R):
-        y_lo, y_hi, ah_lo, ah_hi = kept[r]
-        gl.store(h_next + r * OWNED + c, gl.fma(b_lo, y_lo * invs[r], ah_lo))
-        gl.store(h_next + r * OWNED + c + 1, gl.fma(b_hi, y_hi * invs[r], ah_hi))
+        inv = gl.where(r2 == r, invs[r], inv)
+    at = h_next + r2 * OWNED + c2
+    keep = (r2 < R) & (j2 >= 0)
+    gl.store(at, gl.fma(b2_lo, y_lo * inv, ah_lo), mask=keep)
+    gl.store(at + 1, gl.fma(b2_hi, y_hi * inv, ah_hi), mask=keep)
     mb.stamp("fin", trace.END)
 
 
