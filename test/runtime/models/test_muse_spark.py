@@ -407,6 +407,35 @@ def test_forward_taps_the_residual_stream_after_each_draft_target_layer(
     assert sink.captures[0][1] is aux[0] and sink.captures[1][1] is aux[1]
 
 
+def test_a_tap_entering_a_fused_layer_reads_the_rows_the_step_returned() -> None:
+    # The step gathers the whole rows before a layer a draft taps; the tap
+    # must read what the fused run before it returned, and the plan must
+    # know the tapped layers.
+    model, sink, ctx = _tapping_model([0])  # taps the stream entering layer 1
+    planned = []
+
+    def fused(*, hidden_states, attention_input, ctx):
+        return hidden_states + 10.0, attention_input
+
+    step = SimpleNamespace(
+        layer=lambda index: fused if index == 0 else None, finish=lambda: None
+    )
+
+    def plan(rows, ctx, taps):
+        planned.append(list(taps))
+        return step
+
+    model.monokernels = SimpleNamespace(plan=plan)
+    hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    model.forward(torch.tensor([0, 1]), torch.tensor([0, 1]), ctx, hidden)
+
+    assert planned == [model.layers_to_capture]
+    torch.testing.assert_close(
+        sink.captures[0][1], (hidden + 10.0).to(torch.bfloat16), rtol=0, atol=0
+    )
+
+
 def test_idle_forward_taps_nothing() -> None:
     model, sink, _ = _tapping_model([0, 2])
     idle = SimpleNamespace(

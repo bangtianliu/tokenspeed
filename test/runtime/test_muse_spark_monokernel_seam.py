@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -48,9 +49,11 @@ from tokenspeed.runtime.layers.moe.weights.loaders import (  # noqa: E402
     load_w13,
 )
 from tokenspeed.runtime.models.muse_spark_monokernel import (  # noqa: E402
+    MAX_ROWS,
     NOT_TP8,
     OTHER_CONSTANTS,
     OTHER_SHAPES,
+    MonokernelStep,
     _rank_slices,
     model_reasons,
     takes_monokernels,
@@ -69,14 +72,29 @@ def _ctx(mode: ForwardMode, bs: int, rows: int) -> ForwardContext:
     )
 
 
-def test_one_token_decode_steps_of_one_request_take_the_kernels() -> None:
-    """A launch computes one token row: prefill, several requests and
-    speculative verify rows keep the regular path."""
+def test_decode_steps_of_one_request_take_the_kernels() -> None:
+    """A launch computes the rows of one request: a decode token or a
+    speculative verify of up to MAX_ROWS tokens. Prefill, several requests
+    and wider verifies keep the regular path."""
     assert takes_monokernels(1, _ctx(ForwardMode.DECODE, 1, 1))
+    assert takes_monokernels(4, _ctx(ForwardMode.DECODE, 1, 4))
+    assert takes_monokernels(MAX_ROWS, _ctx(ForwardMode.DECODE, 1, MAX_ROWS))
+    assert not takes_monokernels(MAX_ROWS + 1, _ctx(ForwardMode.DECODE, 1, 9))
     assert not takes_monokernels(2, _ctx(ForwardMode.DECODE, 2, 2))
-    assert not takes_monokernels(4, _ctx(ForwardMode.DECODE, 1, 4))
     assert not takes_monokernels(1, _ctx(ForwardMode.EXTEND, 1, 1))
     assert not takes_monokernels(1, _ctx(ForwardMode.IDLE, 1, 1))
+
+
+def test_a_verify_step_gives_each_row_its_token_length() -> None:
+    """Verify metadata holds the request's length after the step; row t of
+    the request's rows is the token at position seq - rows + t."""
+    monokernels = SimpleNamespace()
+    seq_lens = torch.tensor([100, 7], dtype=torch.int32)
+    verify = MonokernelStep(monokernels, 8, [])
+    assert verify._row_lengths(0, seq_lens).tolist() == list(range(93, 101))
+    # One decode row reads the metadata as is.
+    decode = MonokernelStep(monokernels, 1, [])
+    assert decode._row_lengths(0, seq_lens).tolist() == [100]
 
 
 def _text_config(**overrides) -> dict:

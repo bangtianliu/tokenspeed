@@ -20,8 +20,8 @@
 
 """Muse Spark decode monokernel seam.
 
-With ``--decode-monokernel``, each eligible decoder layer of a one-row decode
-step runs as one persistent launch per TP8 rank from
+With ``--decode-monokernel``, each eligible decoder layer of a decode step of
+one request runs as one persistent launch per TP8 rank from
 ``tokenspeed_kernel.ops.monokernel``. The model touches this module in four
 places:
 
@@ -33,6 +33,12 @@ places:
   :class:`MonokernelStep`, or None for the regular path;
 * the layer loop runs ``step.layer(i)`` in place of layer ``i`` where it is
   not None, and calls ``step.finish()`` after the loop.
+
+A step serves one token row, or the rows of a speculative verify (the
+request's draft tokens, one row each; row ``t`` has length ``seq - rows + t +
+1`` for the step's ``seq_lens``). A draft model that taps the residual
+entering a layer (``layers_to_capture``) gets the whole row there: the fused
+run before that layer gathers it, as before a regular layer.
 
 Both MoE splits of a TP8 server are served: MoE TP8 / EP1 and MoE TP1 /
 EP8. The kernel computes each rank's slice of every picked expert, so on an
@@ -74,8 +80,9 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
 
-# One token row per launch: decode steps of one request.
-MAX_ROWS = 1
+# Token rows of one launch: a decode row, or a verify of up to 7 draft tokens
+# (the DFlash2 drafters' block of 8).
+MAX_ROWS = 8
 WORLD = 8
 # The served MoE splits, as (MoE TP size, EP size).
 MOE_SPLITS = frozenset({(WORLD, 1), (1, WORLD)})
@@ -265,7 +272,8 @@ def _pack(model, index, window, qkvg, o, pool, post, gains, experts):
             "alpha2": alpha2,
             "beta2": beta2,
             "in_gain": in_gain,
-        }
+        },
+        max_rows=MAX_ROWS,
     )
 
 
@@ -337,9 +345,10 @@ def prepare_ep8_experts(mlp: torch.nn.Module) -> tuple[torch.Tensor, ...] | None
 
 def takes_monokernels(rows: int, ctx: ForwardContext) -> bool:
     """Whether a forward of ``rows`` token rows takes the monokernels: a
-    decode step of one request with one token. Prefill, several requests and
-    speculative verify rows keep the regular path."""
-    return ctx.forward_mode.is_decode() and ctx.bs == 1 and rows == MAX_ROWS
+    decode step of one request, with one token or a speculative verify of at
+    most ``MAX_ROWS`` tokens. Prefill and several requests keep the regular
+    path."""
+    return ctx.forward_mode.is_decode() and ctx.bs == 1 and 1 <= rows <= MAX_ROWS
 
 
 class MonokernelSteps:
@@ -356,7 +365,9 @@ class MonokernelSteps:
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
         context = get_or_create_context(heap_size=MIN_HEAP_BYTES)
         iris_group = IrisGroup(context, group, rank, device)
-        # Nothing clears the scratch: the tags make old pairs stale.
+        # Nothing clears the scratch: the tags make old pairs stale. Every
+        # layer's plan lays the regions out alike (layer.layer_plan), so one
+        # scratch serves both kinds of layer.
         self.scratch = context.zeros((scratch_pairs,), dtype=torch.int64)
         self.bases = iris_group.bases.to(device)
         # The launches' tag base: it moves once per forward, inside the graph.
@@ -404,23 +415,32 @@ class MuseSparkMonokernels:
             scratch_pairs = max(f.scratch_pairs for f in self.fused.values())
             self.steps = MonokernelSteps(group, rank, scratch_pairs)
 
-    def plan(self, rows: int, ctx: ForwardContext) -> MonokernelStep | None:
+    def plan(
+        self, rows: int, ctx: ForwardContext, taps: list[int]
+    ) -> MonokernelStep | None:
         """This forward's step of ``rows`` token rows, or None when the
-        monokernels do not serve it (the regular path): a decode step of one
-        request with one token."""
+        monokernels do not serve it (the regular path; see
+        :func:`takes_monokernels`). ``taps`` are the layers whose entering
+        residual a draft reads (the model's ``layers_to_capture``)."""
         if self.steps is None or not takes_monokernels(rows, ctx):
             return None
-        return MonokernelStep(self)
+        return MonokernelStep(self, rows, taps)
 
 
 class MonokernelStep:
     """One forward that the monokernels serve."""
 
-    def __init__(self, monokernels: MuseSparkMonokernels) -> None:
+    def __init__(
+        self, monokernels: MuseSparkMonokernels, rows: int, taps: list[int]
+    ) -> None:
         self._monokernels = monokernels
+        self._rows = rows
+        self._taps = frozenset(taps)
         # The owned residual columns that the last launch wrote, while the
         # next layer is fused too.
         self._owned: torch.Tensor | None = None
+        # Each row's length, by cache group (computed once per forward).
+        self._seq_lens: dict[int, torch.Tensor] = {}
 
     def layer(self, index: int) -> Callable | None:
         """The launch that replaces decoder layer ``index``, with the layer
@@ -442,9 +462,10 @@ class MonokernelStep:
         ctx: ForwardContext,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run layer ``index``'s launch. Returns ``(residual, next attention
-        input)`` as the regular layer does: the whole residual row only when
-        the next layer keeps the regular path, else the input row unchanged
-        (the next launch reads the owned columns this one wrote)."""
+        input)`` as the regular layer does: the whole residual rows when the
+        next layer keeps the regular path or a draft taps it, else the input
+        rows unchanged (the next launch reads the owned columns this one
+        wrote)."""
         monokernels = self._monokernels
         layer, fused, steps = (
             monokernels.layers[index],
@@ -452,8 +473,9 @@ class MonokernelStep:
             monokernels.steps,
         )
         rank = fused.weights.rank
+        rows = self._rows
         if self._owned is None:
-            h = hidden_states[0, rank * OWNED : (rank + 1) * OWNED]
+            h = hidden_states[:rows, rank * OWNED : (rank + 1) * OWNED].contiguous()
         else:
             h = self._owned
         attn = layer.self_attn
@@ -474,16 +496,16 @@ class MonokernelStep:
             if attn.rotary_emb is not None
             else attn.nope_cos_sin_cache
         )
-        h_out = h.new_empty(OWNED)
-        a_out = attention_input.new_empty(1, HIDDEN)
+        h_out = h.new_empty(rows, OWNED)
+        a_out = attention_input.new_empty(rows, HIDDEN)
         muse_spark_layer_decode(
             fused,
-            h=h[None],
-            a=attention_input[:1],
-            h_out=h_out[None],
+            h=h,
+            a=attention_input[:rows],
+            h_out=h_out,
             a_out=a_out,
-            seq_len=leaf.forward_decode_metadata.seq_lens[:1],
-            slot=slot[:1],
+            seq_len=self._row_lengths(group_id, leaf.forward_decode_metadata.seq_lens),
+            slot=slot[:rows],
             page_table=view.page_table[0],
             k_cache=k_cache.view(-1, 2, 64),
             v_cache=v_cache.view(-1, 2, 64),
@@ -493,12 +515,27 @@ class MonokernelStep:
             peer_bases=steps.bases,
             layer_index=index,
         )
-        if index + 1 in monokernels.fused:
+        if index + 1 in monokernels.fused and index + 1 not in self._taps:
             self._owned = h_out
             return hidden_states, a_out
-        # The next layer keeps the regular path: it reads the whole row.
+        # The next layer keeps the regular path, or a draft taps the residual
+        # entering it: it reads the whole rows.
         self._owned = None
-        return all_gather(h_out[None], monokernels.group, dim=-1), a_out
+        return all_gather(h_out, monokernels.group, dim=-1), a_out
+
+    def _row_lengths(self, group_id: int, seq_lens: torch.Tensor) -> torch.Tensor:
+        """Each row's length from the step's ``seq_lens`` (the request's
+        length after the step): ``seq - rows + t + 1`` for row ``t``."""
+        lengths = self._seq_lens.get(group_id)
+        if lengths is None:
+            if self._rows == 1:
+                lengths = seq_lens[:1]
+            else:
+                lengths = seq_lens[:1] + torch.arange(
+                    1 - self._rows, 1, dtype=seq_lens.dtype, device=seq_lens.device
+                )
+            self._seq_lens[group_id] = lengths
+        return lengths
 
 
 def enable_decode_monokernels(model: torch.nn.Module) -> None:
