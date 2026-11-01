@@ -82,19 +82,19 @@ def route_kernel(
         moe_route.router_stage(mb, task, w, pre_gain, h, alpha, beta, RANK, "router")
     task, active = schedule.stage_task(PLAN, "topk")
     if active:
-        moe_route.topk_stage(mb, bias, "topk")
+        moe_route.topk_stage(mb, task, bias, "topk")
 
 
-def _inputs(seed: int):
-    """The attention tail's ``b`` (BF16 values), ``h``, ``alpha``, ``beta``,
-    the residual ``h' = beta b inv + alpha h`` they give, and the router's
-    weights."""
+def _inputs(seed: int, rows: int):
+    """The attention tail's ``b`` (BF16 values) and ``h`` of each row
+    (``[rows, 8192]``), ``alpha``, ``beta``, the residual ``h' = beta b inv +
+    alpha h`` they give, and the router's weights."""
     g = torch.Generator().manual_seed(seed)
-    b = torch.randn(HIDDEN, generator=g).to(torch.bfloat16).float()
-    h = torch.randn(HIDDEN, generator=g) * 3.0
+    b = torch.randn(rows, HIDDEN, generator=g).to(torch.bfloat16).float()
+    h = torch.randn(rows, HIDDEN, generator=g) * 3.0
     alpha = torch.rand(HIDDEN, generator=g) + 0.5
     beta = torch.rand(HIDDEN, generator=g) + 0.5
-    inv = torch.rsqrt(b.double().pow(2).mean() + 1e-8)
+    inv = torch.rsqrt(b.double().pow(2).mean(-1, keepdim=True) + 1e-8)
     hp = beta.double() * b.double() * inv + alpha.double() * h.double()
     pre_gain = (torch.randn(HIDDEN, generator=g) * 0.1 + 1.0).to(torch.bfloat16).float()
     w = torch.randn(EXPERTS, HIDDEN, generator=g) / HIDDEN**0.5
@@ -107,7 +107,7 @@ def _inputs(seed: int):
     return (b, h, alpha, beta), hp, pre_gain, w, bias
 
 
-def _worker(rank: int, port: int) -> None:
+def _worker(rank: int, port: int, rows: int) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "gloo",
@@ -122,11 +122,11 @@ def _worker(rank: int, port: int) -> None:
         group = IrisGroup(ctx, dist.group.WORLD, rank, device)
         plan = Plan(
             grid=256,
-            stages=moe_route.stages({"router": 0, "topk": 16}),
+            stages=moe_route.stages({"router": 0, "topk": 16}, rows),
             regions=(("bq", OWNED), ("ss1", WORLD * TAIL_TASKS * SUMS))
             + moe_route.regions(),
-            rows=1,
-            chain=1,
+            rows=rows,
+            chain=rows,
             external=("bq", "ss1"),
             world=WORLD,
             peers=moe_route.PEERS,
@@ -136,29 +136,34 @@ def _worker(rank: int, port: int) -> None:
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         for k, seed in enumerate((1, 2, 3)):
             step = 4 + k
-            (b, h, alpha, beta), hp, pre_gain, w, bias = _inputs(seed)
-            fill(
-                scratch,
-                plan,
-                "bq",
-                b[own].view(torch.int32).to(device),
-                launch_tag(step, 0),
-            )
-            # The attention tail's partial sums: [rank][task of 128 columns][sum].
-            fill(
-                scratch,
-                plan,
-                "ss1",
-                _tail_sums(b, h, alpha, beta).view(torch.int32).to(device),
-                launch_tag(step, 0),
-            )
+            (b, h, alpha, beta), hp, pre_gain, w, bias = _inputs(seed, rows)
+            tag = launch_tag(step, 0)
+            for row in range(rows):
+                fill(
+                    scratch,
+                    plan,
+                    "bq",
+                    b[row, own].contiguous().view(torch.int32).to(device),
+                    tag,
+                    row=row,
+                )
+                # The attention tail's partial sums: [rank][task][sum].
+                sums = _tail_sums(b[row], h[row], alpha, beta)
+                fill(
+                    scratch,
+                    plan,
+                    "ss1",
+                    sums.view(torch.int32).to(device),
+                    tag,
+                    row=row,
+                )
             route_kernel[(plan.grid,)](
                 scratch,
                 torch.full((1,), step, dtype=torch.int32, device=device),
                 group.bases,
                 w[:, own].contiguous().to(device),
                 pre_gain[own].to(device),
-                h[own].to(device),
+                h[:, own].contiguous().to(device),
                 alpha[own].to(device),
                 beta[own].to(device),
                 bias.to(device),
@@ -167,30 +172,35 @@ def _worker(rank: int, port: int) -> None:
                 num_warps=8,
             )
             torch.cuda.synchronize()
-            got = payloads(scratch, plan, "route", 2 * TOP_K, launch_tag(step, 0)).cpu()
-            u = hp * torch.rsqrt(hp.pow(2).mean() + 1e-5) * pre_gain
-            logit = (w.double() @ u) * 0.17677669529663687
-            score = torch.sigmoid(logit)
-            # Largest first, a tie to the lowest id.
-            ids = torch.sort(
-                score + bias.double(), descending=True, stable=True
-            ).indices[:TOP_K]
-            weights = score[ids] / score[ids].sum()
-            assert torch.equal(got[:TOP_K].long(), ids)
-            if seed == 3:
-                assert ids[:2].tolist() == [5, 9]
-            torch.testing.assert_close(
-                got[TOP_K:].view(torch.float32).double(), weights, rtol=1e-5, atol=1e-6
-            )
+            for row in range(rows):
+                got = payloads(scratch, plan, "route", 2 * TOP_K, tag, row=row).cpu()
+                u = hp[row] * torch.rsqrt(hp[row].pow(2).mean() + 1e-5) * pre_gain
+                logit = (w.double() @ u) * 0.17677669529663687
+                score = torch.sigmoid(logit)
+                # Largest first, a tie to the lowest id.
+                ids = torch.sort(
+                    score + bias.double(), descending=True, stable=True
+                ).indices[:TOP_K]
+                weights = score[ids] / score[ids].sum()
+                assert torch.equal(got[:TOP_K].long(), ids), row
+                if seed == 3:
+                    assert ids[:2].tolist() == [5, 9]
+                torch.testing.assert_close(
+                    got[TOP_K:].view(torch.float32).double(),
+                    weights,
+                    rtol=1e-5,
+                    atol=1e-6,
+                )
             dist.barrier()
     finally:
         dist.destroy_process_group()
 
 
-def test_routing_sums_the_ranks_partial_logits_and_picks_the_top_8():
+@pytest.mark.parametrize("rows", [1, 8])
+def test_routing_sums_the_ranks_partial_logits_and_picks_the_top_8(rows: int):
     if torch.cuda.device_count() < WORLD:
         pytest.skip(f"requires {WORLD} GPUs")
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port,), nprocs=WORLD, join=True)
+    mp.spawn(_worker, args=(port, rows), nprocs=WORLD, join=True)
