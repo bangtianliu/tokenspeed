@@ -18,7 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""A whole Muse Spark decode layer as one persistent launch per TP8 rank."""
+"""A whole Muse Spark decode layer as one persistent launch per TP8 rank,
+for one decode row or a speculative verify's chained rows."""
 
 from __future__ import annotations
 
@@ -50,20 +51,22 @@ WORLD, HIDDEN, POOLED, OWNED, EXPERTS = 8, 8192, 4096, 1024, 16
 QKVG, Q = 2304, 1024
 
 
-def _shared(seed: int, length: int):
-    """Inputs every rank shares."""
+def _shared(seed: int, length: int, rows: int):
+    """Inputs every rank shares: ``a_in`` and ``h`` of each row (``[rows,
+    8192]``; row ``t`` at position ``length - 1 + t``), the weights of the
+    norms and the router, and the page table."""
     g = torch.Generator().manual_seed(seed)
 
     def gain(n):
         return (1.0 + 0.1 * torch.randn(n, generator=g)).to(torch.bfloat16).float()
 
-    a_in = torch.randn(HIDDEN, generator=g).to(torch.bfloat16)
-    h = torch.randn(HIDDEN, generator=g) * 2
+    a_in = torch.randn(rows, HIDDEN, generator=g).to(torch.bfloat16)
+    h = torch.randn(rows, HIDDEN, generator=g) * 2
     gates = [torch.rand(HIDDEN, generator=g) + 0.5 for _ in range(4)]
     router = torch.randn(256, HIDDEN, generator=g) / HIDDEN**0.5
     bias = torch.randn(256, generator=g) * 0.1
     bias[EXPERTS:] = -1e4  # the test holds 16 experts per rank
-    pages = (length + 63) // 64
+    pages = (length + rows - 1 + 63) // 64
     table = (torch.randperm(pages + 3, generator=g)[:pages] + 1).to(torch.int32)
     return dict(
         a_in=a_in,
@@ -114,60 +117,71 @@ def _all_experts(t: torch.Tensor) -> torch.Tensor:
     return full
 
 
-def _reference(sh, length, full, kernel_pooled, kernel_hp):
-    """The layer's pooled row, FP32 residual ``h''`` and next BF16 attention
-    input.
+def _reference(sh, length, full, kernel_pooled, kernel_hp, dev):
+    """Each row's pooled row, FP32 residual ``h''`` and next BF16 attention
+    input (``[rows, ...]``).
 
     MXFP4 quantization is discontinuous: a pooled value one BF16 step from
     the reference's can quantize one E2M1 step away and move every expert
-    output a little. So the pooled row is checked on its own, and the expert
-    math downstream of it starts from the kernel's ``kernel_pooled``. In the
-    same way the FFN residual gate starts from the kernel's ``h'``
-    (``kernel_hp``), which is checked on its own.
+    output a little. So the pooled rows are checked on their own, and the
+    expert math downstream of them starts from the kernel's
+    ``kernel_pooled``. In the same way the FFN residual gate starts from the
+    kernel's ``h'`` (``kernel_hp``), which is checked on its own.
     """
+    rows = sh["a_in"].shape[0]
+    end = length + rows - 1
     window = 0 if full else layer.WINDOW
     splits = layer.FULL_SPLITS if full else layer.SLIDING_SPLITS
-    cs = ref.rope_table(length + 1)
-    b = torch.zeros(HIDDEN)
+    cs = ref.rope_table(end + 1)
+    b = torch.zeros(rows, HIDDEN)
     for r in range(WORLD):
-        w = _rank_weights(r, length)
+        w = _rank_weights(r, end)
         qkvg = (sh["a_in"].float() @ w["w_qkvg"].float().T).to(torch.bfloat16)
         z, _, _, _ = ref.attention_z(
             qkvg, w["k_cache"], w["v_cache"], sh["table"], length, window, splits, cs
         )
         b = b + (z.float() @ w["w_o"].float().T).to(torch.bfloat16).float()
     b = b.to(torch.bfloat16).float()
-    b = b * torch.rsqrt(b.pow(2).mean() + 1e-8)
+    b = b * torch.rsqrt(b.pow(2).mean(-1, keepdim=True) + 1e-8)
     hp = sh["beta1"] * b + sh["alpha1"] * sh["h"]
-    u = hp * torch.rsqrt(hp.pow(2).mean() + 1e-5) * sh["pre_gain"]
-    score = torch.sigmoid((sh["router"].double() @ u.double()) * 0.17677669529663687)
-    ids = torch.topk(score + sh["bias"].double(), 8).indices
-    weights = (score[ids] / score[ids].sum()).float()
-    w_pool = torch.cat([_rank_weights(r, length)["w_pool"] for r in range(WORLD)])
+    u = hp * torch.rsqrt(hp.pow(2).mean(-1, keepdim=True) + 1e-5) * sh["pre_gain"]
+    w_pool = torch.cat([_rank_weights(r, end)["w_pool"] for r in range(WORLD)])
     pooled = (u.to(torch.bfloat16).float() @ w_pool.float().T).to(torch.bfloat16)
-    routes = torch.zeros(8, POOLED)
+    w_post = torch.cat([_rank_weights(r, end)["w_post"] for r in range(WORLD)])
+    h2 = torch.empty(rows, HIDDEN)
+    a = torch.empty(rows, HIDDEN, dtype=torch.bfloat16)
+    gated = torch.empty(rows, HIDDEN)
+    score = torch.sigmoid((u.double() @ sh["router"].double().T) * 0.17677669529663687)
+    ids = torch.topk(score + sh["bias"].double(), 8).indices  # [rows, 8]
+    # The experts on the worker's GPU, every row at once.
+    routes = torch.zeros(rows, 8, POOLED)
     for r in range(WORLD):
-        routes = (
-            routes
-            + ref.expert_partials(
-                r, EXPERTS, kernel_pooled, sh["pre_exp_gain"], ids
-            ).float()
+        routes += (
+            ref.expert_partials(
+                r, EXPERTS, kernel_pooled.to(dev), sh["pre_exp_gain"], ids.to(dev)
+            )
+            .float()
+            .cpu()
         )
-    p = routes.to(torch.bfloat16).float() * sh["pen_gain"]
-    p = p * torch.rsqrt(p.pow(2).mean(1, keepdim=True) + 1e-8)
-    combined = (p * weights[:, None]).sum(0).to(torch.bfloat16)
-    w_post = torch.cat([_rank_weights(r, length)["w_post"] for r in range(WORLD)])
-    y = (combined.float() @ w_post.float().T).to(torch.bfloat16).float() * sh[
-        "post_gain"
-    ]
-    y = y * torch.rsqrt(y.pow(2).mean() + 1e-8)
-    h2 = sh["beta2"] * y + sh["alpha2"] * kernel_hp
-    a = (h2 * torch.rsqrt(h2.pow(2).mean() + 1e-5) * sh["in_gain"]).to(torch.bfloat16)
-    return pooled, hp, (sh["beta1"] * b).abs(), h2, a, (sh["beta2"] * y).abs()
+    for t in range(rows):
+        weights = (score[t, ids[t]] / score[t, ids[t]].sum()).float()
+        p = routes[t].to(torch.bfloat16).float() * sh["pen_gain"]
+        p = p * torch.rsqrt(p.pow(2).mean(1, keepdim=True) + 1e-8)
+        combined = (p * weights[:, None]).sum(0).to(torch.bfloat16)
+        y = (combined.float() @ w_post.float().T).to(torch.bfloat16).float()
+        y = y * sh["post_gain"]
+        y = y * torch.rsqrt(y.pow(2).mean() + 1e-8)
+        h2[t] = sh["beta2"] * y + sh["alpha2"] * kernel_hp[t]
+        a[t] = (h2[t] * torch.rsqrt(h2[t].pow(2).mean() + 1e-5) * sh["in_gain"]).to(
+            torch.bfloat16
+        )
+        gated[t] = (sh["beta2"] * y).abs()
+    return pooled, hp, (sh["beta1"] * b).abs(), h2, a, gated
 
 
 def _pack(rank: int, dev: torch.device, sh: dict, length: int, full: bool):
-    """Pack ``rank``'s layer from the regular path's tensors."""
+    """Pack ``rank``'s layer from the regular path's tensors (``length``: the
+    last row's length)."""
     w = _rank_weights(rank, length)
     w13, w13s, w2, w2s = ref.preprocessed_experts(rank, EXPERTS, dev)
     # The packer takes the regular path's tensors: the replicated pooler
@@ -199,7 +213,7 @@ def _pack(rank: int, dev: torch.device, sh: dict, length: int, full: bool):
     )
 
 
-def _worker(rank: int, port: int, length: int, full: bool) -> None:
+def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "gloo",
@@ -212,37 +226,34 @@ def _worker(rank: int, port: int, length: int, full: bool) -> None:
         dev = torch.device(f"cuda:{rank}")
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
-        plan = layer.layer_plan(full)
+        plan = layer.layer_plan(full, rows)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
-        sh = _shared(42, length)
-        w = _rank_weights(rank, length)
-        weights = _pack(rank, dev, sh, length, full)
+        end = length + rows - 1
+        sh = _shared(42, length, rows)
+        w = _rank_weights(rank, end)
+        weights = _pack(rank, dev, sh, end, full)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         k_cache, v_cache = w["k_cache"].to(dev), w["v_cache"].to(dev)
-        h_in = sh["h"][own].to(dev)
+        h_in = sh["h"][:, own].contiguous().to(dev)
         a_in = sh["a_in"].to(dev)
-        h_next = torch.empty(OWNED, device=dev)
-        a_out = torch.empty(HIDDEN, dtype=torch.bfloat16, device=dev)
+        h_next = torch.empty(rows, OWNED, device=dev)
+        a_out = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
 
         def launch(index: int, step: int, seq_len: int) -> None:
-            pos = seq_len - 1
+            pos = torch.arange(seq_len - 1, seq_len - 1 + rows)
+            slots = sh["table"][pos // 64].long() * 64 + pos % 64
             layer.launch_gluon_muse_spark_layer_gfx950(
                 weights,
                 h=h_in,
                 a=a_in,
                 h_out=h_next,
                 a_out=a_out,
-                seq_len=torch.full((1,), seq_len, dtype=torch.int32, device=dev),
-                slot=torch.full(
-                    (1,),
-                    int(sh["table"][pos // 64]) * 64 + pos % 64,
-                    dtype=torch.int32,
-                    device=dev,
-                ),
+                seq_len=(pos + 1).to(torch.int32).to(dev),
+                slot=slots.to(torch.int32).to(dev),
                 page_table=sh["table"].to(dev),
                 k_cache=k_cache,
                 v_cache=v_cache,
-                cos_sin=ref.rope_table(length + 1).to(dev),
+                cos_sin=ref.rope_table(end + 1).to(dev),
                 scratch=scratch,
                 step=torch.full((1,), step, dtype=torch.int32, device=dev),
                 peer_bases=group.bases,
@@ -255,45 +266,54 @@ def _worker(rank: int, port: int, length: int, full: bool) -> None:
         launch(lay, 3, length)
         torch.cuda.synchronize()
         dist.barrier()
-        kernel_pooled = (
-            payloads(scratch, plan, "cg", POOLED // 2, launch_tag(3, lay), copy=lay & 1)
-            .view(torch.bfloat16)
-            .cpu()
+        tag = launch_tag(3, lay)
+        kernel_pooled = torch.stack(
+            [
+                payloads(scratch, plan, "cg", POOLED // 2, tag, row=t, copy=lay & 1)
+                .view(torch.bfloat16)
+                .cpu()
+                for t in range(rows)
+            ]
         )
-        hp_own = (
-            payloads(scratch, plan, "hp", OWNED, launch_tag(3, lay))
-            .view(torch.float32)
-            .cpu()
+        hp_own = torch.stack(
+            [
+                payloads(scratch, plan, "hp", OWNED, tag, row=t)
+                .view(torch.float32)
+                .cpu()
+                for t in range(rows)
+            ]
         )
-        slices = [torch.empty(OWNED) for _ in range(WORLD)]
+        slices = [torch.empty_like(hp_own) for _ in range(WORLD)]
         dist.all_gather(slices, hp_own)
-        kernel_hp = torch.cat(slices)
+        kernel_hp = torch.cat(slices, dim=1)
         pooled, hp, gated1, h2, a, gated = _reference(
-            sh, length, full, kernel_pooled, kernel_hp
+            sh, length, full, kernel_pooled, kernel_hp, dev
         )
         # h' sums 8 ranks' BF16 partials: where they cancel, a step of one
         # partial is an absolute error at the row's scale, which the norm
         # carries into beta b.
-        err1 = (hp_own - hp[own]).abs()
-        bound1 = 2**-7 * hp[own].abs() + 2**-6 * float(gated1.max())
+        err1 = (hp_own - hp[:, own]).abs()
+        bound1 = 2**-7 * hp[:, own].abs() + 2**-6 * gated1.amax(-1, keepdim=True)
         assert torch.all(err1 <= bound1), float(err1.max())
         # The pooled row is the BF16 projection of bf16(u), which carries the
         # attention tail's BF16 steps: up to two steps, and near zero an
         # absolute error of the row's scale (the sum cancels).
-        atol = 2**-9 * float(pooled.float().abs().max())
-        torch.testing.assert_close(
-            kernel_pooled.float(), pooled.float(), rtol=2**-6, atol=atol
-        )
-        err = (h_next.cpu() - h2[own]).abs()
+        for t in range(rows):
+            atol = 2**-9 * float(pooled[t].float().abs().max())
+            torch.testing.assert_close(
+                kernel_pooled[t].float(), pooled[t].float(), rtol=2**-6, atol=atol
+            )
+        err = (h_next.cpu() - h2[:, own]).abs()
         # In the same way, a BF16 step of the projection is an absolute
         # error at the scale of beta y.
-        bound = 2**-7 * h2[own].abs() + 2**-6 * float(gated.max())
+        bound = 2**-7 * h2[:, own].abs() + 2**-6 * gated.amax(-1, keepdim=True)
         assert torch.all(err <= bound), float(err.max())
         # The next input is BF16 of h'' after a norm: the same row-scale error.
-        atol = 2**-8 * float(a.float().abs().max())
-        torch.testing.assert_close(
-            a_out.float().cpu(), a.float(), rtol=2**-6, atol=atol
-        )
+        for t in range(rows):
+            atol = 2**-8 * float(a[t].float().abs().max())
+            torch.testing.assert_close(
+                a_out[t].float().cpu(), a[t].float(), rtol=2**-6, atol=atol
+            )
         dist.barrier()
         # Serving moves the layer index, the step and the length every
         # launch; they are runtime arguments: one binary serves them all.
@@ -310,14 +330,15 @@ def _worker(rank: int, port: int, length: int, full: bool) -> None:
         dist.destroy_process_group()
 
 
+@pytest.mark.parametrize("rows", [1, 8])
 @pytest.mark.parametrize("full", [False, True])
-def test_layer_matches_the_regular_path_math(full):
+def test_layer_matches_the_regular_path_math(full, rows):
     if torch.cuda.device_count() < WORLD:
         pytest.skip(f"requires {WORLD} GPUs")
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port, 3000, full), nprocs=WORLD, join=True)
+    mp.spawn(_worker, args=(port, 3000, full, rows), nprocs=WORLD, join=True)
 
 
 def _graph_worker(rank: int, port: int, length: int) -> None:
@@ -333,17 +354,17 @@ def _graph_worker(rank: int, port: int, length: int) -> None:
         dev = torch.device(f"cuda:{rank}")
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
-        plan = layer.layer_plan(False)
+        plan = layer.layer_plan(False, 1)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
-        sh = _shared(42, length)
+        sh = _shared(42, length, 1)
         weights = _pack(rank, dev, sh, length, False)
         w = _rank_weights(rank, length)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         k_cache, v_cache = w["k_cache"].to(dev), w["v_cache"].to(dev)
-        h_in = sh["h"][own].to(dev)
+        h_in = sh["h"][:, own].contiguous().to(dev)
         a_in = sh["a_in"].to(dev)
-        h_out = torch.empty(OWNED, device=dev)
-        a_out = torch.empty(HIDDEN, dtype=torch.bfloat16, device=dev)
+        h_out = torch.empty(1, OWNED, device=dev)
+        a_out = torch.empty(1, HIDDEN, dtype=torch.bfloat16, device=dev)
         # The per-step operands are device tensors that the decode metadata
         # refreshes in place, as in serving.
         step = torch.zeros(1, dtype=torch.int32, device=dev)

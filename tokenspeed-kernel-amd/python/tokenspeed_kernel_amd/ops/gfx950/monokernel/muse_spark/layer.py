@@ -49,7 +49,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
     moe_tail,
     qkvg,
 )
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import WORLD
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import HIDDEN, WORLD
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Plan
 
 SLIDING_SPLITS = 16
@@ -77,12 +77,23 @@ BASES = {
 }
 
 
-def _bases(*names: str) -> dict[str, int]:
-    return {name: BASES[name] for name in names}
+# Past one row the attention tail has 8 tasks per row and the router 16 per
+# pair of rows: both move to CTAs whose only earlier task is oproj (the tail
+# off the router's CTAs, whose weight loads would otherwise wait for it).
+CHAINED_BASES = {**BASES, "tail": 64, "router": 0}
 
 
-def layer_plan(full: bool) -> Plan:
-    """The plan of a full-attention (``full``) or sliding-window layer."""
+def _bases(rows: int, *names: str) -> dict[str, int]:
+    table = BASES if rows == 1 else CHAINED_BASES
+    return {name: table[name] for name in names}
+
+
+def layer_plan(full: bool, rows: int) -> Plan:
+    """The plan of a full-attention (``full``) or sliding-window layer for
+    ``rows`` token rows of one request: 1 for decode, ``k + 1`` for a
+    speculative verify of ``k`` draft tokens."""
+    if not 1 <= rows <= 8:
+        raise ValueError(f"a launch serves 1 to 8 rows, got {rows}")
     splits = FULL_SPLITS if full else SLIDING_SPLITS
     regions = (
         qkvg.REGIONS
@@ -94,13 +105,13 @@ def layer_plan(full: bool) -> Plan:
         + moe_tail.regions()
     )
     stages = (
-        qkvg.stages(_bases("qkvg", "gate"))
-        + attention.stages(_bases("head", "attn", "merge"), splits)
-        + attn_tail.stages(_bases("oproj", "tail"))
-        + moe_route.stages(_bases("router", "topk"))
-        + moe_pool.stages(_bases("pool"))
-        + moe_experts.stages(_bases("ex1", "ex2"))
-        + moe_tail.stages(_bases("comb", "unpool", "out"))
+        qkvg.stages(_bases(rows, "qkvg", "gate"))
+        + attention.stages(_bases(rows, "head", "attn", "merge"), splits, rows)
+        + attn_tail.stages(_bases(rows, "oproj", "tail"), rows)
+        + moe_route.stages(_bases(rows, "router", "topk"), rows)
+        + moe_pool.stages(_bases(rows, "pool"))
+        + moe_experts.stages(_bases(rows, "ex1", "ex2"))
+        + moe_tail.stages(_bases(rows, "comb", "unpool", "out"), rows)
     )
     peers = (
         attn_tail.PEERS
@@ -113,8 +124,8 @@ def layer_plan(full: bool) -> Plan:
         grid=256,
         stages=stages,
         regions=regions,
-        rows=1,
-        chain=1,
+        rows=rows,
+        chain=rows,
         world=int(WORLD),
         peers=peers,
     )
@@ -195,10 +206,10 @@ def gluon_muse_spark_layer_gfx950(
 
     task, active = schedule.stage_task(PLAN, "qkvg")
     if active:
-        qkvg.qkvg_stage(mb, task, w_qkvg, a_in, 0, "qkvg")
+        qkvg.qkvg_stage(mb, task, w_qkvg, a_in, HIDDEN, "qkvg")
     task, active = schedule.stage_task(PLAN, "gate")
     if active:
-        qkvg.gate_stage(mb, task, w_qkvg, a_in, 0, "gate")
+        qkvg.gate_stage(mb, task, w_qkvg, a_in, HIDDEN, "gate")
     task, active = schedule.stage_task(PLAN, "head")
     if active:
         attention.head_stage(
@@ -235,7 +246,7 @@ def gluon_muse_spark_layer_gfx950(
         )
     task, active = schedule.stage_task(PLAN, "topk")
     if active:
-        moe_route.topk_stage(mb, router_bias, "topk")
+        moe_route.topk_stage(mb, task, router_bias, "topk")
     task, active = schedule.stage_task(PLAN, "pool")
     if active:
         moe_pool.pool_stage(mb, task, w_pool, RANK, "pool")
@@ -245,7 +256,7 @@ def gluon_muse_spark_layer_gfx950(
     task1 = gl.where(active1, task1, 0)
     task2, active2 = schedule.stage_task(PLAN, "ex2")
     task2 = gl.where(active2, task2, 0)
-    got1, gain_lo, gain_hi, e1, e2 = moe_experts.ex1_poll(
+    got1, gain_lo, gain_hi, ids, e1, e2 = moe_experts.ex1_poll(
         mb, task1, task2, active1, pre_exp_gain, "ex1"
     )
     loads1 = moe_experts.ex1_issue(
@@ -254,11 +265,40 @@ def gluon_muse_spark_layer_gfx950(
     loads2 = moe_experts.ex2_issue(
         mb, task2, active2, e2, w2, w2s, s2_we, s2_se, s2_lin, s2_nb, "ex2"
     )
+    union = moe_experts.slots(ids)
     a1 = moe_experts.ex1_operand(task1, got1, gain_lo, gain_hi)
     if active1:
-        moe_experts.ex1_finish(mb, task1, a1, loads1, "ex1")
+        moe_experts.ex1_finish(
+            mb,
+            task1,
+            a1,
+            loads1,
+            e1,
+            union,
+            w13,
+            w13s,
+            s13_we,
+            s13_se,
+            s13_lin,
+            s13_nb,
+            "ex1",
+        )
     if active2:
-        moe_experts.ex2_finish(mb, task2, loads2, RANK, "ex2")
+        moe_experts.ex2_finish(
+            mb,
+            task2,
+            loads2,
+            e2,
+            union,
+            w2,
+            w2s,
+            s2_we,
+            s2_se,
+            s2_lin,
+            s2_nb,
+            RANK,
+            "ex2",
+        )
     task, active = schedule.stage_task(PLAN, "comb1")
     if active:
         moe_tail.comb_stages(mb, task, pen_gain, RANK)
@@ -272,10 +312,20 @@ def gluon_muse_spark_layer_gfx950(
 
 
 def launch_layer(
-    scratch, step, layer, bases, attn_ops, moe_ops, trace_buf, rank: int, full: bool
+    scratch,
+    step,
+    layer,
+    bases,
+    attn_ops,
+    moe_ops,
+    trace_buf,
+    rank: int,
+    full: bool,
+    rows: int,
 ):
-    """Launch one layer step (``full``: a full-attention, NoPE layer)."""
-    plan = layer_plan(full)
+    """Launch one layer step of ``rows`` token rows (``full``: a
+    full-attention, NoPE layer)."""
+    plan = layer_plan(full, rows)
     gluon_muse_spark_layer_gfx950[(plan.grid,)](
         scratch,
         step,
@@ -312,18 +362,20 @@ def launch_gluon_muse_spark_layer_gfx950(
     layer: int,
     trace_buf,
 ):
-    """One decode step of a packed layer (``weights.LayerWeights``) for one
-    token row.
+    """One step of a packed layer (``weights.LayerWeights``) for the rows of
+    one request: one decode row, or a speculative verify's consecutive
+    tokens (row ``t`` at position ``seq_len[0] - 1 + t``). The row count
+    ``rows`` comes from ``h`` and selects the plan.
 
     Args:
         weights: From ``weights.pack_layer``.
-        h, h_out: FP32 ``[1024]`` owned residual columns, in and out.
-        a, a_out: BF16 ``[8192]`` attention input of this layer and of the
-            next one (normed with the next layer's input gain).
-        seq_len, slot: int32 ``[1]``: the row's length including its token,
-            and the KV cache slot of the token.
-        page_table: int32 ``[pages]`` of the row (64 tokens a page, indexed
-            by absolute position).
+        h, h_out: FP32 ``[rows, 1024]`` owned residual columns, in and out.
+        a, a_out: BF16 ``[rows, 8192]`` attention input of this layer and of
+            the next one (normed with the next layer's input gain).
+        seq_len, slot: int32 ``[rows]``: each row's length including its
+            token, and the KV cache slot of the token.
+        page_table: int32 ``[pages]`` of the request (64 tokens a page,
+            indexed by absolute position).
         k_cache, v_cache: BF16 ``[slots, 2, 64]``.
         cos_sin: FP32 ``[positions, 64]`` rotary table (unused by a full,
             NoPE layer).
@@ -333,19 +385,25 @@ def launch_gluon_muse_spark_layer_gfx950(
         layer: The decoder layer index (the tag and the peer copy).
         trace_buf: None, or a trace buffer (``trace.py``).
     """
+    rows = h.shape[0] if h.dim() == 2 else 0
     # The launch reads h and a while other CTAs already write the outputs.
     if (
         h.dtype != torch.float32
-        or h.numel() != 1024
+        or h.shape != (rows, 1024)
+        or not h.is_contiguous()
         or h.data_ptr() == h_out.data_ptr()
     ):
-        raise ValueError("h: FP32 [1024] that does not alias h_out")
+        raise ValueError("h: contiguous FP32 [rows, 1024] that does not alias h_out")
     if (
         a.dtype != torch.bfloat16
-        or a.numel() != 8192
+        or a.shape != (rows, 8192)
+        or not a.is_contiguous()
         or a.data_ptr() == a_out.data_ptr()
     ):
-        raise ValueError("a: BF16 [8192] that does not alias a_out")
+        raise ValueError("a: contiguous BF16 [rows, 8192] that does not alias a_out")
+    for name, t in (("seq_len", seq_len), ("slot", slot)):
+        if t.dtype != torch.int32 or t.numel() != rows:
+            raise ValueError(f"{name}: int32 [{rows}], one per row")
     attn_ops, moe_ops = weights.kernel_args(
         h=h,
         a=a,
@@ -368,6 +426,7 @@ def launch_gluon_muse_spark_layer_gfx950(
         trace_buf,
         weights.rank,
         weights.full,
+        rows,
     )
 
 

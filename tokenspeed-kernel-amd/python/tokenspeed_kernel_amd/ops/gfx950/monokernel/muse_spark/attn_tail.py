@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Output projection and attention tail of one Muse Spark rank (one row).
+"""Output projection and attention tail of one Muse Spark rank.
 
 Rank ``r`` owns hidden columns ``1024 r .. 1024 r + 1023``: it keeps only
 that slice of the FP32 residual, and it reduces only those columns of the
@@ -27,9 +27,9 @@ output projection (a reduce-scatter).
 * oproj, 128 tasks of 64 output columns: the rank's ``o_proj`` partial
   (BF16 ``[8192, 1024]``, 128 KiB a task) of the gated head-norm output
   ``z``, rounded to BF16 like the regular path's partial. A task puts its
-  columns into the owner rank's ``red`` slot of this rank.
-* tail1, tail2, 8 tasks of 128 owned columns on the same CTAs (each task
-  keeps its values in registers from one stage to the next):
+  columns of every row into the owner rank's ``red`` slot of this rank.
+* tail1, tail2, 8 tasks of 128 owned columns per row on the same CTAs (each
+  task keeps its values in registers from one stage to the next):
 
   - tail1 sums the 8 ranks' partials in rank order and rounds to BF16
     (``b``). It puts four partial sums of its columns into every rank's
@@ -75,9 +75,10 @@ def regions() -> tuple[tuple[str, int], ...]:
     )
 
 
-def stages(bases: dict[str, int]) -> tuple[Stage, ...]:
+def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
+    """Oproj, tail1 and tail2 of ``rows`` token rows, placed by ``bases``."""
     oproj, tail = placement(bases, ("oproj", "tail"))
-    tasks = int(TAIL_TASKS)
+    tasks = int(TAIL_TASKS) * rows
     return (
         Stage("oproj", int(OPROJ_TASKS), oproj, reads=("z",), writes=("red",)),
         Stage("tail1", tasks, tail, reads=("red",), writes=("bq", "ss1")),
@@ -87,12 +88,12 @@ def stages(bases: dict[str, int]) -> tuple[Stage, ...]:
 
 @gluon.jit
 def oproj_stage(mb, task, w, RANK: gl.constexpr, STAGE: gl.constexpr):
-    """Oproj task ``task``: output columns ``64 task ..``.
+    """Oproj task ``task``: output columns ``64 task ..`` of every row.
 
     Args:
         w: The rank's ``o_proj``, BF16 ``[8192, 1024]`` (``weights.bf16_tiles``).
     """
-    gl.static_assert(schedule.rows(mb.plan) == 1, "the attention tail serves one row")
+    R: gl.constexpr = schedule.rows(mb.plan)
     mb.stamp(STAGE, trace.START)
     NW: gl.constexpr = OPROJ_COLS // 16
     tiles = bf16.load_weight_tiles(
@@ -106,21 +107,25 @@ def oproj_stage(mb, task, w, RANK: gl.constexpr, STAGE: gl.constexpr):
         GROUP=NW,
         GROUP_STRIDE=0,
     )
-    x_smem, _ = bf16.load_rows(mb, "z", 0, Q, 1)
+    x_smem, _ = bf16.load_rows(mb, "z", 0, Q, R)
     mb.stamp(STAGE, trace.READY)
-    out = bf16.gemv(x_smem, tiles, FIRST=0, ROWS=1)  # FP32 [1, 64]
+    out = bf16.gemv(x_smem, tiles, FIRST=0, ROWS=R)  # FP32 [RP, 64]
     mb.stamp(STAGE, trace.COMPUTED)
+    RP: gl.constexpr = out.shape[0]
     pairs: gl.constexpr = gl.BlockedLayout([1, 2], [1, 64], [gl.num_warps(), 1], [1, 0])
     values = gl.convert_layout(out.to(gl.bfloat16), pairs)
     word = gl.reshape(
-        mx.pack_bf16_pairs(gl.reshape(values, [1, OPROJ_COLS // 2, 2])),
-        [OPROJ_COLS // 2],
+        mx.pack_bf16_pairs(gl.reshape(values, [RP, OPROJ_COLS // 2, 2])),
+        [RP, OPROJ_COLS // 2],
     )
-    p = gl.arange(0, OPROJ_COLS // 2, word.type.layout)
+    wl: gl.constexpr = word.type.layout
+    r = gl.arange(0, RP, gl.SliceLayout(1, wl))[:, None]
+    p = gl.arange(0, OPROJ_COLS // 2, gl.SliceLayout(0, wl))[None, :]
     cols_per_rank: gl.constexpr = OWNED // OPROJ_COLS
     owner = task // cols_per_rank
     at = RANK * (OWNED // 2) + (task % cols_per_rank) * (OPROJ_COLS // 2) + p
-    mb.put_peer("red", owner, at, word)
+    # One put serves every row; the padding rows past R are masked.
+    mb.put_peer("red", owner, mb.row_offset(r) + at, word, mask=(r < R) & (p >= 0))
     mb.stamp(STAGE, trace.END)
 
 
@@ -157,15 +162,19 @@ def norm_scales(got):
 
 @gluon.jit
 def tail_stages(mb, task, h, alpha, beta, pre_gain, RANK: gl.constexpr):
-    """Tail tasks ``task`` of tail1 and tail2: owned columns ``128 task ..``
-    (of the rank's 1024).
+    """Tail tasks ``task`` of tail1 and tail2: owned columns ``128 (task %
+    8) ..`` (of the rank's 1024) of row ``task // 8``.
 
     Args:
-        h: The rank's FP32 residual slice ``[1024]`` (the previous launch's).
+        h: The rank's FP32 residual slice ``[rows, 1024]`` (the previous
+            launch's).
         alpha, beta: FP32 residual-gate coefficients of the owned columns.
         pre_gain: FP32 ``bf16(w + 1)`` of the pre-FFN norm, owned columns.
     """
     mb.stamp("tail1", trace.START)
+    row, task, _ = schedule.row_task(mb.plan, task, TAIL_TASKS)
+    mb = mb.row(row)
+    h = h + row * OWNED
     nw: gl.constexpr = gl.num_warps()
     rl: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [1, nw], [1, 0])
     src = gl.arange(0, WORLD, gl.SliceLayout(1, rl))

@@ -21,23 +21,25 @@
 """Combine, post-expert projection and layer boundary of one Muse Spark rank.
 
 Rank ``r`` owns pooled columns ``512 r ..`` of the expert outputs and hidden
-columns ``1024 r ..`` of the residual (one row).
+columns ``1024 r ..`` of the residual.
 
-* comb1, comb2, 8 tasks of 64 owned pooled columns (same CTAs): the rank-order
+* comb1, comb2, 8 tasks of 64 owned pooled columns per row (same CTAs): the
+  rank-order
   sum of the 8 ranks' BF16 route partials, rounded to BF16, times the
   post-expert gain; then each route's RMS norm over all 4096 columns (one
   exchange of partial sums of squares per route), and the weighted sum of
   the 8 routes (a tree within a wave, not the regular path's pick order),
   rounded to BF16, put into every rank's ``cmb``.
 * unpool, fin, 64 tasks of 16 owned hidden columns (same CTAs): the
-  post-expert projection (BF16 ``[1024, 4096]``, 128 KiB a task) of the whole
-  combined row, rounded to BF16, times the post-FFN gain. Each task puts its
+  post-expert projection (BF16 ``[1024, 4096]``, 128 KiB a task) of every
+  whole combined row, rounded to BF16, times the post-FFN gain. For each
+  row, a task puts its
   ``y`` and ``alpha h'`` and four partial sums, of ``y^2``, ``(beta y)^2``,
   ``(alpha h')(beta y)`` and ``(alpha h')^2``, into every rank's ``ffn``, in
   one store per rank. Then, after that one exchange: the post-FFN norm (RMS
   over 8192 columns) and the residual gate ``h'' = beta y + alpha h'`` of the
   owned columns (stored: the launch's residual output).
-* out, 16 tasks of 512 hidden columns, after the same exchange: the norms,
+* out, 16 tasks of 512 hidden columns per row, after the same exchange: the norms,
   the residual gate and the next layer's input norm, whose sum of squares is
   the expansion of ``(beta y inv + alpha h')^2`` in the four sums. The result
   is rounded to BF16 and stored as the next attention input, for the next
@@ -82,15 +84,17 @@ def regions() -> tuple[tuple[str, int], ...]:
     )
 
 
-def stages(bases: dict[str, int]) -> tuple[Stage, ...]:
+def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
+    """Comb1, comb2, unpool, fin and out of ``rows`` token rows, placed by
+    ``bases``."""
     comb, unpool, out = placement(bases, ("comb", "unpool", "out"))
-    c, u = int(COMB_TASKS), int(UNPOOL_TASKS)
+    c, u = int(COMB_TASKS) * rows, int(UNPOOL_TASKS)
     return (
         Stage("comb1", c, comb, reads=("rr", "route"), writes=("ss3",)),
         Stage("comb2", c, comb, reads=("ss3",), writes=("cmb",)),
         Stage("unpool", u, unpool, reads=("cmb", "hp"), writes=("ffn",)),
         Stage("fin", u, unpool, reads=("ffn",)),
-        Stage("out", int(OUT_TASKS), out, reads=("ffn",)),
+        Stage("out", int(OUT_TASKS) * rows, out, reads=("ffn",)),
     )
 
 
@@ -111,12 +115,15 @@ def _bf16_word(lo, hi):
 
 @gluon.jit
 def comb_stages(mb, task, pen_gain, RANK: gl.constexpr):
-    """Comb1 and comb2 task ``task``: owned pooled columns ``64 task ..``.
+    """Comb1 and comb2 task ``task``: owned pooled columns ``64 (task % 8)
+    ..`` of row ``task // 8``.
 
     Args:
         pen_gain: FP32 ``bf16(w + 1)`` of the post-expert norm, owned columns.
     """
     mb.stamp("comb1", trace.START)
+    row, task, _ = schedule.row_task(mb.plan, task, COMB_TASKS)
+    mb = mb.row(row)
     nw: gl.constexpr = gl.num_warps()
     gl.static_assert(nw == 8, "comb lays out 8 waves")
     # [source, route, pair]: the 8 source ranks in a thread's registers, so
@@ -198,54 +205,13 @@ def _ffn_norms(mb):
 
 
 @gluon.jit
-def unpool_stages(mb, task, w, post_gain, alpha, beta, h_next, RANK: gl.constexpr):
-    """Unpool and fin task ``task``: owned hidden columns ``16 task ..``.
-
-    Args:
-        w: This rank's post-expert projection rows, BF16 ``[1024, 4096]``
-            (``weights.bf16_tiles``).
-        post_gain: FP32 ``bf16(w + 1)`` of the post-FFN norm, owned columns.
-        alpha: FP32 residual-gate coefficient of the FFN, owned columns.
-        beta: FP32 residual-gate coefficient of the FFN, all 8192 columns.
-        h_next: Where the owned FP32 residual ``h''`` goes.
-    """
-    gl.static_assert(schedule.rows(mb.plan) == 1, "the MoE tail serves one row")
+def _unpool_row(
+    mb, task, y_lo, y_hi, hp_lo, hp_hi, post_lo, post_hi, b_lo, b_hi, a_lo, a_hi, RANK
+):
+    """One row's unpool epilogue: ``y`` from the raw sums ``y_lo``, ``y_hi``
+    of the owned columns' pairs, the four sums, and the put into every rank's
+    ``ffn``. Returns ``(y_lo, y_hi, (alpha h')_lo, (alpha h')_hi)`` for fin."""
     nw: gl.constexpr = gl.num_warps()
-    mb.stamp("unpool", trace.START)
-    tiles = bf16.load_weight_tiles(
-        w,
-        nb0=task,
-        K=POOLED,
-        kit0=0,
-        KITS=POOLED // 32,
-        SPLIT=8,
-        NW=1,
-        GROUP=1,
-        GROUP_STRIDE=0,
-    )
-    # The parameters load before the polls: a load after a poll would start
-    # only when the poll returns.
-    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
-    j = gl.arange(0, UNPOOL_COLS // 2, lanes)
-    c = task * UNPOOL_COLS + 2 * j
-    post_lo = gl.load(post_gain + c)
-    post_hi = gl.load(post_gain + c + 1)
-    b_lo = gl.load(beta + RANK * OWNED + c)
-    b_hi = gl.load(beta + RANK * OWNED + c + 1)
-    a_lo = gl.load(alpha + c)
-    a_hi = gl.load(alpha + c + 1)
-    x_smem, _ = bf16.load_rows(mb, "cmb", 0, POOLED, 1)
-    hp_lo, hp_hi = mb.poll_many(("hp", "hp"), (c, c + 1))
-    mb.stamp("unpool", trace.READY)
-    out = bf16.gemv(x_smem, tiles, FIRST=0, ROWS=1)  # [1, 16]
-    mb.stamp("unpool", trace.COMPUTED)
-    # split needs a pair's two values in one thread.
-    pairs: gl.constexpr = gl.BlockedLayout([1, 2], [1, 64], [nw, 1], [1, 0])
-    lo, hi = gl.split(
-        gl.reshape(gl.convert_layout(out, pairs), [1, UNPOOL_COLS // 2, 2])
-    )
-    y_lo = gl.convert_layout(gl.sum(lo, axis=0), lanes)
-    y_hi = gl.convert_layout(gl.sum(hi, axis=0), lanes)
     y_lo = y_lo.to(gl.bfloat16).to(gl.float32) * post_lo
     y_hi = y_hi.to(gl.bfloat16).to(gl.float32) * post_hi
     ah_lo = a_lo * hp_lo.to(gl.float32, bitcast=True)
@@ -285,20 +251,97 @@ def unpool_stages(mb, task, w, post_gain, alpha, beta, h_next, RANK: gl.constexp
     put = (r < 4) | ((r == 4) & (jr < SUMS))
     for p in gl.static_range(WORLD):
         mb.put_peer("ffn", p, idx, word, mask=put)
+    return y_lo, y_hi, ah_lo, ah_hi
+
+
+@gluon.jit
+def unpool_stages(mb, task, w, post_gain, alpha, beta, h_next, RANK: gl.constexpr):
+    """Unpool and fin task ``task``: owned hidden columns ``16 task ..`` of
+    every row.
+
+    Args:
+        w: This rank's post-expert projection rows, BF16 ``[1024, 4096]``
+            (``weights.bf16_tiles``).
+        post_gain: FP32 ``bf16(w + 1)`` of the post-FFN norm, owned columns.
+        alpha: FP32 residual-gate coefficient of the FFN, owned columns.
+        beta: FP32 residual-gate coefficient of the FFN, all 8192 columns.
+        h_next: Where the owned FP32 residual ``h''`` goes, ``[rows, 1024]``.
+    """
+    R: gl.constexpr = schedule.rows(mb.plan)
+    nw: gl.constexpr = gl.num_warps()
+    mb.stamp("unpool", trace.START)
+    tiles = bf16.load_weight_tiles(
+        w,
+        nb0=task,
+        K=POOLED,
+        kit0=0,
+        KITS=POOLED // 32,
+        SPLIT=8,
+        NW=1,
+        GROUP=1,
+        GROUP_STRIDE=0,
+    )
+    # The parameters load before the polls: a load after a poll would start
+    # only when the poll returns.
+    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
+    j = gl.arange(0, UNPOOL_COLS // 2, lanes)
+    c = task * UNPOOL_COLS + 2 * j
+    post_lo = gl.load(post_gain + c)
+    post_hi = gl.load(post_gain + c + 1)
+    b_lo = gl.load(beta + RANK * OWNED + c)
+    b_hi = gl.load(beta + RANK * OWNED + c + 1)
+    a_lo = gl.load(alpha + c)
+    a_hi = gl.load(alpha + c + 1)
+    x_smem, _ = bf16.load_rows(mb, "cmb", 0, POOLED, R)
+    hp = mb.poll_rows(("hp", "hp"), (c, c + 1), R)
+    mb.stamp("unpool", trace.READY)
+    out = bf16.gemv(x_smem, tiles, FIRST=0, ROWS=R)  # [RP, 16]
+    mb.stamp("unpool", trace.COMPUTED)
+    RP: gl.constexpr = out.shape[0]
+    # split needs a pair's two values in one thread.
+    pairs: gl.constexpr = gl.BlockedLayout([1, 2], [1, 64], [nw, 1], [1, 0])
+    lo, hi = gl.split(
+        gl.reshape(gl.convert_layout(out, pairs), [RP, UNPOOL_COLS // 2, 2])
+    )
+    rid = gl.arange(0, RP, gl.SliceLayout(1, lo.type.layout))[:, None]
+    kept = ()
+    for r in gl.static_range(R):
+        kept += (
+            _unpool_row(
+                mb.row(r),
+                task,
+                gl.convert_layout(gl.sum(gl.where(rid == r, lo, 0.0), axis=0), lanes),
+                gl.convert_layout(gl.sum(gl.where(rid == r, hi, 0.0), axis=0), lanes),
+                hp[r][0],
+                hp[r][1],
+                post_lo,
+                post_hi,
+                b_lo,
+                b_hi,
+                a_lo,
+                a_hi,
+                RANK,
+            ),
+        )
     mb.stamp("unpool", trace.END)
 
     mb.stamp("fin", trace.START)
-    inv, _ = _ffn_norms(mb)
+    invs = ()
+    for r in gl.static_range(R):
+        invs += (_ffn_norms(mb.row(r))[0],)
     mb.stamp("fin", trace.READY)
-    gl.store(h_next + c, gl.fma(b_lo, y_lo * inv, ah_lo))
-    gl.store(h_next + c + 1, gl.fma(b_hi, y_hi * inv, ah_hi))
+    for r in gl.static_range(R):
+        y_lo, y_hi, ah_lo, ah_hi = kept[r]
+        gl.store(h_next + r * OWNED + c, gl.fma(b_lo, y_lo * invs[r], ah_lo))
+        gl.store(h_next + r * OWNED + c + 1, gl.fma(b_hi, y_hi * invs[r], ah_hi))
     mb.stamp("fin", trace.END)
 
 
 @gluon.jit
 def out_stage(mb, task, beta, in_gain, a_out, STAGE: gl.constexpr):
-    """Out task ``task``: next attention input values ``512 task ..`` to
-    ``a_out`` (BF16 ``[8192]``), from every rank's ``ffn``.
+    """Out task ``task``: next attention input values ``512 (task % 16) ..``
+    of row ``task // 16`` to ``a_out`` (BF16 ``[rows, 8192]``), from every
+    rank's ``ffn``.
 
     Args:
         beta: FP32 residual-gate coefficient of the FFN, all 8192 columns.
@@ -306,6 +349,9 @@ def out_stage(mb, task, beta, in_gain, a_out, STAGE: gl.constexpr):
             8192 columns.
     """
     mb.stamp(STAGE, trace.START)
+    row, task, _ = schedule.row_task(mb.plan, task, OUT_TASKS)
+    mb = mb.row(row)
+    a_out = a_out + row * HIDDEN
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     i = task * 256 + gl.arange(0, 256, lanes)
     c = 2 * i

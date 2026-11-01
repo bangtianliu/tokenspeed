@@ -2,7 +2,8 @@
 
 These kernels run one decoder layer of Muse Spark Open (`muse_spark`) as one
 persistent launch per rank of a TP8 group (attention TP8, MoE TP8 / EP1), for
-one token row. On a TP8 / EP8 server (MoE TP1 / EP8) they run on gathered
+the rows of one request: one decode row, or the 2 to 8 consecutive tokens of
+a speculative verify (`Plan.chain`). On a TP8 / EP8 server (MoE TP1 / EP8) they run on gathered
 expert slices (see [Weights](#weights)). They use the building blocks in [`../README.md`](../README.md).
 That file also gives the launch contract and the rules for writing a stage.
 
@@ -18,20 +19,23 @@ registers them as `prepare_muse_spark_layer` and `muse_spark_layer_decode`.
 
 ### Contract
 
-- Rank `r` owns hidden columns `1024 r ..`. The launch reads the FP32
-  residual of the owned columns and the whole BF16 attention input of the
-  layer. It writes the owned FP32 residual after the layer and the whole
-  BF16 attention input of the next layer, normed with that layer's input
-  gain.
+- Rank `r` owns hidden columns `1024 r ..`. The launch reads each row's
+  FP32 residual of the owned columns (`[rows, 1024]`) and whole BF16
+  attention input of the layer (`[rows, 8192]`). It writes each row's owned
+  FP32 residual after the layer and whole BF16 attention input of the next
+  layer, normed with that layer's input gain.
+- Row `t` is the token at position `seq_len[0] - 1 + t`. `layer_plan(full,
+  rows)` builds the plan of a row count; each row count compiles once.
 - The regular path hands over the whole residual row. Thus the first launch
   of a run of fused layers reads its slice of that row, and after the last
   one the caller gathers the 8 slices back into a row (32 KiB).
 - The launch reads and writes the regular path's paged KV cache in place:
   BF16 `[slots, 2, 64]` per rank, 64 tokens a page, the page table indexed
   by absolute position on sliding layers too. A sliding layer attends over
-  the last 2048 positions.
-- The step counter, the sequence length, the write slot and the page table
-  are device tensors. The layer index is a runtime argument. Thus one binary
+  the last 2048 positions. Each row writes its token's slot; the rows read
+  the launch's own keys from the projection, not from the cache.
+- The step counter, the sequence lengths, the write slots and the page
+  table are device tensors. The layer index is a runtime argument. Thus one binary
   serves every layer of a kind, and the decode graph captures the launches.
 - The mailbox tag is `step * 64 + layer + 1`. The peer regions' copy is
   `layer & 1`: it alternates from one launch to the next, across steps too,
@@ -53,7 +57,8 @@ seam. The switch `--decode-monokernel` enables it.
 - The seam allocates the mailbox scratch on the Iris symmetric heap before
   graph capture.
 - A forward uses the kernels when it is a decode step of one request with
-  one token. Other forwards use the regular path.
+  one token. Other forwards use the regular path. The seam does not yet
+  serve a speculative verify's rows.
 
 ## Stages
 
@@ -67,7 +72,7 @@ docstring gives its math and task split):
 | `attn_tail.py` | oproj, tail1, tail2 | `o_proj` reduce-scattered to the owners; the post-attention norm, residual gate and pre-FFN norm. |
 | `moe_route.py` | router, topk | Partial router logits of the owned columns; the sum, sigmoid scores and top 8. |
 | `moe_pool.py` | pool | The pre-expert projection, gathered on every rank. |
-| `moe_experts.py` | ex1, ex2 | The MXFP4 experts, each rank's 512 of 4096 intermediate values. |
+| `moe_experts.py` | ex1, ex2 | The MXFP4 experts, each rank's 512 of 4096 intermediate values. The rows' distinct experts are slots: each streams once for every row that picked it. |
 | `moe_tail.py` | comb1, comb2, unpool, fin, out | Combine the routes, the post-expert projection, the post-FFN norm, residual gate and the next layer's input norm. |
 
 ## Weights
@@ -125,8 +130,9 @@ QKVG and attention tests need 8 GPUs.
 | `test_muse_spark_moe_tail_gfx950.py` | The combine, post-expert projection and boundary. |
 | `test_muse_spark_layer_gfx950.py` | The whole layer through the packer and the launcher, no recompiles across layers, steps and lengths, CUDA graph replays against eager launches, and the packer's errors. |
 
-Each stage test runs a slice of the real plan and compares it with a torch
-reference of TokenSpeed's math (`muse_spark_reference.py`).
+Each stage test runs a slice of the real plan, at 1 row and at 8 chained
+rows, and compares it with a torch reference of TokenSpeed's math
+(`muse_spark_reference.py`).
 `test/runtime/test_muse_spark_monokernel_seam.py` covers which forwards and
 models the seam serves, and that an EP8 server's expert slices are the shards
 of an EP1 server's loader.

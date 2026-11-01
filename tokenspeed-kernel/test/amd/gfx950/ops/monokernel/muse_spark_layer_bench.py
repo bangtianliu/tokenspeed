@@ -131,27 +131,35 @@ def rank0_payloads(plan, parity: int, gpus: int, scratch) -> torch.Tensor:
     )
 
 
-def _operands(rank: int, length: int, dev):
-    sh = layer_test._shared(42, length)
-    w = layer_test._rank_weights(rank, length)
-    w13, w13s, w2, w2s = ref.preprocessed_experts(rank, EXPERTS, dev)
+def _operands(rank: int, length: int, rows: int, experts: int, dev):
+    """The launch operands of ``rows`` chained rows (row 0 at ``length``)
+    whose routing picks among the first ``experts`` experts."""
+    sh = layer_test._shared(42, length, rows)
+    end = length + rows - 1
+    w = layer_test._rank_weights(rank, end)
+    # Each row picks 8 of the held experts: 8 independent rows of 40 experts
+    # share about 33, as a verify's 8 consecutive tokens do.
+    g = torch.Generator().manual_seed(7)
+    sh["bias"] = torch.full((256,), -1e4)
+    sh["bias"][:experts] = torch.randn(experts, generator=g) * 0.1
+    w13, w13s, w2, w2s = ref.preprocessed_experts(rank, experts, dev)
     own = slice(rank * OWNED, (rank + 1) * OWNED)
     own_pool = slice(rank * POOL_OWNED, (rank + 1) * POOL_OWNED)
-    last = length - 1
-    slot = int(sh["table"][last // 64]) * 64 + last % 64
-    h_next = torch.empty(OWNED, device=dev)
-    a_out = torch.empty(HIDDEN, dtype=torch.bfloat16, device=dev)
+    pos = torch.arange(length - 1, end)
+    slots = sh["table"][pos // 64].long() * 64 + pos % 64
+    h_next = torch.empty(rows, OWNED, device=dev)
+    a_out = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
     attn_ops = (
         bf16_tiles(w["w_qkvg"]).to(dev),
         sh["a_in"].to(dev),
-        torch.full((1,), length, dtype=torch.int32, device=dev),
-        torch.full((1,), slot, dtype=torch.int32, device=dev),
+        (pos + 1).to(torch.int32).to(dev),
+        slots.to(torch.int32).to(dev),
         sh["table"].to(dev),
         w["k_cache"].to(dev),
         w["v_cache"].to(dev),
-        ref.rope_table(length + 1).to(dev),
+        ref.rope_table(end + 1).to(dev),
         bf16_tiles(w["w_o"]).to(dev),
-        sh["h"][own].to(dev),
+        sh["h"][:, own].contiguous().to(dev),
         sh["alpha1"][own].to(dev),
         sh["beta1"][own].to(dev),
         sh["pre_gain"][own].to(dev),
@@ -229,13 +237,15 @@ def worker(rank: int, port: int, args) -> None:
     dev = torch.device(f"cuda:{rank}")
     ctx = get_or_create_context(heap_size=256 << 20)
     group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
-    plan = layer.layer_plan(args.full)
+    plan = layer.layer_plan(args.full, args.rows)
     scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
     ghost = torch.zeros_like(scratch)
     bases = torch.empty(TP, dtype=torch.int64, device=dev)
     bases[:gpus] = group.bases.to(dev)
     bases[gpus:] = int(group.bases[rank]) + (ghost.data_ptr() - scratch.data_ptr())
-    attn_ops, moe_ops, h_next, a_out = _operands(rank, args.length, dev)
+    attn_ops, moe_ops, h_next, a_out = _operands(
+        rank, args.length, args.rows, args.experts, dev
+    )
     step = torch.full((1,), 100, dtype=torch.int32, device=dev)
     idx = [absent_index(plan, p, gpus).to(dev) for p in (0, 1)]
     bits = [torch.zeros(len(i), dtype=torch.int64, device=dev) for i in idx]
@@ -272,7 +282,16 @@ def worker(rank: int, port: int, args) -> None:
     def launch(lay: int, trace_buf=None) -> None:
         fill(lay)
         layer.launch_layer(
-            scratch, step, lay, bases, attn_ops, moe_ops, trace_buf, rank, args.full
+            scratch,
+            step,
+            lay,
+            bases,
+            attn_ops,
+            moe_ops,
+            trace_buf,
+            rank,
+            args.full,
+            args.rows,
         )
 
     def run(cold: bool) -> None:
@@ -324,7 +343,8 @@ def worker(rank: int, port: int, args) -> None:
         f = us["fill"] if gpus < TP else 0.0
         kind = "full" if args.full else "sliding"
         print(
-            f"{gpus} GPU {kind} layer at {args.length} tokens: "
+            f"{gpus} GPU {kind} layer, {args.rows} rows, {args.experts} experts, "
+            f"at {args.length} tokens: "
             f"warm {us['warm'] - f:.1f} us, cold {us['cold'] - us['flush'] - f:.1f} us "
             f"per launch (graph; flush {us['flush']:.1f}, fill {f:.1f} us subtracted)"
         )
@@ -389,6 +409,12 @@ def main() -> None:
     )
     p.add_argument("--length", type=int, default=8700, help="tokens in the KV cache")
     p.add_argument("--full", action="store_true", help="a full-attention layer")
+    p.add_argument(
+        "--rows", type=int, default=1, help="chained rows (a verify of rows - 1 drafts)"
+    )
+    p.add_argument(
+        "--experts", type=int, default=EXPERTS, help="experts the routing picks among"
+    )
     p.add_argument("--replays", type=int, default=15)
     p.add_argument(
         "--settle",

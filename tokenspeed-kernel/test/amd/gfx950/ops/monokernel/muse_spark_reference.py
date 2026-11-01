@@ -57,58 +57,105 @@ def norm_rope(
     return y.to(torch.bfloat16)
 
 
-def split_attention(q, keys, values, splits: int) -> torch.Tensor:
-    """The monokernel's split attention: chunks of 128 keys per split with
-    an online base-2 softmax whose weights round to BF16, then the LSE merge."""
-    n = keys.shape[0]
+def _online(state, scores, values):
+    """One chunk of the monokernel's online base-2 softmax for a batch of q
+    heads (``scores [heads, keys]``, -inf where masked); its weights round
+    to BF16 before the PV product."""
+    m, l, acc = state
+    m_new = torch.maximum(m, scores.amax(-1))
+    m_safe = torch.where(m_new == float("-inf"), 0.0, m_new)
+    alpha = torch.exp2(m - m_safe)
+    p = torch.exp2(scores - m_safe[:, None])
+    acc = acc * alpha[:, None] + p.to(torch.bfloat16).float() @ values
+    return m_new, l * alpha + p.sum(-1), acc
+
+
+def verify_attention(q, keys, values, own_k, own_v, t, first, L0, row_first, splits):
+    """The monokernel's split attention of row ``t``'s q heads ``q [heads,
+    64]`` (of one KV head): the splits share the cached keys ``first .. L0 -
+    1`` (``keys`` / ``values`` ``[L0 - first, 64]``) in chunks of 128, the
+    keys before ``row_first`` masked; the last split then takes the launch's
+    keys ``0 .. t`` (``own_k`` / ``own_v``) as one more chunk. Then the LSE
+    merge. Returns ``[heads, 64]``."""
+    scale = 0.125 * math.log2(math.e)
+    heads = q.shape[0]
+    n = L0 - first
     per = -(-n // splits)
-    scores = (q.float() @ keys.T) * (0.125 * math.log2(math.e))
+    pos = torch.arange(first, L0)
+    scores = (q.float() @ keys.T) * scale
+    scores = torch.where(pos >= row_first, scores, float("-inf"))
     outs, lses = [], []
     for s in range(splits):
         lo, hi = s * per, min(s * per + per, n)
-        m, l, acc = float("-inf"), torch.zeros(()), torch.zeros(HEAD)
+        state = (
+            torch.full((heads,), float("-inf")),
+            torch.zeros(heads),
+            torch.zeros(heads, HEAD),
+        )
         for c0 in range(lo, hi, 128):
-            sc = scores[c0 : min(c0 + 128, hi)]
-            m_new = max(m, float(sc.max()))
-            alpha = 2.0 ** (m - m_new)
-            p = torch.exp2(sc - m_new)
-            l = l * alpha + p.sum()
-            acc = (
-                acc * alpha + p.to(torch.bfloat16).float() @ values[c0 : c0 + p.numel()]
-            )
-            m = m_new
-        if hi > lo:
-            outs.append(acc / l)
-            lses.append(m + math.log2(float(l)))
-    lse = torch.tensor(lses)
-    w = torch.exp2(lse - lse.max())
-    return (torch.stack(outs) * w[:, None]).sum(0) / w.sum()
+            c1 = min(c0 + 128, hi)
+            state = _online(state, scores[:, c0:c1], values[c0:c1])
+        if s == splits - 1:
+            own = (q.float() @ own_k[: t + 1].T) * scale
+            state = _online(state, own, own_v[: t + 1])
+        m, l, acc = state
+        outs.append(acc / torch.where(l > 0, l, 1.0)[:, None])
+        lses.append(
+            torch.where(l > 0, m + torch.log2(torch.where(l > 0, l, 1.0)), -math.inf)
+        )
+    lse = torch.stack(lses)  # [splits, heads]
+    w = torch.where(lse == -math.inf, 0.0, torch.exp2(lse - lse.amax(0)))
+    return (torch.stack(outs) * w[:, :, None]).sum(0) / w.sum(0)[:, None]
 
 
 def attention_z(qkvg, k_cache, v_cache, table, length, window, splits, cs):
-    """One rank's gated head-norm output ``z`` [1024] and the token's K, V.
+    """One rank's gated head-norm output ``z [rows, 1024]`` of the rows of one
+    request (``qkvg [rows, 2304]``; row ``t`` at position ``length - 1 +
+    t``), and the rows' K, V ``[rows, 2, 64]`` and cache slots.
 
-    ``k_cache`` / ``v_cache``: BF16 ``[slots, 2, 64]`` before the token's write.
+    ``k_cache`` / ``v_cache``: BF16 ``[slots, 2, 64]`` before the rows' writes.
     """
     rope = window != 0
-    L = length - 1
-    q = norm_rope(qkvg[:K_ROW].view(HEADS, HEAD), 5.473006248474121, cs[L], rope)
-    k = norm_rope(qkvg[K_ROW:V_ROW].view(KV_HEADS, HEAD), 1.0, cs[L], rope)
-    v = qkvg[V_ROW:GATE_ROW].view(KV_HEADS, HEAD)
-    gate = qkvg[GATE_ROW:].view(HEADS, HEAD).float()
-    slot = int(table[L // PAGE]) * PAGE + L % PAGE
-    flat_k, flat_v = k_cache.clone(), v_cache.clone()
-    flat_k[slot], flat_v[slot] = k, v
-    first = max(0, L - window + 1) if window else 0
-    pos = torch.arange(first, L + 1)
-    slots = table[pos // PAGE].long() * PAGE + pos % PAGE
-    keys, values = flat_k[slots].float(), flat_v[slots].float()
-    z = torch.empty(HEADS, HEAD)
-    for h in range(HEADS):
-        a = split_attention(q[h], keys[:, h // GROUP], values[:, h // GROUP], splits)
-        a = a.to(torch.bfloat16).float()
-        z[h] = a * torch.rsqrt(a.pow(2).mean() + 1e-5) * torch.sigmoid(gate[h])
-    return z.reshape(-1).to(torch.bfloat16), k, v, slot
+    rows = qkvg.shape[0]
+    L0 = length - 1
+    k = torch.stack(
+        [
+            norm_rope(qkvg[t, K_ROW:V_ROW].view(KV_HEADS, HEAD), 1.0, cs[L0 + t], rope)
+            for t in range(rows)
+        ]
+    )
+    v = qkvg[:, V_ROW:GATE_ROW].view(rows, KV_HEADS, HEAD)
+    positions = torch.arange(L0, L0 + rows)
+    slots = table[positions // PAGE].long() * PAGE + positions % PAGE
+    first = max(0, L0 - window + 1) if window else 0
+    cached = torch.arange(first, L0)
+    cached_slots = table[cached // PAGE].long() * PAGE + cached % PAGE
+    keys, values = k_cache[cached_slots].float(), v_cache[cached_slots].float()
+    z = torch.empty(rows, HEADS, HEAD)
+    for t in range(rows):
+        q = norm_rope(
+            qkvg[t, :K_ROW].view(HEADS, HEAD), 5.473006248474121, cs[L0 + t], rope
+        )
+        gate = qkvg[t, GATE_ROW:].view(HEADS, HEAD).float()
+        row_first = L0 + t - window + 1 if window else 0
+        for kv in range(KV_HEADS):
+            heads = slice(kv * GROUP, (kv + 1) * GROUP)
+            a = verify_attention(
+                q[heads],
+                keys[:, kv],
+                values[:, kv],
+                k[:, kv].float(),
+                v[:, kv].float(),
+                t,
+                first,
+                L0,
+                row_first,
+                splits,
+            )
+            a = a.to(torch.bfloat16).float()
+            inv = torch.rsqrt(a.pow(2).mean(-1, keepdim=True) + 1e-5)
+            z[t, heads] = a * inv * torch.sigmoid(gate[heads])
+    return z.reshape(rows, -1).to(torch.bfloat16), k, v, slots
 
 
 def raw_experts(rank: int, experts: int):
@@ -160,15 +207,20 @@ def preprocessed_experts(rank: int, experts: int, device: torch.device):
 
 
 def expert_partials(rank: int, experts: int, pooled, gain, ids) -> torch.Tensor:
-    """Rank ``rank``'s BF16 route partials ``[8, 4096]``."""
+    """Rank ``rank``'s BF16 route partials ``[rows, 8, 4096]`` of each row's
+    picks ``ids [rows, 8]`` (``pooled [rows, 4096]``), on ``pooled``'s device.
+    Each picked expert is dequantized once."""
     x = pooled.float()
-    x = x * torch.rsqrt(x.pow(2).mean() + 1e-5) * gain
-    xq = fake_quantize_mxfp4_even(x.to(torch.bfloat16).float().view(1, -1)).view(-1)
-    w13, s13, w2, s2 = raw_experts(rank, experts)
-    out = torch.empty(TOP_K, POOLED)
-    for k, e in enumerate(ids.tolist()):
-        acc = dequantize_mxfp4(w13[e], s13[e]).float() @ xq
-        h = acc[0::2] / (1.0 + torch.exp(-acc[0::2])) * acc[1::2]
-        hq = fake_quantize_mxfp4_even(h.to(torch.bfloat16).float().view(1, -1)).view(-1)
-        out[k] = dequantize_mxfp4(w2[e], s2[e]).float() @ hq
+    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-5) * gain.to(x.device)
+    xq = fake_quantize_mxfp4_even(x.to(torch.bfloat16).float())
+    w13, s13, w2, s2 = (t.to(x.device) for t in raw_experts(rank, experts))
+    out = torch.empty(ids.shape[0], TOP_K, POOLED, device=x.device)
+    for e in ids.unique().tolist():
+        up = dequantize_mxfp4(w13[e], s13[e]).float()
+        down = dequantize_mxfp4(w2[e], s2[e]).float()
+        for row, k in (ids == e).nonzero().tolist():
+            acc = up @ xq[row]
+            h = acc[0::2] / (1.0 + torch.exp(-acc[0::2])) * acc[1::2]
+            hq = fake_quantize_mxfp4_even(h.to(torch.bfloat16).float().view(1, -1))
+            out[row, k] = down @ hq.view(-1)
     return out.to(torch.bfloat16)

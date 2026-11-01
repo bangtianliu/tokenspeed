@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Expert routing of one Muse Spark rank (one row).
+"""Expert routing of one Muse Spark rank.
 
 The router multiplies the FP32 pre-FFN norm output ``u = h' s g`` (``s =
 rsqrt(mean(h'^2) + 1e-5)``, ``g = bf16(w + 1)``) by the FP32 router weight.
@@ -30,10 +30,11 @@ post-attention norm's ``inv``. So the router multiplies ``beta b g`` and
 ``alpha h g``, and top-8 applies the scalars ``inv`` and ``s``: the router
 waits for neither norm exchange, only for ``b``.
 
-* router, 16 tasks of 16 experts: this rank's partial logits of ``alpha h
-  g`` (from the launch's inputs, at once) and of ``beta b g``, put into
-  every rank's ``lg2`` and ``lg`` slots of this rank.
-* topk, 1 task: the rank-order sum of ``inv lg + lg2`` times ``s`` (both
+* router, 16 tasks of 16 experts (past one row, 16 per pair of rows): this
+  rank's partial logits of ``alpha h g`` (from the launch's inputs, at once)
+  and of ``beta b g`` of its rows, put into every rank's ``lg2`` and ``lg``
+  slots of this rank.
+* topk, 1 task per row: the rank-order sum of ``inv lg + lg2`` times ``s`` (both
   from ``ss1``) times ``output_multiplier``, the sigmoid
   scores, and the 8 experts of the largest ``score + bias`` (8 argmax passes,
   a tie to the lowest id). The weights are the bias-free scores of the 8,
@@ -43,8 +44,8 @@ waits for neither norm exchange, only for ``b``.
 
 from __future__ import annotations
 
-from tokenspeed_kernel_amd._triton import gl, gluon
-from tokenspeed_kernel_amd.ops.gfx950.monokernel import trace
+from tokenspeed_kernel_amd._triton import gl, gluon, triton
+from tokenspeed_kernel_amd.ops.gfx950.monokernel import schedule, trace
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.attn_tail import (
     OWNED,
     norm_scales,
@@ -57,6 +58,7 @@ EXPERTS = gl.constexpr(256)
 TOP_K = gl.constexpr(8)
 ROUTER_TASKS = gl.constexpr(16)
 ROUTER_ROWS = gl.constexpr(16)  # experts a router task
+ROW_PAIR = gl.constexpr(2)  # token rows a router task serves past one row
 ROUTER_SCALE = gl.constexpr(0.17677669529663687)  # output_multiplier
 
 PEERS = ("lg", "lg2")
@@ -71,11 +73,18 @@ def regions() -> tuple[tuple[str, int], ...]:
     )
 
 
-def stages(bases: dict[str, int]) -> tuple[Stage, ...]:
+def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
+    """Router and topk of ``rows`` token rows, placed by ``bases``."""
     router, topk = placement(bases, ("router", "topk"))
     return (
-        Stage("router", int(ROUTER_TASKS), router, reads=("bq",), writes=("lg", "lg2")),
-        Stage("topk", 1, topk, reads=("lg", "lg2", "ss1"), writes=("route",)),
+        Stage(
+            "router",
+            int(ROUTER_TASKS) * (1 if rows == 1 else -(-rows // int(ROW_PAIR))),
+            router,
+            reads=("bq",),
+            writes=("lg", "lg2"),
+        ),
+        Stage("topk", rows, topk, reads=("lg", "lg2", "ss1"), writes=("route",)),
     )
 
 
@@ -83,7 +92,8 @@ def stages(bases: dict[str, int]) -> tuple[Stage, ...]:
 def router_stage(
     mb, task, w, pre_gain, h, alpha, beta, RANK: gl.constexpr, STAGE: gl.constexpr
 ):
-    """Router task ``task``: experts ``16 task ..``.
+    """Router task ``task``: experts ``16 (task % 16) ..`` of one row, or of
+    rows ``2 (task // 16)`` and ``+ 1`` of several.
 
     ``h' = beta b inv + alpha h`` (see attn_tail), so the logits of ``h' g``
     are ``inv`` times those of ``beta b g`` plus those of ``alpha h g``. The
@@ -94,13 +104,26 @@ def router_stage(
         w: This rank's router columns, FP32 ``[256, 1024]`` (row ``e`` is
             expert ``e``'s weights for the owned columns).
         pre_gain: FP32 ``bf16(w + 1)`` of the pre-FFN norm, owned columns.
-        h, alpha, beta: The owned FP32 residual and residual-gate
-            coefficients (as tail_stages takes them).
+        h, alpha, beta: The owned FP32 residual ``[rows, 1024]`` and
+            residual-gate coefficients (as tail_stages takes them).
     """
     mb.stamp(STAGE, trace.START)
+    if schedule.rows(mb.plan) == 1:
+        _router_row(mb, task, w, pre_gain, h, alpha, beta, RANK, STAGE)
+    else:
+        _router_rows(mb, task, w, pre_gain, h, alpha, beta, RANK, STAGE)
+    mb.stamp(STAGE, trace.COMPUTED)
+    mb.stamp(STAGE, trace.END)
+
+
+@gluon.jit
+def _router_row(
+    mb, task, w, pre_gain, h, alpha, beta, RANK: gl.constexpr, STAGE: gl.constexpr
+):
+    """:func:`router_stage` of one row. The waves split the columns: each
+    wave polls only its 128 values of b (fewer polls of the same lines),
+    and one sum crosses the waves."""
     nw: gl.constexpr = gl.num_warps()
-    # The waves split the columns: each wave polls only its 128 values of
-    # h' (fewer polls of the same lines), and one sum crosses the waves.
     wl: gl.constexpr = gl.BlockedLayout([1, 4], [2, 32], [1, nw], [1, 0])
     e = task * ROUTER_ROWS + gl.arange(0, ROUTER_ROWS, gl.SliceLayout(1, wl))
     k = gl.arange(0, OWNED, gl.SliceLayout(0, wl))
@@ -114,18 +137,65 @@ def router_stage(
     (got,) = mb.poll_many(("bq",), (k,))
     mb.stamp(STAGE, trace.READY)
     v = got.to(gl.float32, bitcast=True) * bg
-    partial = gl.sum(weights * v[None, :], axis=1)
-    mb.stamp(STAGE, trace.COMPUTED)
-    word = partial.to(gl.int32, bitcast=True)
+    word = gl.sum(weights * v[None, :], axis=1).to(gl.int32, bitcast=True)
     for p in gl.static_range(WORLD):
         mb.put_peer("lg", p, RANK * EXPERTS + e, word)
-    mb.stamp(STAGE, trace.END)
 
 
 @gluon.jit
-def topk_stage(mb, bias, STAGE: gl.constexpr):
-    """The top-8 of the summed logits (``bias``: FP32 ``[256]``)."""
+def _router_rows(
+    mb, task, w, pre_gain, h, alpha, beta, RANK: gl.constexpr, STAGE: gl.constexpr
+):
+    """:func:`router_stage` of a pair of rows. The waves split the experts (2
+    each) and the lanes the columns, so a row's sum stays within a wave: no
+    LDS round trip per row. The rows' b goes through LDS once."""
+    R: gl.constexpr = schedule.rows(mb.plan)
+    RP: gl.constexpr = ROW_PAIR
+    nw: gl.constexpr = gl.num_warps()
+    first = (task // ROUTER_TASKS) * ROW_PAIR
+    task = task % ROUTER_TASKS
+    wl: gl.constexpr = gl.BlockedLayout([2, 16], [1, 64], [nw, 1], [1, 0])
+    e = task * ROUTER_ROWS + gl.arange(0, ROUTER_ROWS, gl.SliceLayout(1, wl))
+    k = gl.arange(0, OWNED, gl.SliceLayout(0, wl))
+    col = gl.arange(0, RP, gl.SliceLayout(0, wl))[None, :]
+    weights = gl.load(w + e[:, None] * OWNED + k[None, :])
+    gain = gl.load(pre_gain + k)
+    ag = gl.load(alpha + k) * gain
+    bg = gl.load(beta + k) * gain
+    # The logits of every row, [expert, row], then one put per peer.
+    at = mb.row_offset(first + col) + RANK * EXPERTS + e[:, None]
+    put = (first + col < R) & (e[:, None] >= 0)
+    lg2 = gl.zeros([ROUTER_ROWS, RP], gl.float32, wl)
+    for r in gl.static_range(RP):
+        ahg = ag * gl.load(h + gl.minimum(first + r, R - 1) * OWNED + k)
+        lg2 = gl.where(col == r, gl.sum(weights * ahg[None, :], axis=1)[:, None], lg2)
+    word2 = lg2.to(gl.int32, bitcast=True)
+    for p in gl.static_range(WORLD):
+        mb.put_peer("lg2", p, at, word2, mask=put)
+    # Every row's b in one poll, through LDS into the column layout.
+    bl: gl.constexpr = gl.BlockedLayout([1, 4], [1, 64], [nw, 1], [1, 0])
+    br = gl.arange(0, RP, gl.SliceLayout(1, bl))[:, None]
+    bk = gl.arange(0, OWNED, gl.SliceLayout(0, bl))[None, :]
+    (got,) = mb.poll_many(("bq",), (mb.row_offset(first + br) + bk,))
+    mb.stamp(STAGE, trace.READY)
+    flat: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+    b_smem = gl.allocate_shared_memory(gl.float32, [RP * OWNED], flat)
+    b_smem.store(gl.reshape(got.to(gl.float32, bitcast=True), [RP * OWNED]))
+    gl.barrier()
+    lg = gl.zeros([ROUTER_ROWS, RP], gl.float32, wl)
+    for r in gl.static_range(RP):
+        v = b_smem.slice(r * OWNED, OWNED).load(gl.SliceLayout(0, wl)) * bg
+        lg = gl.where(col == r, gl.sum(weights * v[None, :], axis=1)[:, None], lg)
+    word = lg.to(gl.int32, bitcast=True)
+    for p in gl.static_range(WORLD):
+        mb.put_peer("lg", p, at, word, mask=put)
+
+
+@gluon.jit
+def topk_stage(mb, task, bias, STAGE: gl.constexpr):
+    """The top-8 of row ``task``'s summed logits (``bias``: FP32 ``[256]``)."""
     mb.stamp(STAGE, trace.START)
+    mb = mb.row(task)
     nw: gl.constexpr = gl.num_warps()
     ll: gl.constexpr = gl.BlockedLayout([WORLD, 1], [1, 64], [1, nw], [0, 1])
     src = gl.arange(0, WORLD, gl.SliceLayout(1, ll))

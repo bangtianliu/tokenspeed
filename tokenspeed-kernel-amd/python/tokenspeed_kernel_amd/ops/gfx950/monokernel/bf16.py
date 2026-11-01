@@ -213,6 +213,20 @@ def _with_extras(region, extra_regions):
     return (region,) + tuple(extra_regions)
 
 
+# Pairs per thread of one poll of load_rows (see "Few pairs per thread").
+POLL_PAIRS = 16
+
+
+@gluon.constexpr_function
+def _poll_group_rows(RP, KP, num_warps):
+    """Rows of one poll of :func:`load_rows`: a power of two, at most
+    ``POLL_PAIRS`` pairs per thread unless one row is wider."""
+    group = RP
+    while group > 1 and group * KP * 16 > POLL_PAIRS * 64 * num_warps:
+        group //= 2
+    return group
+
+
 @gluon.jit
 def load_global_rows(x, row_stride, k0, KS: gl.constexpr, R: gl.constexpr):
     """:func:`load_rows` of BF16 rows in global memory that an earlier launch
@@ -257,11 +271,12 @@ def load_rows(
     extra_indices=(),
 ):
     """Poll BF16 rows ``0 .. R - 1``, values ``k0 .. k0 + KS - 1`` of each,
-    into LDS for :func:`gemv`, in one round trip.
+    into LDS for :func:`gemv`, in one round trip per group of rows (a wide
+    poll of many rows would hold too many registers).
 
     ``region`` holds each row as BF16 pairs (:func:`mx.put_bf16_rows`);
     ``k0`` and ``KS`` are even. ``extra_regions`` / ``extra_indices`` poll
-    other inputs of the caller in the same round trips (as
+    other inputs of the caller with the first group (as
     :func:`mx.load_mxfp4_rows`).
 
     Returns:
@@ -273,21 +288,30 @@ def load_rows(
     KI: gl.constexpr = KS // 32
     KP: gl.constexpr = triton.next_power_of_2(KI)
     RP: gl.constexpr = triton.next_power_of_2(R)
+    G: gl.constexpr = _poll_group_rows(RP, KP, gl.num_warps())
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
-    p = gl.arange(0, RP * KP * 16, lanes)
-    row = gl.minimum(p // (KP * 16), R - 1)
+    p = gl.arange(0, G * KP * 16, lanes)
     at = p % (KP * 16)
+    pair = k0 // 2 + gl.minimum(at, KS // 2 - 1)
     stride: gl.constexpr = schedule.row_pairs(mb.plan)
-    got = mb.poll_many(
-        _with_extras(region, extra_regions),
-        (row * stride + k0 // 2 + gl.minimum(at, KS // 2 - 1),) + extra_indices,
-    )
     # Each row ends in 32 bytes of padding: rows that start on the same LDS
     # bank conflict when the MFMA lanes of a multi-row GEMV read them.
     words = gl.allocate_shared_memory(
         gl.int32, [RP, KP, 16], mx._padded_rows([RP, KP, 16], KP * 16, 8)
     )
-    words.store(gl.reshape(gl.where(at < KS // 2, got[0], 0), [RP, KP, 16]))
+    row = gl.minimum(p // (KP * 16), R - 1)
+    got = mb.poll_many(
+        _with_extras(region, extra_regions), (row * stride + pair,) + extra_indices
+    )
+    words.slice(0, G, 0).store(
+        gl.reshape(gl.where(at < KS // 2, got[0], 0), [G, KP, 16])
+    )
+    for g in gl.static_range(1, RP // G):
+        row = gl.minimum(g * G + p // (KP * 16), R - 1)
+        (more,) = mb.poll_many((region,), (row * stride + pair,))
+        words.slice(g * G, G, 0).store(
+            gl.reshape(gl.where(at < KS // 2, more, 0), [G, KP, 16])
+        )
     gl.barrier()
     x_smem = words.reinterpret(
         gl.bfloat16, [RP, KP, 32], mx._padded_rows([RP, KP, 32], KP * 32, 16)
