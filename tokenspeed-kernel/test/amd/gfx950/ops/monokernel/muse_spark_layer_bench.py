@@ -177,8 +177,8 @@ def _operands(rank: int, length: int, dev):
         bf16_tiles(w["w_post"]).to(dev),
         sh["post_gain"][own].to(dev),
         sh["alpha2"][own].to(dev),
-        sh["beta2"][own].to(dev),
-        sh["in_gain"][own].to(dev),
+        sh["beta2"].to(dev),
+        sh["in_gain"].to(dev),
         h_next,
         a_out,
     )

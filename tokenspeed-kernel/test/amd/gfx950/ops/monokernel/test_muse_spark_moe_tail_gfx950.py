@@ -78,12 +78,10 @@ def moe_tail_kernel(
         moe_tail.comb_stages(mb, task, pen_gain, RANK)
     task, active = schedule.stage_task(PLAN, "unpool")
     if active:
-        moe_tail.unpool_stages(
-            mb, task, w_post, post_gain, alpha, beta, in_gain, h_next, RANK
-        )
+        moe_tail.unpool_stages(mb, task, w_post, post_gain, alpha, beta, h_next, RANK)
     task, active = schedule.stage_task(PLAN, "out")
     if active:
-        moe_tail.out_stage(mb, task, a_out, "out")
+        moe_tail.out_stage(mb, task, beta, in_gain, a_out, "out")
 
 
 def _inputs(launch: int):
@@ -168,8 +166,8 @@ def _worker(rank: int, port: int) -> None:
                 bf16_tiles(w_post[own].contiguous()).to(device),
                 post[own].to(device),
                 alpha[own].to(device),
-                beta[own].to(device),
-                ing[own].to(device),
+                beta.to(device),
+                ing.to(device),
                 h_next,
                 a_out,
                 plan.key,
