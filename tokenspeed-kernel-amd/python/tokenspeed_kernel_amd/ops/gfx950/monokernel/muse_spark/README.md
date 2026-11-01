@@ -61,6 +61,10 @@ seam. The switch `--decode-monokernel` enables it.
   with its reasons. Startup fails when no layer is eligible.
 - The seam allocates the mailbox scratch on the Iris symmetric heap before
   graph capture.
+- A launch traps when its peers' values do not come within a few seconds,
+  and a cold compile can take longer on one rank than on the others. Thus
+  the first launch of each layer and row count only compiles
+  (`compile_only`), the ranks meet at a CPU barrier, and then they launch.
 - A forward uses the kernels when it is a decode step of one request: one
   token, or a speculative verify of up to 8 tokens (row `t` has length
   `seq - rows + t + 1` for the step's `seq_lens`). Other forwards use the
@@ -137,7 +141,7 @@ QKVG and attention tests need 8 GPUs.
 | `test_muse_spark_pool_gfx950.py` | The pooler. |
 | `test_muse_spark_experts_gfx950.py` | The experts, on the regular path's preprocessed weights. |
 | `test_muse_spark_moe_tail_gfx950.py` | The combine, post-expert projection and boundary. |
-| `test_muse_spark_layer_gfx950.py` | The whole layer through the packer and the launcher, no recompiles across layers, steps and lengths, CUDA graph replays against eager launches, and the packer's errors. |
+| `test_muse_spark_layer_gfx950.py` | The whole layer through the packer and the launcher, a compile-only call that runs nothing, no recompiles across layers, steps and lengths, CUDA graph replays against eager launches, and the packer's errors. |
 
 Each stage test runs a slice of the real plan, at 1 row and at 8 chained
 rows, and compares it with a torch reference of TokenSpeed's math

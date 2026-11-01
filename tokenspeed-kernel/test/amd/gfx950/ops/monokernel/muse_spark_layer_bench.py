@@ -292,6 +292,7 @@ def worker(rank: int, port: int, args) -> None:
             rank,
             args.full,
             args.rows,
+            False,
         )
 
     def run(cold: bool) -> None:

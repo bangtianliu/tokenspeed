@@ -389,6 +389,9 @@ class MuseSparkMonokernels:
             Those layers keep the regular path.
         steps: The mailbox scratch, the heap bases and the step counter, from
             :meth:`prepare` (None before it).
+        cpu_group: The TP8 group's CPU (gloo) process group, from
+            :meth:`prepare` (None before it).
+        compiled: The ``(layer index, rows)`` launches compiled on every rank.
     """
 
     def __init__(self, model: torch.nn.Module) -> None:
@@ -406,14 +409,19 @@ class MuseSparkMonokernels:
                 # Free an EP8 layer's expert slices that no launch reads.
                 self.layers[index].mlp.monokernel_experts = None
         self.steps: MonokernelSteps | None = None
+        self.cpu_group: dist.ProcessGroup | None = None
+        self.compiled: set[tuple[int, int]] = set()
 
-    def prepare(self, group: dist.ProcessGroup, rank: int) -> None:
+    def prepare(
+        self, group: dist.ProcessGroup, cpu_group: dist.ProcessGroup, rank: int
+    ) -> None:
         """Allocate the shared state on the Iris heap of ``group`` (the TP8
-        device process group, ``rank`` this process's rank in it). Call once,
-        before graph capture."""
+        device process group; ``cpu_group`` its CPU twin, ``rank`` this
+        process's rank in it). Call once, before graph capture."""
         if self.steps is None:
             scratch_pairs = max(f.scratch_pairs for f in self.fused.values())
             self.steps = MonokernelSteps(group, rank, scratch_pairs)
+            self.cpu_group = cpu_group
 
     def plan(
         self, rows: int, ctx: ForwardContext, taps: list[int]
@@ -498,8 +506,7 @@ class MonokernelStep:
         )
         h_out = h.new_empty(rows, OWNED)
         a_out = attention_input.new_empty(rows, HIDDEN)
-        muse_spark_layer_decode(
-            fused,
+        operands = dict(
             h=h,
             a=attention_input[:rows],
             h_out=h_out,
@@ -515,6 +522,14 @@ class MonokernelStep:
             peer_bases=steps.bases,
             layer_index=index,
         )
+        if (index, rows) not in monokernels.compiled:
+            # A launch traps when its peers' values do not come within a few
+            # seconds, and a first launch compiles for longer on some ranks
+            # than on others: every rank compiles, then the ranks meet.
+            muse_spark_layer_decode(fused, compile_only=True, **operands)
+            dist.barrier(group=monokernels.cpu_group)
+            monokernels.compiled.add((index, rows))
+        muse_spark_layer_decode(fused, compile_only=False, **operands)
         if index + 1 in monokernels.fused and index + 1 not in self._taps:
             self._owned = h_out
             return hidden_states, a_out
