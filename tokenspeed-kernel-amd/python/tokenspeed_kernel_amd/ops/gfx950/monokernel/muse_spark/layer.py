@@ -333,11 +333,13 @@ def launch_layer(
     rank: int,
     full: bool,
     rows: int,
+    compile_only: bool,
 ):
     """Launch one layer step of ``rows`` token rows (``full``: a
-    full-attention, NoPE layer)."""
+    full-attention, NoPE layer), or with ``compile_only`` only compile the
+    launch."""
     plan = layer_plan(full, rows)
-    gluon_muse_spark_layer_gfx950[(plan.grid,)](
+    args = (
         scratch,
         step,
         layer,
@@ -350,8 +352,11 @@ def launch_layer(
         FULL_SPLITS if full else SLIDING_SPLITS,
         0 if full else WINDOW,
         not full,
-        num_warps=8,
     )
+    if compile_only:
+        gluon_muse_spark_layer_gfx950.warmup(*args, num_warps=8, grid=(plan.grid,))
+    else:
+        gluon_muse_spark_layer_gfx950[(plan.grid,)](*args, num_warps=8)
 
 
 def launch_gluon_muse_spark_layer_gfx950(
@@ -372,6 +377,7 @@ def launch_gluon_muse_spark_layer_gfx950(
     peer_bases,
     layer: int,
     trace_buf,
+    compile_only: bool,
 ):
     """One step of a packed layer (``weights.LayerWeights``) for the rows of
     one request: one decode row, or a speculative verify's consecutive
@@ -395,6 +401,9 @@ def launch_gluon_muse_spark_layer_gfx950(
         peer_bases: int64 ``[8]`` heap bases of the group's ranks.
         layer: The decoder layer index (the tag and the peer copy).
         trace_buf: None, or a trace buffer (``trace.py``).
+        compile_only: Only compile the launch for these operands. A rank's
+            launch polls its peers' values for a few seconds before it traps,
+            so the ranks compile before any of them launches.
     """
     rows = h.shape[0] if h.dim() == 2 else 0
     # The launch reads h and a while other CTAs already write the outputs.
@@ -438,6 +447,7 @@ def launch_gluon_muse_spark_layer_gfx950(
         weights.rank,
         weights.full,
         rows,
+        compile_only,
     )
 
 

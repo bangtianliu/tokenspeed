@@ -239,7 +239,7 @@ def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
         h_next = torch.empty(rows, OWNED, device=dev)
         a_out = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
 
-        def launch(index: int, step: int, seq_len: int) -> None:
+        def launch(index: int, step: int, seq_len: int, compile_only: bool) -> None:
             pos = torch.arange(seq_len - 1, seq_len - 1 + rows)
             slots = sh["table"][pos // 64].long() * 64 + pos % 64
             layer.launch_gluon_muse_spark_layer_gfx950(
@@ -259,12 +259,23 @@ def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
                 peer_bases=group.bases,
                 layer=index,
                 trace_buf=None,
+                compile_only=compile_only,
             )
 
         group.finish_prepare()
         lay = 1 if full else 2
-        launch(lay, 3, length)
+        # Compiling alone runs nothing: the outputs and the scratch keep
+        # their fill (until every rank has checked: a peer's launch puts
+        # into this scratch). The launch then runs the binary it compiled.
+        h_next.fill_(float("nan"))
+        launch(lay, 3, length, compile_only=True)
         torch.cuda.synchronize()
+        assert torch.isnan(h_next).all()
+        assert not scratch.any()
+        dist.barrier()
+        with assert_no_triton_compile(layer.gluon_muse_spark_layer_gfx950):
+            launch(lay, 3, length, compile_only=False)
+            torch.cuda.synchronize()
         dist.barrier()
         tag = launch_tag(3, lay)
         kernel_pooled = torch.stack(
@@ -323,7 +334,7 @@ def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
                 ((lay + 1, length), (lay + 18, length - 1), (lay + 35, length - 70)),
                 start=4,
             ):
-                launch(index, step, seq_len)
+                launch(index, step, seq_len, compile_only=False)
             torch.cuda.synchronize()
         dist.barrier()
     finally:
@@ -391,6 +402,7 @@ def _graph_worker(rank: int, port: int, length: int) -> None:
                 peer_bases=group.bases,
                 layer=2,
                 trace_buf=None,
+                compile_only=False,
             )
             # The seam moves the tag base once per forward, in the graph.
             step.add_(1)
