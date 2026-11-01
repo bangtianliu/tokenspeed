@@ -41,7 +41,9 @@ Read these documents with this one:
   same time. Thus each CU holds one CTA, the kernel has no spills, and no
   other kernel runs on the GPU during the launch.
 - `scratch` is int64, at least `Plan.scratch_pairs` pairs. Every launch uses
-  the same buffer, and nothing clears it.
+  the same buffer, and nothing clears it. Launches that share a buffer must
+  share one region layout: the peer regions' two copies keep a rank a
+  launch ahead off the copy a slower rank reads only within one layout.
 - `step` is an int32 `[1]` device counter. The caller changes it before each
   step, inside the CUDA graph. The launch tag is
   `step * LAYER_SLOTS + layer + 1`, so `layer < LAYER_SLOTS` (64).
