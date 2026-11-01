@@ -2217,7 +2217,7 @@ class MuseSparkModel(BaseTransformerModel):
         # Decode monokernels: a plan for this forward, or None for the
         # regular path.
         step = (
-            self.monokernels.plan(rows, ctx)
+            self.monokernels.plan(rows, ctx, self.layers_to_capture)
             if self.monokernels is not None and owned_global_rows is None
             else None
         )
@@ -2251,13 +2251,8 @@ class MuseSparkModel(BaseTransformerModel):
                 )
             fused = None if step is None else step.layer(layer_index)
             if fused is not None:
-                # A fused run keeps the residual in the monokernel's owned
-                # slices: a tap inside it would read a stale row.
-                if layer_index in self.layers_to_capture:
-                    raise RuntimeError(
-                        f"Muse Spark monokernel fused layer {layer_index}, "
-                        "which a draft taps"
-                    )
+                # The step gathers the whole rows before a tapped layer, so
+                # the capture above read the current residual.
                 hidden_states, attention_input = fused(
                     hidden_states=hidden_states,
                     attention_input=attention_input,

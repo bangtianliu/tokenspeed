@@ -329,27 +329,30 @@ def qwen4_exp_qsa_layer_decode(
 
 
 def prepare_muse_spark_layer(
-    *, tensors: dict[str, Any], override: str | None = None
+    *, tensors: dict[str, Any], max_rows: int, override: str | None = None
 ) -> FusedDecodeLayer | None:
     """Pack one TP8 rank's Muse Spark decoder layer for its monokernel.
 
     Args:
         tensors: The rank's weights by role (see
             ``tokenspeed_kernel_amd...muse_spark.weights.pack_layer``).
+        max_rows: The most token rows of one request a launch will serve:
+            1 for decode, ``k + 1`` for a speculative verify of ``k`` draft
+            tokens. The scratch is sized for it.
         override: Optional registered kernel name to force.
 
     Returns:
-        The packed layer, or None when no monokernel serves it here. One
-        launch serves one token row.
+        The packed layer, or None when no monokernel serves ``max_rows``
+        here.
     """
     try:
-        prepare = _select("muse_spark_layer_prepare", 1, override)
-        decode = _select("muse_spark_layer_decode", 1, override)
+        prepare = _select("muse_spark_layer_prepare", max_rows, override)
+        decode = _select("muse_spark_layer_decode", max_rows, override)
     except NoKernelFoundError:
         if override is not None:
             raise
         return None
-    weights, scratch_pairs, late_weights = prepare(tensors=tensors)
+    weights, scratch_pairs, late_weights = prepare(tensors=tensors, max_rows=max_rows)
     return FusedDecodeLayer(
         decode=decode,
         weights=weights,
@@ -402,20 +405,22 @@ def muse_spark_layer_decode(
     peer_bases: torch.Tensor,
     layer_index: int,
 ) -> None:
-    """One decode step of a packed Muse Spark layer for one token row, on
-    every rank of the TP8 group at once (the launches exchange values).
+    """One step of a packed Muse Spark layer for the rows of one request (a
+    decode row, or a speculative verify's consecutive tokens), on every rank
+    of the TP8 group at once (the launches exchange values).
 
     Args:
         layer: From :func:`prepare_muse_spark_layer`.
-        h, h_out: FP32 ``[1, 1024]``: the rank's owned residual columns
+        h, h_out: FP32 ``[rows, 1024]``: the rank's owned residual columns
             (``1024 rank ..``) before and after the layer.
-        a, a_out: BF16 ``[1, 8192]``: the layer's attention input (normed
+        a, a_out: BF16 ``[rows, 8192]``: the layer's attention input (normed
             with its input norm) and the next layer's. Outputs alias no
             input.
-        seq_len, slot: int32 ``[1]``: the row's length including its token,
-            and the token's KV cache slot.
-        page_table: int32 ``[pages]``: the row's page table of the layer's
-            cache group (64 tokens a page, absolute positions).
+        seq_len, slot: int32 ``[rows]``: each row's length including its
+            token, and the token's KV cache slot. Row ``t`` is the token at
+            position ``seq_len[0] - 1 + t``.
+        page_table: int32 ``[pages]``: the request's page table of the
+            layer's cache group (64 tokens a page, absolute positions).
         k_cache, v_cache: The layer's BF16 ``[slots, 2, 64]`` caches.
         cos_sin: FP32 ``[positions, 64]`` rotary table (cos, then sin).
         scratch: int64 mailbox scratch of at least ``layer.scratch_pairs``,

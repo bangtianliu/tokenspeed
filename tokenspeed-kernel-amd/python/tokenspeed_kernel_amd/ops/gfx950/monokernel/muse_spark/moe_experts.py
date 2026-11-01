@@ -298,6 +298,11 @@ def ex1_poll(mb, task, task2, active, pre_gain, STAGE: gl.constexpr):
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
     i = gl.arange(0, 2, lanes)
     first = gl.where(i == 0, task // (NB1 * KSPLIT), task2 // (NB2 // EX2_BLOCKS))
+    if R > 1:
+        # Past one row every wave of many CTAs polls several whole rows:
+        # one wave spins on hints first (unthrottled, the flood of polls
+        # starves the producers' stores across ranks and the grid livelocks).
+        mb.row(R - 1).pre_poll_spread("cg", POOLED // 2)
     got, firsts, ids = mb.poll_many(
         ("cg", "route", "route"),
         (mb.row_offset(gr) + pair, first, mb.row_offset(pk // TOP_K) + pk % TOP_K),

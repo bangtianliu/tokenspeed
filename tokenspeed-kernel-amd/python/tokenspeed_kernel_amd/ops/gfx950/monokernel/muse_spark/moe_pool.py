@@ -71,6 +71,11 @@ def pool_stage(mb, task, w, RANK: gl.constexpr, STAGE: gl.constexpr):
         GROUP=1,
         GROUP_STRIDE=0,
     )
+    if R > 1:
+        # Past one row every wave of many CTAs polls several whole rows:
+        # one wave spins on hints first (unthrottled, the flood of polls
+        # starves the producers' stores across ranks and the grid livelocks).
+        mb.row(R - 1).pre_poll_spread("xin", HIDDEN // 2)
     x_smem, _ = bf16.load_rows(mb, "xin", 0, HIDDEN, R)
     mb.stamp(STAGE, trace.READY)
     out = bf16.gemv(x_smem, tiles, FIRST=0, ROWS=R)  # FP32 [RP, 16]

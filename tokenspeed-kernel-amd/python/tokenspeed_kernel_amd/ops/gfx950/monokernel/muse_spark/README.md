@@ -39,7 +39,12 @@ registers them as `prepare_muse_spark_layer` and `muse_spark_layer_decode`.
   serves every layer of a kind, and the decode graph captures the launches.
 - The mailbox tag is `step * 64 + layer + 1`. The peer regions' copy is
   `layer & 1`: it alternates from one launch to the next, across steps too,
-  since layers 1 to 60 are an even count.
+  since layers 1 to 60 are an even count. A rank one launch ahead thus puts
+  only into the copy no slower rank still reads. That needs one region
+  layout for every launch in the scratch: the sliding and full plans size
+  the attention regions for the full layer's splits, so they lay the scratch
+  out alike (a layout per kind let a sliding and a full launch overlap, and
+  the group deadlocked under serving).
 - The launcher's docstring lists every operand.
 
 ### Serving
@@ -56,9 +61,13 @@ seam. The switch `--decode-monokernel` enables it.
   with its reasons. Startup fails when no layer is eligible.
 - The seam allocates the mailbox scratch on the Iris symmetric heap before
   graph capture.
-- A forward uses the kernels when it is a decode step of one request with
-  one token. Other forwards use the regular path. The seam does not yet
-  serve a speculative verify's rows.
+- A forward uses the kernels when it is a decode step of one request: one
+  token, or a speculative verify of up to 8 tokens (row `t` has length
+  `seq - rows + t + 1` for the step's `seq_lens`). Other forwards use the
+  regular path.
+- A draft model that taps the residual entering a layer (DFlash2's
+  `target_layer_ids`) gets whole rows there: the fused run before that layer
+  gathers the 8 owned slices, as before a regular layer.
 
 ## Stages
 

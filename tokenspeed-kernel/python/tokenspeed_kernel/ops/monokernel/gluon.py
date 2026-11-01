@@ -220,8 +220,9 @@ if _muse_spark_layer is not None:
         max_arch_version=ArchVersion(9, 5),
         vendors=frozenset({"amd"}),
     )
-    # One token row per launch (decode at concurrency 1).
-    _MUSE_TRAITS = {"rows": frozenset({1})}
+    # The rows of one request per launch: decode, or a verify of up to 7
+    # draft tokens.
+    _MUSE_TRAITS = {"rows": frozenset(range(1, _muse_spark_layer.MAX_ROWS + 1))}
 
     @register_kernel(
         "monokernel",
@@ -234,11 +235,15 @@ if _muse_spark_layer is not None:
         traits=_MUSE_TRAITS,
     )
     def gluon_muse_spark_layer_prepare_gfx950(
-        *, tensors: dict[str, Any]
+        *, tensors: dict[str, Any], max_rows: int
     ) -> tuple[Any, int, None]:
         weights = _muse_spark_weights.pack_layer(**tensors)
-        plan = _muse_spark_layer.layer_plan(weights.full, 1)
-        return weights, plan.scratch_pairs, None
+        # One scratch serves launches of every row count up to max_rows.
+        scratch_pairs = max(
+            _muse_spark_layer.layer_plan(weights.full, rows).scratch_pairs
+            for rows in range(1, max_rows + 1)
+        )
+        return weights, scratch_pairs, None
 
     @register_kernel(
         "monokernel",

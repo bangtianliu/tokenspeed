@@ -51,7 +51,13 @@ columns ``1024 r ..`` of the residual.
 from __future__ import annotations
 
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
-from tokenspeed_kernel_amd.ops.gfx950.monokernel import bf16, mx, schedule, trace
+from tokenspeed_kernel_amd.ops.gfx950.monokernel import (
+    bf16,
+    mailbox,
+    mx,
+    schedule,
+    trace,
+)
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.attn_tail import OWNED
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import HIDDEN, WORLD
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.moe_experts import (
@@ -207,6 +213,11 @@ def _ffn_row_scales(mb):
     at = SUMS_AT + rt[None, :, None] * SUMS + qt[None, None, :]
     q2 = gl.arange(0, SUMS, gl.SliceLayout(0, gl.SliceLayout(1, L3)))[None, :]
     g2 = gl.arange(0, G, gl.SliceLayout(1, gl.SliceLayout(1, L3)))[:, None]
+    if R > 1:
+        # Past one row every wave of many CTAs polls several rows' sums: one
+        # wave spins on hints first (unthrottled, the flood of polls starves
+        # the producers' stores across ranks and the grid livelocks).
+        _pre_poll_sums(mb.row(R - 1))
     invs = ()
     for g in gl.static_range(triton.cdiv(R, G)):
         (got,) = mb.poll_many(("ffn",), (mb.row_offset(g * G + gr) + at,))
@@ -217,6 +228,15 @@ def _ffn_row_scales(mb):
             )
             invs += (gl.rsqrt(ss_y / HIDDEN + POST_EPS),)
     return invs
+
+
+@gluon.jit
+def _pre_poll_sums(mb):
+    """:meth:`Mailbox.pre_poll` on 64 of ``ffn``'s sums, spread evenly (each
+    unpool task puts its sums last in its one put)."""
+    N: gl.constexpr = WORLD * UNPOOL_TASKS * SUMS
+    lanes = gl.arange(0, 64 * gl.num_warps(), mailbox.lane_layout(gl.num_warps()))
+    mb.pre_poll("ffn", SUMS_AT + gl.minimum(lanes * N // 64, N - 1))
 
 
 @gluon.jit
@@ -284,6 +304,11 @@ def unpool_stages(mb, task, w, post_gain, alpha, beta, h_next, RANK: gl.constexp
     b_hi = gl.load(beta + RANK * OWNED + c + 1)
     a_lo = gl.load(alpha + c)
     a_hi = gl.load(alpha + c + 1)
+    if R > 1:
+        # Past one row every wave of many CTAs polls several whole rows:
+        # one wave spins on hints first (unthrottled, the flood of polls
+        # starves the producers' stores across ranks and the grid livelocks).
+        mb.row(R - 1).pre_poll_spread("cmb", POOLED // 2)
     x_smem, _ = bf16.load_rows(mb, "cmb", 0, POOLED, R)
     # Every row's h' of the task's pairs, in the epilogue's [row, pair] layout.
     RPP: gl.constexpr = triton.next_power_of_2(R)
@@ -393,6 +418,10 @@ def out_stage(mb, task, beta, in_gain, a_out, STAGE: gl.constexpr):
     b_hi = gl.load(beta + c + 1)
     in_lo = gl.load(in_gain + c)
     in_hi = gl.load(in_gain + c + 1)
+    if schedule.rows(mb.plan) > 1:
+        # Past one row 8 tasks per row poll every rank's sums: throttle them
+        # as fin's (see _ffn_row_scales).
+        _pre_poll_sums(mb)
     y_lo, y_hi, ah_lo, ah_hi = mb.poll_many(
         ("ffn", "ffn", "ffn", "ffn"), (c, c + 1, HIDDEN + c, HIDDEN + c + 1)
     )
