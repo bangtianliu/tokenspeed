@@ -79,8 +79,8 @@ class LayerWeights:
     post: torch.Tensor  # BF16 tiles [OWNED, POOLED]
     post_gain: torch.Tensor  # FP32 [OWNED], post-FFN norm
     alpha2: torch.Tensor  # FP32 [OWNED]
-    beta2: torch.Tensor
-    in_gain: torch.Tensor  # FP32 [OWNED], the next layer's input norm
+    beta2: torch.Tensor  # FP32 [HIDDEN]: every rank's out stage reads it all
+    in_gain: torch.Tensor  # FP32 [HIDDEN], the next layer's input norm
 
     def kernel_args(
         self,
@@ -312,8 +312,8 @@ def pack_layer(
         post=bf16_tiles(post[own]),
         post_gain=post_gain[own].contiguous(),
         alpha2=alpha2[own],
-        beta2=beta2[own],
-        in_gain=in_gain[own].contiguous(),
+        beta2=beta2,
+        in_gain=in_gain.contiguous(),
     )
 
 
