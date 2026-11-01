@@ -31,16 +31,19 @@ columns ``1024 r ..`` of the residual (one row).
   rounded to BF16, put into every rank's ``cmb``.
 * unpool, fin, 64 tasks of 16 owned hidden columns (same CTAs): the
   post-expert projection (BF16 ``[1024, 4096]``, 128 KiB a task) of the whole
-  combined row, rounded to BF16, times the post-FFN gain. Each task puts
-  four partial sums into every rank's ``ss4``: of ``y^2``, ``(beta y)^2``,
-  ``(alpha h')(beta y)`` and ``(alpha h')^2``. Then, after one exchange: the
-  post-FFN norm (RMS over 8192 columns), the residual gate ``h'' = beta y +
-  alpha h'`` (stored: the launch's residual output), and the next layer's
-  input norm, whose sum of squares is the expansion of ``(beta y inv + alpha
-  h')^2`` in the four sums. The result is rounded to BF16 and put into every
-  rank's ``anext``.
-* out, 16 tasks: the whole next attention input to memory, for the next
-  launch.
+  combined row, rounded to BF16, times the post-FFN gain. Each task puts its
+  ``y`` and ``alpha h'`` and four partial sums, of ``y^2``, ``(beta y)^2``,
+  ``(alpha h')(beta y)`` and ``(alpha h')^2``, into every rank's ``ffn``, in
+  one store per rank. Then, after that one exchange: the post-FFN norm (RMS
+  over 8192 columns) and the residual gate ``h'' = beta y + alpha h'`` of the
+  owned columns (stored: the launch's residual output).
+* out, 16 tasks of 512 hidden columns, after the same exchange: the norms,
+  the residual gate and the next layer's input norm, whose sum of squares is
+  the expansion of ``(beta y inv + alpha h')^2`` in the four sums. The result
+  is rounded to BF16 and stored as the next attention input, for the next
+  launch. Every rank computes the whole row from the ``ffn`` of all ranks,
+  with fin's arithmetic: putting the owned slice of the result to the other
+  ranks instead would add a second exchange to the end of the layer.
 """
 
 from __future__ import annotations
@@ -64,8 +67,9 @@ SUMS = gl.constexpr(4)
 OUT_TASKS = gl.constexpr(16)
 POST_EPS = gl.constexpr(1e-8)
 PRE_EPS = gl.constexpr(1e-5)
+SUMS_AT = gl.constexpr(2 * int(HIDDEN))  # where the sums start in ``ffn``
 
-PEERS = ("ss3", "cmb", "ss4", "anext")
+PEERS = ("ss3", "cmb", "ffn")
 
 
 def regions() -> tuple[tuple[str, int], ...]:
@@ -73,8 +77,8 @@ def regions() -> tuple[tuple[str, int], ...]:
     return (
         ("ss3", world * int(COMB_TASKS) * k),  # FP32 [rank][task][route]
         ("cmb", int(POOLED) // 2),  # BF16 pairs of the combined row
-        ("ss4", world * int(UNPOOL_TASKS) * int(SUMS)),  # FP32 [rank][task][sum]
-        ("anext", int(HIDDEN) // 2),  # BF16 pairs of the next attention input
+        # FP32 [y, alpha h'][column], then the sums: [rank][task][sum].
+        ("ffn", 2 * int(HIDDEN) + world * int(UNPOOL_TASKS) * int(SUMS)),
     )
 
 
@@ -84,9 +88,9 @@ def stages(bases: dict[str, int]) -> tuple[Stage, ...]:
     return (
         Stage("comb1", c, comb, reads=("rr", "route"), writes=("ss3",)),
         Stage("comb2", c, comb, reads=("ss3",), writes=("cmb",)),
-        Stage("unpool", u, unpool, reads=("cmb", "hp"), writes=("ss4",)),
-        Stage("fin", u, unpool, reads=("ss4",), writes=("anext",)),
-        Stage("out", int(OUT_TASKS), out, reads=("anext",)),
+        Stage("unpool", u, unpool, reads=("cmb", "hp"), writes=("ffn",)),
+        Stage("fin", u, unpool, reads=("ffn",)),
+        Stage("out", int(OUT_TASKS), out, reads=("ffn",)),
     )
 
 
@@ -173,17 +177,36 @@ def comb_stages(mb, task, pen_gain, RANK: gl.constexpr):
 
 
 @gluon.jit
-def unpool_stages(
-    mb, task, w, post_gain, alpha, beta, in_gain, h_next, RANK: gl.constexpr
-):
+def _ffn_norms(mb):
+    """The inverse RMS of the post-FFN norm and of the next layer's input
+    norm, from every rank's sums in ``ffn``. Fin and out share this, so both get the
+    same values."""
+    nw: gl.constexpr = gl.num_warps()
+    sl: gl.constexpr = gl.BlockedLayout([1, SUMS], [64, 1], [nw, 1], [1, 0])
+    rt = gl.arange(0, WORLD * UNPOOL_TASKS, gl.SliceLayout(1, sl))[:, None]
+    qt = gl.arange(0, SUMS, gl.SliceLayout(0, sl))
+    (got,) = mb.poll_many(("ffn",), (SUMS_AT + rt * SUMS + qt[None, :],))
+    total = gl.sum(got.to(gl.float32, bitcast=True), axis=0)  # [4 sums]
+    ss_y = gl.sum(gl.where(qt == 0, total, 0.0), axis=0)
+    ss_by = gl.sum(gl.where(qt == 1, total, 0.0), axis=0)
+    ss_x = gl.sum(gl.where(qt == 2, total, 0.0), axis=0)
+    ss_ah = gl.sum(gl.where(qt == 3, total, 0.0), axis=0)
+    inv = gl.rsqrt(ss_y / HIDDEN + POST_EPS)
+    # The sum of h''^2 over all columns: inv^2 ss_by + 2 inv ss_x + ss_ah.
+    ss_h = gl.maximum(inv * inv * ss_by + 2.0 * inv * ss_x + ss_ah, 0.0)
+    return inv, gl.rsqrt(ss_h / HIDDEN + PRE_EPS)
+
+
+@gluon.jit
+def unpool_stages(mb, task, w, post_gain, alpha, beta, h_next, RANK: gl.constexpr):
     """Unpool and fin task ``task``: owned hidden columns ``16 task ..``.
 
     Args:
         w: This rank's post-expert projection rows, BF16 ``[1024, 4096]``
             (``weights.bf16_tiles``).
         post_gain: FP32 ``bf16(w + 1)`` of the post-FFN norm, owned columns.
-        alpha, beta: FP32 residual-gate coefficients of the FFN, owned columns.
-        in_gain: FP32 ``bf16(w + 1)`` of the next layer's input norm.
+        alpha: FP32 residual-gate coefficient of the FFN, owned columns.
+        beta: FP32 residual-gate coefficient of the FFN, all 8192 columns.
         h_next: Where the owned FP32 residual ``h''`` goes.
     """
     gl.static_assert(schedule.rows(mb.plan) == 1, "the MoE tail serves one row")
@@ -207,12 +230,10 @@ def unpool_stages(
     c = task * UNPOOL_COLS + 2 * j
     post_lo = gl.load(post_gain + c)
     post_hi = gl.load(post_gain + c + 1)
-    b_lo = gl.load(beta + c)
-    b_hi = gl.load(beta + c + 1)
+    b_lo = gl.load(beta + RANK * OWNED + c)
+    b_hi = gl.load(beta + RANK * OWNED + c + 1)
     a_lo = gl.load(alpha + c)
     a_hi = gl.load(alpha + c + 1)
-    in_lo = gl.load(in_gain + c)
-    in_hi = gl.load(in_gain + c + 1)
     x_smem, _ = bf16.load_rows(mb, "cmb", 0, POOLED, 1)
     hp_lo, hp_hi = mb.poll_many(("hp", "hp"), (c, c + 1))
     mb.stamp("unpool", trace.READY)
@@ -231,56 +252,82 @@ def unpool_stages(
     ah_hi = a_hi * hp_hi.to(gl.float32, bitcast=True)
     by_lo = b_lo * y_lo
     by_hi = b_hi * y_hi
-    q = gl.arange(0, SUMS, lanes)
-    sums = gl.where(
-        q == 0,
-        gl.sum(y_lo * y_lo + y_hi * y_hi, axis=0),
+    s_y = gl.sum(y_lo * y_lo + y_hi * y_hi, axis=0)
+    s_by = gl.sum(by_lo * by_lo + by_hi * by_hi, axis=0)
+    s_x = gl.sum(ah_lo * by_lo + ah_hi * by_hi, axis=0)
+    s_ah = gl.sum(ah_lo * ah_lo + ah_hi * ah_hi, axis=0)
+    # One put per peer: rows y_lo, y_hi, (alpha h')_lo, (alpha h')_hi of the
+    # 8 pairs, then the 4 sums in row 4.
+    rows: gl.constexpr = gl.BlockedLayout([1, 1], [8, 8], [1, nw], [1, 0])
+    r = gl.arange(0, 8, gl.SliceLayout(1, rows))[:, None]
+    jr = gl.arange(0, UNPOOL_COLS // 2, gl.SliceLayout(0, rows))[None, :]
+    col = RANK * OWNED + task * UNPOOL_COLS + 2 * jr
+    yr_lo = gl.convert_layout(y_lo, gl.SliceLayout(0, rows))[None, :]
+    yr_hi = gl.convert_layout(y_hi, gl.SliceLayout(0, rows))[None, :]
+    ar_lo = gl.convert_layout(ah_lo, gl.SliceLayout(0, rows))[None, :]
+    ar_hi = gl.convert_layout(ah_hi, gl.SliceLayout(0, rows))[None, :]
+    sr = gl.where(jr == 0, s_y, gl.where(jr == 1, s_by, gl.where(jr == 2, s_x, s_ah)))
+    vals = gl.where(
+        r == 0,
+        yr_lo,
         gl.where(
-            q == 1,
-            gl.sum(by_lo * by_lo + by_hi * by_hi, axis=0),
-            gl.where(
-                q == 2,
-                gl.sum(ah_lo * by_lo + ah_hi * by_hi, axis=0),
-                gl.sum(ah_lo * ah_lo + ah_hi * ah_hi, axis=0),
-            ),
+            r == 1,
+            yr_hi,
+            gl.where(r == 2, ar_lo, gl.where(r == 3, ar_hi, sr)),
         ),
     )
-    _put_all(mb, "ss4", (RANK * UNPOOL_TASKS + task) * SUMS + q, sums)
+    idx = gl.where(
+        r < 4,
+        (r >> 1) * HIDDEN + col + (r & 1),
+        SUMS_AT + (RANK * UNPOOL_TASKS + task) * SUMS + jr,
+    )
+    word = vals.to(gl.int32, bitcast=True)
+    put = (r < 4) | ((r == 4) & (jr < SUMS))
+    for p in gl.static_range(WORLD):
+        mb.put_peer("ffn", p, idx, word, mask=put)
     mb.stamp("unpool", trace.END)
 
     mb.stamp("fin", trace.START)
-    sl: gl.constexpr = gl.BlockedLayout([1, SUMS], [64, 1], [nw, 1], [1, 0])
-    rt = gl.arange(0, WORLD * UNPOOL_TASKS, gl.SliceLayout(1, sl))[:, None]
-    qt = gl.arange(0, SUMS, gl.SliceLayout(0, sl))
-    (got,) = mb.poll_many(("ss4",), (rt * SUMS + qt[None, :],))
+    inv, _ = _ffn_norms(mb)
     mb.stamp("fin", trace.READY)
-    total = gl.sum(got.to(gl.float32, bitcast=True), axis=0)  # [4 sums]
-    ss_y = gl.sum(gl.where(qt == 0, total, 0.0), axis=0)
-    ss_by = gl.sum(gl.where(qt == 1, total, 0.0), axis=0)
-    ss_x = gl.sum(gl.where(qt == 2, total, 0.0), axis=0)
-    ss_ah = gl.sum(gl.where(qt == 3, total, 0.0), axis=0)
-    inv = gl.rsqrt(ss_y / HIDDEN + POST_EPS)
-    # The sum of h''^2 over all columns: inv^2 ss_by + 2 inv ss_x + ss_ah.
-    ss_h = gl.maximum(inv * inv * ss_by + 2.0 * inv * ss_x + ss_ah, 0.0)
-    inv2 = gl.rsqrt(ss_h / HIDDEN + PRE_EPS)
-    h_lo = gl.fma(b_lo, y_lo * inv, ah_lo)
-    h_hi = gl.fma(b_hi, y_hi * inv, ah_hi)
-    gl.store(h_next + c, h_lo)
-    gl.store(h_next + c + 1, h_hi)
-    word = _bf16_word(h_lo * inv2 * in_lo, h_hi * inv2 * in_hi)
-    for p in gl.static_range(WORLD):
-        mb.put_peer("anext", p, (RANK * OWNED + c) // 2, word)
+    gl.store(h_next + c, gl.fma(b_lo, y_lo * inv, ah_lo))
+    gl.store(h_next + c + 1, gl.fma(b_hi, y_hi * inv, ah_hi))
     mb.stamp("fin", trace.END)
 
 
 @gluon.jit
-def out_stage(mb, task, a_out, STAGE: gl.constexpr):
+def out_stage(mb, task, beta, in_gain, a_out, STAGE: gl.constexpr):
     """Out task ``task``: next attention input values ``512 task ..`` to
-    ``a_out`` (BF16 ``[8192]``)."""
+    ``a_out`` (BF16 ``[8192]``), from every rank's ``ffn``.
+
+    Args:
+        beta: FP32 residual-gate coefficient of the FFN, all 8192 columns.
+        in_gain: FP32 ``bf16(w + 1)`` of the next layer's input norm, all
+            8192 columns.
+    """
     mb.stamp(STAGE, trace.START)
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     i = task * 256 + gl.arange(0, 256, lanes)
-    (got,) = mb.poll_many(("anext",), (i,))
+    c = 2 * i
+    b_lo = gl.load(beta + c)
+    b_hi = gl.load(beta + c + 1)
+    in_lo = gl.load(in_gain + c)
+    in_hi = gl.load(in_gain + c + 1)
+    y_lo, y_hi, ah_lo, ah_hi = mb.poll_many(
+        ("ffn", "ffn", "ffn", "ffn"), (c, c + 1, HIDDEN + c, HIDDEN + c + 1)
+    )
+    inv, inv2 = _ffn_norms(mb)
     mb.stamp(STAGE, trace.READY)
-    gl.store(a_out.to(gl.pointer_type(gl.int32), bitcast=True) + i, got)
+    h_lo = gl.fma(
+        b_lo,
+        y_lo.to(gl.float32, bitcast=True) * inv,
+        ah_lo.to(gl.float32, bitcast=True),
+    )
+    h_hi = gl.fma(
+        b_hi,
+        y_hi.to(gl.float32, bitcast=True) * inv,
+        ah_hi.to(gl.float32, bitcast=True),
+    )
+    word = _bf16_word(h_lo * inv2 * in_lo, h_hi * inv2 * in_hi)
+    gl.store(a_out.to(gl.pointer_type(gl.int32), bitcast=True) + i, word)
     mb.stamp(STAGE, trace.END)

@@ -145,8 +145,8 @@ def gluon_muse_spark_layer_gfx950(
     ``moe_ops``: (router columns, router bias, pooler rows, w13, w13 scales,
     their 4 strides, w2, w2 scales, their 4 strides, pre-expert gain,
     post-expert gain, post-expert projection rows, post-FFN gain, FFN gate
-    ``alpha``, ``beta``, next input gain, residual output, next attention
-    input).
+    ``alpha``, ``beta`` (all 8192 columns), next input gain (all 8192
+    columns), residual output, next attention input).
     """
     table = trace.allocate(trace_buf)
     peers = mailbox.load_peers(bases, RANK, layer & 1, WORLD)
@@ -264,12 +264,10 @@ def gluon_muse_spark_layer_gfx950(
         moe_tail.comb_stages(mb, task, pen_gain, RANK)
     task, active = schedule.stage_task(PLAN, "unpool")
     if active:
-        moe_tail.unpool_stages(
-            mb, task, w_post, post_gain, alpha2, beta2, in_gain, h_next, RANK
-        )
+        moe_tail.unpool_stages(mb, task, w_post, post_gain, alpha2, beta2, h_next, RANK)
     task, active = schedule.stage_task(PLAN, "out")
     if active:
-        moe_tail.out_stage(mb, task, a_out, "out")
+        moe_tail.out_stage(mb, task, beta2, in_gain, a_out, "out")
     trace.flush(table, trace_buf)
 
 
