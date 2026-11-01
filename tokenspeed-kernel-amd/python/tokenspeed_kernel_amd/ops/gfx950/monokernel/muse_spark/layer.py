@@ -88,16 +88,27 @@ def _bases(rows: int, *names: str) -> dict[str, int]:
     return {name: table[name] for name in names}
 
 
+# The most rows of one launch: a verify of 7 draft tokens (the drafters'
+# block of 8).
+MAX_ROWS = 8
+
+
 def layer_plan(full: bool, rows: int) -> Plan:
     """The plan of a full-attention (``full``) or sliding-window layer for
     ``rows`` token rows of one request: 1 for decode, ``k + 1`` for a
     speculative verify of ``k`` draft tokens."""
-    if not 1 <= rows <= 8:
-        raise ValueError(f"a launch serves 1 to 8 rows, got {rows}")
+    if not 1 <= rows <= MAX_ROWS:
+        raise ValueError(f"a launch serves 1 to {MAX_ROWS} rows, got {rows}")
     splits = FULL_SPLITS if full else SLIDING_SPLITS
+    # Both kinds of layer lay their regions out alike: the attention
+    # regions are sized for the full layer's splits. Consecutive launches
+    # alternate the peer regions' two copies, which keeps a rank's puts for
+    # the next launch off the copy a slower rank still reads; with two
+    # layouts in one scratch, a sliding and a full launch overlapped and the
+    # group deadlocked.
     regions = (
         qkvg.REGIONS
-        + attention.regions(splits)
+        + attention.regions(FULL_SPLITS)
         + attn_tail.regions()
         + moe_route.regions()
         + moe_pool.regions()
@@ -432,6 +443,7 @@ def launch_gluon_muse_spark_layer_gfx950(
 
 __all__ = [
     "BASES",
+    "MAX_ROWS",
     "launch_gluon_muse_spark_layer_gfx950",
     "FULL_SPLITS",
     "SLIDING_SPLITS",
