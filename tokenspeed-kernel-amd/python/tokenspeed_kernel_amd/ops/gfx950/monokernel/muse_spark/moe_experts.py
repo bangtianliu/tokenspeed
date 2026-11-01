@@ -432,16 +432,12 @@ def ex1_finish(
     for the lane's other slots."""
     lane = task // (NB1 * KSPLIT)
     count = union[3]
-    # Each slot's loads go out before the previous slot's product.
-    following = _slot_expert(union, lane + LANES)
-    more = ex1_issue(
-        task, True, following, w13, w13s, stride_we, stride_se, stride_slin, stride_snb
-    )
-    _ex1_slot(mb, task, a, tiles, union, expert)
-    for i in range(lane + LANES, count, LANES):
-        expert = following
-        tiles = more
-        following = _slot_expert(union, i + LANES)
+    if schedule.rows(mb.plan) == 1:
+        # Each slot's loads go out before the previous slot's product. One
+        # row has one slot a lane, so the loop never runs, yet this form
+        # measured 2 us faster per layer than one without it: a backend
+        # schedule effect, kept as measured.
+        following = _slot_expert(union, lane + LANES)
         more = ex1_issue(
             task,
             True,
@@ -454,6 +450,39 @@ def ex1_finish(
             stride_snb,
         )
         _ex1_slot(mb, task, a, tiles, union, expert)
+        for i in range(lane + LANES, count, LANES):
+            expert = following
+            tiles = more
+            following = _slot_expert(union, i + LANES)
+            more = ex1_issue(
+                task,
+                True,
+                following,
+                w13,
+                w13s,
+                stride_we,
+                stride_se,
+                stride_slin,
+                stride_snb,
+            )
+            _ex1_slot(mb, task, a, tiles, union, expert)
+    else:
+        # Past one row, no prefetch: two slots' tiles would spill registers.
+        _ex1_slot(mb, task, a, tiles, union, expert)
+        for i in range(lane + LANES, count, LANES):
+            expert = _slot_expert(union, i)
+            more = ex1_issue(
+                task,
+                True,
+                expert,
+                w13,
+                w13s,
+                stride_we,
+                stride_se,
+                stride_slin,
+                stride_snb,
+            )
+            _ex1_slot(mb, task, a, more, union, expert)
     mb.stamp(STAGE, trace.COMPUTED)
     mb.stamp(STAGE, trace.END)
 
