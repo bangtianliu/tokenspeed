@@ -79,48 +79,54 @@ def tail_kernel(
         attn_tail.tail_stages(mb, task, h, alpha, beta, pre_gain, RANK)
 
 
-def _plan() -> Plan:
+def _plan(rows: int) -> Plan:
     return Plan(
         grid=256,
-        stages=attn_tail.stages({"oproj": 0, "tail": 128}),
+        stages=attn_tail.stages({"oproj": 0, "tail": 128}, rows),
         regions=(("z", Q // 2),) + attn_tail.regions(),
-        rows=1,
-        chain=1,
+        rows=rows,
+        chain=rows,
         external=("z",),
         world=WORLD,
         peers=attn_tail.PEERS,
     )
 
 
-def _rank_inputs(rank: int, launch: int):
+def _rank_inputs(rank: int, launch: int, rows: int):
     g = torch.Generator().manual_seed(100 * launch + rank)
-    z = torch.randn(Q, generator=g).to(torch.bfloat16)
+    z = torch.randn(rows, Q, generator=g).to(torch.bfloat16)
     w = (torch.randn(HIDDEN, Q, generator=g) / Q**0.5).to(torch.bfloat16)
     return z, w
 
 
-def _shared_inputs(launch: int):
+def _shared_inputs(launch: int, rows: int):
     g = torch.Generator().manual_seed(9000 + launch)
-    h = torch.randn(HIDDEN, generator=g) * 3
+    h = torch.randn(rows, HIDDEN, generator=g) * 3
     alpha = torch.rand(HIDDEN, generator=g) + 0.5
     beta = torch.rand(HIDDEN, generator=g) + 0.5
     pre_gain = (torch.randn(HIDDEN, generator=g) * 0.1 + 1.0).to(torch.bfloat16).float()
     return h, alpha, beta, pre_gain
 
 
-def _reference(launch: int):
-    b = torch.zeros(HIDDEN)
+def _reference_b(launch: int, rows: int):
+    """The reduced, BF16-rounded ``o_proj`` output ``b``, ``[rows, 8192]``."""
+    b = torch.zeros(rows, HIDDEN)
     for r in range(WORLD):
-        z, w = _rank_inputs(r, launch)
+        z, w = _rank_inputs(r, launch, rows)
         b = b + (z.float() @ w.float().T).to(torch.bfloat16).float()
-    b = b.to(torch.bfloat16).float()
-    h, alpha, beta, pre_gain = _shared_inputs(launch)
-    hp = beta * b * torch.rsqrt(b.pow(2).mean() + 1e-8) + alpha * h
-    u = hp * torch.rsqrt(hp.pow(2).mean() + 1e-5) * pre_gain
-    return b, hp, u
+    return b.to(torch.bfloat16).float()
 
 
-def _worker(rank: int, port: int) -> None:
+def _reference_tail(launch: int, b: torch.Tensor):
+    """``(h', u)`` of ``b [rows, 8192]``."""
+    h, alpha, beta, pre_gain = _shared_inputs(launch, b.shape[0])
+    inv = torch.rsqrt(b.pow(2).mean(-1, keepdim=True) + 1e-8)
+    hp = beta * b * inv + alpha * h
+    u = hp * torch.rsqrt(hp.pow(2).mean(-1, keepdim=True) + 1e-5) * pre_gain
+    return hp, u
+
+
+def _worker(rank: int, port: int, rows: int) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "gloo",
@@ -133,7 +139,7 @@ def _worker(rank: int, port: int) -> None:
         device = torch.device(f"cuda:{rank}")
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, device)
-        plan = _plan()
+        plan = _plan(rows)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         group.finish_prepare()
@@ -141,17 +147,23 @@ def _worker(rank: int, port: int) -> None:
         # copies alternate). z is this launch's input, filled by the host.
         for k in range(LAUNCHES):
             step = 7 + k
-            z, w = _rank_inputs(rank, k)
-            h, alpha, beta, pre_gain = _shared_inputs(k)
-            fill(
-                scratch, plan, "z", z.view(torch.int32).to(device), launch_tag(step, 0)
-            )
+            z, w = _rank_inputs(rank, k, rows)
+            h, alpha, beta, pre_gain = _shared_inputs(k, rows)
+            for row in range(rows):
+                fill(
+                    scratch,
+                    plan,
+                    "z",
+                    z[row].view(torch.int32).to(device),
+                    launch_tag(step, 0),
+                    row=row,
+                )
             tail_kernel[(plan.grid,)](
                 scratch,
                 torch.full((1,), step, dtype=torch.int32, device=device),
                 group.bases,
                 bf16_tiles(w).to(device),
-                h[own].to(device),
+                h[:, own].contiguous().to(device),
                 alpha[own].to(device),
                 beta[own].to(device),
                 pre_gain[own].to(device),
@@ -160,35 +172,55 @@ def _worker(rank: int, port: int) -> None:
                 num_warps=8,
             )
             torch.cuda.synchronize()
-            want_b, want_hp, want_u = _reference(k)
+            tag = launch_tag(step, 0)
             # The router's input: the reduced, BF16-rounded o_proj columns.
             # A rank's BF16 partial can be one step off the reference's (its
             # FP32 sums run in another order); with the final rounding the
             # sum is then up to two BF16 steps off.
-            b = payloads(scratch, plan, "bq", OWNED, launch_tag(step, 0))
-            torch.testing.assert_close(
-                b.view(torch.float32).cpu(), want_b[own], rtol=2**-6, atol=1e-3
-            )
-            hp = payloads(scratch, plan, "hp", OWNED, launch_tag(step, 0)).view(
-                torch.float32
-            )
-            torch.testing.assert_close(hp.cpu(), want_hp[own], rtol=2**-7, atol=1e-3)
-            # Every rank holds the whole BF16 MoE input, rank-major.
-            xin = payloads(
-                scratch, plan, "xin", HIDDEN // 2, launch_tag(step, 0), copy=step & 1
+            b = torch.stack(
+                [
+                    payloads(scratch, plan, "bq", OWNED, tag, row=row)
+                    .view(torch.float32)
+                    .cpu()
+                    for row in range(rows)
+                ]
             )
             torch.testing.assert_close(
-                xin.view(torch.bfloat16).float().cpu(), want_u, rtol=2**-7, atol=1e-3
+                b, _reference_b(k, rows)[:, own], rtol=2**-6, atol=1e-3
             )
+            # h' and u follow from the kernel's b: the residual gate can
+            # cancel, and would amplify b's rounding steps.
+            parts = [torch.empty_like(b) for _ in range(WORLD)]
+            dist.all_gather(parts, b)
+            want_hp, want_u = _reference_tail(k, torch.cat(parts, dim=1))
+            for row in range(rows):
+                hp = payloads(scratch, plan, "hp", OWNED, tag, row=row)
+                torch.testing.assert_close(
+                    hp.view(torch.float32).cpu(),
+                    want_hp[row, own],
+                    rtol=2**-7,
+                    atol=1e-3,
+                )
+                # Every rank holds the whole BF16 MoE input, rank-major.
+                xin = payloads(
+                    scratch, plan, "xin", HIDDEN // 2, tag, row=row, copy=step & 1
+                )
+                torch.testing.assert_close(
+                    xin.view(torch.bfloat16).float().cpu(),
+                    want_u[row],
+                    rtol=2**-7,
+                    atol=1e-3,
+                )
             dist.barrier()
     finally:
         dist.destroy_process_group()
 
 
-def test_attention_tail_reduces_scatters_and_normalizes_across_ranks():
+@pytest.mark.parametrize("rows", [1, 8])
+def test_attention_tail_reduces_scatters_and_normalizes_across_ranks(rows: int):
     if torch.cuda.device_count() < WORLD:
         pytest.skip(f"requires {WORLD} GPUs")
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port,), nprocs=WORLD, join=True)
+    mp.spawn(_worker, args=(port, rows), nprocs=WORLD, join=True)

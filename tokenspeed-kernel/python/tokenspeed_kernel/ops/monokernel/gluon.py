@@ -237,7 +237,7 @@ if _muse_spark_layer is not None:
         *, tensors: dict[str, Any]
     ) -> tuple[Any, int, None]:
         weights = _muse_spark_weights.pack_layer(**tensors)
-        plan = _muse_spark_layer.layer_plan(weights.full)
+        plan = _muse_spark_layer.layer_plan(weights.full, 1)
         return weights, plan.scratch_pairs, None
 
     @register_kernel(

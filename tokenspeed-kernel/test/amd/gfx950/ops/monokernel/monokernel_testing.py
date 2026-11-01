@@ -73,11 +73,12 @@ def fill(
     payload: torch.Tensor,
     tag: int,
     copy: int = 0,
+    row: int = 0,
 ) -> None:
-    """Publish ``payload`` (32-bit words) in row 0 of ``region`` with ``tag``,
-    as the stage that writes the region would (``copy``: the launch parity's
-    copy of a peer region)."""
-    start = _start(plan, region, copy)
+    """Publish ``payload`` (32-bit words) in row ``row`` of ``region`` with
+    ``tag``, as the stage that writes the region would (``copy``: the launch
+    parity's copy of a peer region)."""
+    start = _start(plan, region, copy) + row * plan.row_pairs
     words = payload.reshape(-1).view(torch.int32).to(torch.int64) & 0xFFFFFFFF
     scratch[start : start + words.numel()] = (tag << 32) | words
 

@@ -407,10 +407,11 @@ def muse_spark_layer_decode(
 
     Args:
         layer: From :func:`prepare_muse_spark_layer`.
-        h, h_out: FP32 ``[1024]``: the rank's owned residual columns
+        h, h_out: FP32 ``[1, 1024]``: the rank's owned residual columns
             (``1024 rank ..``) before and after the layer.
-        a, a_out: BF16 ``[8192]``: the layer's attention input (normed with
-            its input norm) and the next layer's. Outputs alias no input.
+        a, a_out: BF16 ``[1, 8192]``: the layer's attention input (normed
+            with its input norm) and the next layer's. Outputs alias no
+            input.
         seq_len, slot: int32 ``[1]``: the row's length including its token,
             and the token's KV cache slot.
         page_table: int32 ``[pages]``: the row's page table of the layer's

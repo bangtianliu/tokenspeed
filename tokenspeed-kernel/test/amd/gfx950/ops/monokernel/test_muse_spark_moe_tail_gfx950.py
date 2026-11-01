@@ -84,12 +84,16 @@ def moe_tail_kernel(
         moe_tail.out_stage(mb, task, beta, in_gain, a_out, "out")
 
 
-def _inputs(launch: int):
+def _inputs(launch: int, rows: int):
+    """The route partials, route weights and ``h'`` of each row (leading
+    dimension ``rows``), then the layer's weights."""
     g = torch.Generator().manual_seed(300 + launch)
-    parts = (torch.randn(WORLD, TOP_K, POOLED, generator=g) * 4).to(torch.bfloat16)
-    w = torch.rand(TOP_K, generator=g) + 0.1
-    w = w / w.sum()
-    hp = torch.randn(HIDDEN, generator=g) * 2
+    parts = (torch.randn(rows, WORLD, TOP_K, POOLED, generator=g) * 4).to(
+        torch.bfloat16
+    )
+    w = torch.rand(rows, TOP_K, generator=g) + 0.1
+    w = w / w.sum(-1, keepdim=True)
+    hp = torch.randn(rows, HIDDEN, generator=g) * 2
     pen = (1.0 + 0.1 * torch.randn(POOLED, generator=g)).to(torch.bfloat16).float()
     w_post = (torch.randn(HIDDEN, POOLED, generator=g) / POOLED**0.5).to(torch.bfloat16)
     post = (1.0 + 0.1 * torch.randn(HIDDEN, generator=g)).to(torch.bfloat16).float()
@@ -113,7 +117,7 @@ def _reference(parts, w, hp, pen, w_post, post, alpha, beta, ing):
     return combined, h2, a, (beta * y).abs()
 
 
-def _worker(rank: int, port: int) -> None:
+def _worker(rank: int, port: int, rows: int) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "gloo",
@@ -128,15 +132,15 @@ def _worker(rank: int, port: int) -> None:
         group = IrisGroup(ctx, dist.group.WORLD, rank, device)
         plan = Plan(
             grid=256,
-            stages=moe_tail.stages({"comb": 0, "unpool": 8, "out": 72}),
+            stages=moe_tail.stages({"comb": 0, "unpool": 64, "out": 128}, rows),
             regions=(
                 ("route", 2 * TOP_K),
                 ("hp", OWNED),
                 ("rr", WORLD * TOP_K * OWNED_POOL // 2),
             )
             + moe_tail.regions(),
-            rows=1,
-            chain=1,
+            rows=rows,
+            chain=rows,
             external=("route", "hp", "rr"),
             world=WORLD,
             peers=("rr",) + moe_tail.PEERS,
@@ -148,16 +152,26 @@ def _worker(rank: int, port: int) -> None:
         for launch in range(2):
             step = 20 + launch
             tag = launch_tag(step, 0)
-            parts, w, hp, pen, w_post, post, alpha, beta, ing = _inputs(launch)
-            route = torch.cat(
-                [torch.zeros(TOP_K, dtype=torch.int32), w.view(torch.int32)]
-            )
-            fill(scratch, plan, "route", route.to(device), tag)
-            fill(scratch, plan, "hp", hp[own].view(torch.int32).to(device), tag)
-            rr = parts[:, :, own_pool].contiguous().view(torch.int32)
-            fill(scratch, plan, "rr", rr.reshape(-1).to(device), tag, copy=step & 1)
-            h_next = torch.empty(OWNED, device=device)
-            a_out = torch.empty(HIDDEN, dtype=torch.bfloat16, device=device)
+            parts, w, hp, pen, w_post, post, alpha, beta, ing = _inputs(launch, rows)
+            for row in range(rows):
+                route = torch.cat(
+                    [torch.zeros(TOP_K, dtype=torch.int32), w[row].view(torch.int32)]
+                )
+                fill(scratch, plan, "route", route.to(device), tag, row=row)
+                hp_own = hp[row, own].contiguous().view(torch.int32)
+                fill(scratch, plan, "hp", hp_own.to(device), tag, row=row)
+                rr = parts[row, :, :, own_pool].contiguous().view(torch.int32)
+                fill(
+                    scratch,
+                    plan,
+                    "rr",
+                    rr.reshape(-1).to(device),
+                    tag,
+                    copy=step & 1,
+                    row=row,
+                )
+            h_next = torch.empty(rows, OWNED, device=device)
+            a_out = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=device)
             moe_tail_kernel[(plan.grid,)](
                 scratch,
                 torch.full((1,), step, dtype=torch.int32, device=device),
@@ -176,34 +190,40 @@ def _worker(rank: int, port: int) -> None:
             )
             torch.cuda.synchronize()
             dist.barrier()
-            combined, h2, a, gated = _reference(
-                parts, w, hp, pen, w_post, post, alpha, beta, ing
-            )
-            cmb = payloads(scratch, plan, "cmb", POOLED // 2, tag, copy=step & 1)
-            torch.testing.assert_close(
-                cmb.view(torch.bfloat16).float().cpu(),
-                combined.float(),
-                rtol=2**-7,
-                atol=1e-3,
-            )
-            # The projection output is BF16: a sum next to a rounding boundary
-            # can round to the neighbour, one BF16 step of beta y.
-            err = (h_next.cpu() - h2[own]).abs()
-            assert torch.all(err <= 2**-7 * h2[own].abs() + 2**-8 * gated[own] + 1e-4)
-            # Four BF16 roundings lie between the route partials and this
-            # output: one step in an early one can make two here.
-            torch.testing.assert_close(
-                a_out.float().cpu(), a.float(), rtol=2**-6, atol=2e-3
-            )
+            for row in range(rows):
+                combined, h2, a, gated = _reference(
+                    parts[row], w[row], hp[row], pen, w_post, post, alpha, beta, ing
+                )
+                cmb = payloads(
+                    scratch, plan, "cmb", POOLED // 2, tag, row=row, copy=step & 1
+                )
+                torch.testing.assert_close(
+                    cmb.view(torch.bfloat16).float().cpu(),
+                    combined.float(),
+                    rtol=2**-7,
+                    atol=1e-3,
+                )
+                # The projection output is BF16: a sum next to a rounding
+                # boundary can round to the neighbour, one BF16 step of beta y
+                # (up to 2^-7 of it, at the bottom of a binade).
+                err = (h_next[row].cpu() - h2[own]).abs()
+                bound = 2**-7 * h2[own].abs() + 2**-7 * gated[own] + 1e-4
+                assert torch.all(err <= bound), row
+                # Four BF16 roundings lie between the route partials and this
+                # output: one step in an early one can make two here.
+                torch.testing.assert_close(
+                    a_out[row].float().cpu(), a.float(), rtol=2**-6, atol=2e-3
+                )
             dist.barrier()
     finally:
         dist.destroy_process_group()
 
 
-def test_moe_tail_combines_projects_and_closes_the_layer():
+@pytest.mark.parametrize("rows", [1, 8])
+def test_moe_tail_combines_projects_and_closes_the_layer(rows: int):
     if torch.cuda.device_count() < WORLD:
         pytest.skip(f"requires {WORLD} GPUs")
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port,), nprocs=WORLD, join=True)
+    mp.spawn(_worker, args=(port, rows), nprocs=WORLD, join=True)

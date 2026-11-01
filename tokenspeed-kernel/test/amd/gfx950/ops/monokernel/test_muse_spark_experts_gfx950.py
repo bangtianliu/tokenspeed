@@ -62,7 +62,9 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import (  # noqa: E402
     launch_tag,
 )
 
-WORLD, POOLED, INTER, EXPERTS, TOP_K, OWNED = 8, 4096, 512, 16, 8, 512
+# 48 experts: 8 rows of random picks share about 37 of them, as many as a
+# verify's 8 consecutive tokens, so the slot lanes run several slots.
+WORLD, POOLED, INTER, EXPERTS, TOP_K, OWNED = 8, 4096, 512, 48, 8, 512
 
 
 @gluon.jit
@@ -94,7 +96,7 @@ def experts_kernel(
     task1 = gl.where(active1, task1, 0)
     task2, active2 = schedule.stage_task(PLAN, "ex2")
     task2 = gl.where(active2, task2, 0)
-    got1, gain_lo, gain_hi, e1, e2 = moe_experts.ex1_poll(
+    got1, gain_lo, gain_hi, ids, e1, e2 = moe_experts.ex1_poll(
         mb, task1, task2, active1, pre_gain, "ex1"
     )
     loads1 = moe_experts.ex1_issue(
@@ -103,11 +105,40 @@ def experts_kernel(
     loads2 = moe_experts.ex2_issue(
         mb, task2, active2, e2, w2, w2s, s2_we, s2_se, s2_lin, s2_nb, "ex2"
     )
+    union = moe_experts.slots(ids)
     a1 = moe_experts.ex1_operand(task1, got1, gain_lo, gain_hi)
     if active1:
-        moe_experts.ex1_finish(mb, task1, a1, loads1, "ex1")
+        moe_experts.ex1_finish(
+            mb,
+            task1,
+            a1,
+            loads1,
+            e1,
+            union,
+            w13,
+            w13s,
+            s13_we,
+            s13_se,
+            s13_lin,
+            s13_nb,
+            "ex1",
+        )
     if active2:
-        moe_experts.ex2_finish(mb, task2, loads2, RANK, "ex2")
+        moe_experts.ex2_finish(
+            mb,
+            task2,
+            loads2,
+            e2,
+            union,
+            w2,
+            w2s,
+            s2_we,
+            s2_se,
+            s2_lin,
+            s2_nb,
+            RANK,
+            "ex2",
+        )
 
 
 def _raw_experts(rank: int):
@@ -149,30 +180,39 @@ def _preprocessed(rank: int, device: torch.device):
     )
 
 
-def _inputs(launch: int):
+def _inputs(launch: int, rows: int):
+    """Each row's pooled input and 8 picks (rows ``[rows, ...]``), and the
+    pre-expert gain."""
     g = torch.Generator().manual_seed(77 + launch)
-    pooled = torch.randn(POOLED, generator=g).to(torch.bfloat16)
+    pooled = torch.randn(rows, POOLED, generator=g).to(torch.bfloat16)
     gain = (1.0 + 0.1 * torch.randn(POOLED, generator=g)).to(torch.bfloat16).float()
-    ids = torch.randperm(EXPERTS, generator=g)[:TOP_K].to(torch.int32)
+    ids = torch.stack(
+        [torch.randperm(EXPERTS, generator=g)[:TOP_K] for _ in range(rows)]
+    ).to(torch.int32)
     return pooled, gain, ids
 
 
-def _reference(rank: int, pooled, gain, ids):
-    """Rank ``rank``'s BF16 partial [8, 4096] of the 8 picks."""
-    x = pooled.float()
-    x = x * torch.rsqrt(x.pow(2).mean() + 1e-5) * gain
-    xq = fake_quantize_mxfp4_even(x.to(torch.bfloat16).float().view(1, -1)).view(-1)
-    w13, s13, w2, s2 = _raw_experts(rank)
-    out = torch.empty(TOP_K, POOLED)
-    for k, e in enumerate(ids.tolist()):
-        acc = dequantize_mxfp4(w13[e], s13[e]).float() @ xq
-        h = acc[0::2] / (1.0 + torch.exp(-acc[0::2])) * acc[1::2]
-        hq = fake_quantize_mxfp4_even(h.to(torch.bfloat16).float().view(1, -1)).view(-1)
-        out[k] = dequantize_mxfp4(w2[e], s2[e]).float() @ hq
-    return out.to(torch.bfloat16)
+def _reference(rank: int, pooled, gain, ids, cols, device):
+    """Rank ``rank``'s BF16 partials ``[rows, 8, cols]`` of every row's 8
+    picks (output columns ``cols``), computed on ``device``. Each picked
+    expert is dequantized once."""
+    x = pooled.float().to(device)
+    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-5) * gain.to(device)
+    xq = fake_quantize_mxfp4_even(x.to(torch.bfloat16).float())
+    w13, s13, w2, s2 = (t.to(device) for t in _raw_experts(rank))
+    out = torch.empty(ids.shape[0], TOP_K, cols.stop - cols.start, device=device)
+    for e in ids.unique().tolist():
+        up = dequantize_mxfp4(w13[e], s13[e]).float()
+        down = dequantize_mxfp4(w2[e][cols], s2[e][cols]).float()
+        for row, k in (ids == e).nonzero().tolist():
+            acc = up @ xq[row]
+            h = acc[0::2] / (1.0 + torch.exp(-acc[0::2])) * acc[1::2]
+            hq = fake_quantize_mxfp4_even(h.to(torch.bfloat16).float().view(1, -1))
+            out[row, k] = down @ hq.view(-1)
+    return out.to(torch.bfloat16).cpu()
 
 
-def _worker(rank: int, port: int) -> None:
+def _worker(rank: int, port: int, rows: int) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "gloo",
@@ -189,8 +229,8 @@ def _worker(rank: int, port: int) -> None:
             grid=256,
             stages=moe_experts.stages({"ex1": 0, "ex2": 0}),
             regions=(("route", 2 * TOP_K), ("cg", POOLED // 2)) + moe_experts.regions(),
-            rows=1,
-            chain=1,
+            rows=rows,
+            chain=rows,
             external=("route", "cg"),
             world=WORLD,
             peers=("cg",) + moe_experts.PEERS,
@@ -202,17 +242,21 @@ def _worker(rank: int, port: int) -> None:
         for launch in range(2):
             step = 10 + launch
             tag = launch_tag(step, 0)
-            pooled, gain, ids = _inputs(launch)
-            route = torch.cat([ids, torch.full((TOP_K,), 0.125).view(torch.int32)])
-            fill(scratch, plan, "route", route.to(device), tag)
-            fill(
-                scratch,
-                plan,
-                "cg",
-                pooled.view(torch.int32).to(device),
-                tag,
-                copy=step & 1,
-            )
+            pooled, gain, ids = _inputs(launch, rows)
+            for row in range(rows):
+                route = torch.cat(
+                    [ids[row], torch.full((TOP_K,), 0.125).view(torch.int32)]
+                )
+                fill(scratch, plan, "route", route.to(device), tag, row=row)
+                fill(
+                    scratch,
+                    plan,
+                    "cg",
+                    pooled[row].view(torch.int32).to(device),
+                    tag,
+                    copy=step & 1,
+                    row=row,
+                )
             experts_kernel[(plan.grid,)](
                 scratch,
                 torch.full((1,), step, dtype=torch.int32, device=device),
@@ -236,24 +280,35 @@ def _worker(rank: int, port: int) -> None:
             )
             torch.cuda.synchronize()
             dist.barrier()
-            got = payloads(
-                scratch, plan, "rr", WORLD * TOP_K * OWNED // 2, tag, copy=step & 1
-            )
-            got = got.view(torch.bfloat16).float().view(WORLD, TOP_K, OWNED).cpu()
-            for src in range(WORLD):
-                want = _reference(src, pooled, gain, ids)[:, own].float()
-                torch.testing.assert_close(
-                    got[src], want, rtol=2**-6, atol=2**-6 * float(want.abs().max())
+            want = [
+                _reference(src, pooled, gain, ids, own, device) for src in range(WORLD)
+            ]
+            for row in range(rows):
+                got = payloads(
+                    scratch,
+                    plan,
+                    "rr",
+                    WORLD * TOP_K * OWNED // 2,
+                    tag,
+                    row=row,
+                    copy=step & 1,
                 )
+                got = got.view(torch.bfloat16).float().view(WORLD, TOP_K, OWNED).cpu()
+                for src in range(WORLD):
+                    w = want[src][row].float()
+                    torch.testing.assert_close(
+                        got[src], w, rtol=2**-6, atol=2**-6 * float(w.abs().max())
+                    )
             dist.barrier()
     finally:
         dist.destroy_process_group()
 
 
-def test_experts_match_the_regular_path_math_on_its_weight_layout():
+@pytest.mark.parametrize("rows", [1, 8])
+def test_experts_match_the_regular_path_math_on_its_weight_layout(rows: int):
     if torch.cuda.device_count() < WORLD:
         pytest.skip(f"requires {WORLD} GPUs")
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port,), nprocs=WORLD, join=True)
+    mp.spawn(_worker, args=(port, rows), nprocs=WORLD, join=True)

@@ -64,7 +64,7 @@ def pool_kernel(scratch, step, bases, w, PLAN: gl.constexpr, RANK: gl.constexpr)
         moe_pool.pool_stage(mb, task, w, RANK, "pool")
 
 
-def _worker(rank: int, port: int) -> None:
+def _worker(rank: int, port: int, rows: int) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "gloo",
@@ -81,8 +81,8 @@ def _worker(rank: int, port: int) -> None:
             grid=256,
             stages=moe_pool.stages({"pool": 0}),
             regions=(("xin", HIDDEN // 2),) + moe_pool.regions(),
-            rows=1,
-            chain=1,
+            rows=rows,
+            chain=rows,
             external=("xin",),
             world=WORLD,
             peers=("xin",) + moe_pool.PEERS,
@@ -91,14 +91,21 @@ def _worker(rank: int, port: int) -> None:
         group.finish_prepare()
         for step in (6, 7):
             g = torch.Generator().manual_seed(step)
-            x = torch.randn(HIDDEN, generator=g).to(torch.bfloat16)
+            x = torch.randn(rows, HIDDEN, generator=g).to(torch.bfloat16)
             w = (torch.randn(POOLED, HIDDEN, generator=g) / HIDDEN**0.5).to(
                 torch.bfloat16
             )
             tag = launch_tag(step, 0)
-            fill(
-                scratch, plan, "xin", x.view(torch.int32).to(device), tag, copy=step & 1
-            )
+            for row in range(rows):
+                fill(
+                    scratch,
+                    plan,
+                    "xin",
+                    x[row].view(torch.int32).to(device),
+                    tag,
+                    copy=step & 1,
+                    row=row,
+                )
             pool_kernel[(plan.grid,)](
                 scratch,
                 torch.full((1,), step, dtype=torch.int32, device=device),
@@ -110,23 +117,27 @@ def _worker(rank: int, port: int) -> None:
             )
             torch.cuda.synchronize()
             dist.barrier()
-            got = payloads(scratch, plan, "cg", POOLED // 2, tag, copy=step & 1)
             want = (x.double() @ w.double().T).to(torch.bfloat16)
-            torch.testing.assert_close(
-                got.view(torch.bfloat16).float().cpu(),
-                want.float(),
-                rtol=2**-7,
-                atol=1e-3,
-            )
+            for row in range(rows):
+                got = payloads(
+                    scratch, plan, "cg", POOLED // 2, tag, row=row, copy=step & 1
+                )
+                torch.testing.assert_close(
+                    got.view(torch.bfloat16).float().cpu(),
+                    want[row].float(),
+                    rtol=2**-7,
+                    atol=1e-3,
+                )
             dist.barrier()
     finally:
         dist.destroy_process_group()
 
 
-def test_pooler_gathers_every_ranks_columns():
+@pytest.mark.parametrize("rows", [1, 8])
+def test_pooler_gathers_every_ranks_columns(rows: int):
     if torch.cuda.device_count() < WORLD:
         pytest.skip(f"requires {WORLD} GPUs")
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port,), nprocs=WORLD, join=True)
+    mp.spawn(_worker, args=(port, rows), nprocs=WORLD, join=True)
