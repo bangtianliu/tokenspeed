@@ -18,12 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Muse Spark attention stages (head, attn, merge) of one rank, one row."""
+"""Muse Spark attention stages (head, attn, merge) of one rank, for one
+decode row or the chained rows of a speculative verify."""
 
 from __future__ import annotations
 
-import math
-
+import muse_spark_reference as ref
 import pytest
 import torch
 from monokernel_testing import fill, payloads
@@ -92,63 +92,18 @@ def attention_kernel(
         attention.merge_stage(mb, task, SPLITS, "merge")
 
 
-def _plan(splits: int) -> Plan:
+def _plan(splits: int, rows: int) -> Plan:
     return Plan(
         grid=256,
-        stages=attention.stages({"head": 0, "attn": 32, "merge": 18}, splits),
+        stages=attention.stages({"head": 0, "attn": 32, "merge": 18}, splits, rows),
         regions=qkvg_stage.REGIONS + attention.regions(splits),
-        rows=1,
-        chain=1,
+        rows=rows,
+        chain=rows,
         external=("qkvg", "gate"),
     )
 
 
-def _rope_table(positions: int) -> torch.Tensor:
-    inv = 1.0 / 500000.0 ** (torch.arange(0, HEAD, 2, dtype=torch.float32) / HEAD)
-    t = torch.arange(positions, dtype=torch.float32)[:, None] * inv[None, :]
-    return torch.cat([t.cos(), t.sin()], dim=1)
-
-
-def _norm_rope(x, gain, cs, rope):
-    """Reference per-head norm then interleaved RoPE: FP32, one BF16 rounding."""
-    x = x.float()
-    y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-5) * gain
-    if rope:
-        c, s = cs[:32], cs[32:]
-        lo, hi = y[..., 0::2], y[..., 1::2]
-        y = torch.stack([lo * c - hi * s, hi * c + lo * s], dim=-1).flatten(-2)
-    return y.to(torch.bfloat16)
-
-
-def _split_attention(q, keys, values, splits):
-    """The kernel's split attention: per split, chunks of 128 keys with an
-    online base-2 softmax whose weights round to BF16 before the PV product,
-    then the LSE merge of the splits."""
-    n = keys.shape[0]
-    per = -(-n // splits)
-    scores = (q.float() @ keys.T) * (0.125 * math.log2(math.e))
-    outs, lses = [], []
-    for s in range(splits):
-        lo, hi = s * per, min(s * per + per, n)
-        m, l, acc = float("-inf"), torch.zeros(()), torch.zeros(HEAD)
-        for c0 in range(lo, hi, 128):
-            sc = scores[c0 : min(c0 + 128, hi)]
-            m_new = max(m, float(sc.max()))
-            alpha = 2.0 ** (m - m_new)
-            p = torch.exp2(sc - m_new)
-            l = l * alpha + p.sum()
-            acc = (
-                acc * alpha + p.to(torch.bfloat16).float() @ values[c0 : c0 + p.numel()]
-            )
-            m = m_new
-        if hi > lo:
-            outs.append(acc / l)
-            lses.append(m + math.log2(float(l)))
-    lse = torch.tensor(lses)
-    w = torch.exp2(lse - lse.max())
-    return (torch.stack(outs) * w[:, None]).sum(0) / w.sum()
-
-
+@pytest.mark.parametrize("rows", [1, 8])
 @pytest.mark.parametrize(
     "length,window,splits",
     [
@@ -158,43 +113,44 @@ def _split_attention(q, keys, values, splits):
         (9000, 0, FULL_SPLITS),
     ],
 )
-def test_attention_matches_the_regular_path_math(length, window, splits):
+def test_attention_matches_the_regular_path_math(length, window, splits, rows):
     rope = window != 0
     g = torch.Generator().manual_seed(length + window)
-    L = length - 1  # the token's position
-    pages = (length + PAGE - 1) // PAGE + 3
-    perm = (
-        torch.randperm(pages, generator=g)[: (length + PAGE - 1) // PAGE].to(
-            torch.int32
-        )
-        + 1
-    )
-    table = perm.clone()
+    L0 = length - 1  # row 0's position; row t is the token at L0 + t
+    end = length + rows - 1
+    used = (end + PAGE - 1) // PAGE
+    pages = used + 3
+    table = torch.randperm(pages, generator=g)[:used].to(torch.int32) + 1
     k_cache = torch.randn(pages + 2, PAGE, KV_HEADS, HEAD, generator=g).to(
         torch.bfloat16
     )
     v_cache = torch.randn(pages + 2, PAGE, KV_HEADS, HEAD, generator=g).to(
         torch.bfloat16
     )
-    qkvg = torch.randn(QKVG, generator=g).to(torch.bfloat16)
-    cs = _rope_table(length + 1)
-    slot = int(table[L // PAGE]) * PAGE + L % PAGE
+    qkvg = torch.randn(rows, QKVG, generator=g).to(torch.bfloat16)
+    cs = ref.rope_table(end + 1)
+    positions = torch.arange(L0, L0 + rows)
+    slots = table[positions // PAGE].long() * PAGE + positions % PAGE
 
-    plan = _plan(splits)
+    plan = _plan(splits, rows)
     scratch = torch.zeros(plan.scratch_pairs, dtype=torch.int64, device="cuda")
     step = 5
     tag = launch_tag(step, 0)
     # The projection's two K halves: each half of the value (exact), so
     # their FP32 sum is the BF16 value.
-    for region, rows in (("qkvg", qkvg[:GATE_ROW]), ("gate", qkvg[GATE_ROW:])):
-        half = (rows.float() / 2).view(torch.int32)
-        fill(scratch, plan, region, torch.cat([half, half]).cuda(), tag)
+    for row in range(rows):
+        for region, part in (
+            ("qkvg", qkvg[row, :GATE_ROW]),
+            ("gate", qkvg[row, GATE_ROW:]),
+        ):
+            half = (part.float() / 2).view(torch.int32)
+            fill(scratch, plan, region, torch.cat([half, half]).cuda(), tag, row=row)
     kc, vc = k_cache.clone().cuda(), v_cache.clone().cuda()
     attention_kernel[(plan.grid,)](
         scratch,
         torch.full((1,), step, dtype=torch.int32, device="cuda"),
-        torch.full((1,), length, dtype=torch.int32, device="cuda"),
-        torch.full((1,), slot, dtype=torch.int32, device="cuda"),
+        (positions + 1).to(torch.int32).cuda(),
+        slots.to(torch.int32).cuda(),
         table.cuda(),
         kc,
         vc,
@@ -207,31 +163,30 @@ def test_attention_matches_the_regular_path_math(length, window, splits):
     )
     torch.cuda.synchronize()
 
-    # Reference: the regular path's math with its BF16 rounding points.
-    q = _norm_rope(qkvg[:K_ROW].view(HEADS, HEAD), 5.473006248474121, cs[L], rope)
-    k = _norm_rope(qkvg[K_ROW:V_ROW].view(KV_HEADS, HEAD), 1.0, cs[L], rope)
-    v = qkvg[V_ROW:GATE_ROW].view(KV_HEADS, HEAD)
-    gate = qkvg[GATE_ROW:].view(HEADS, HEAD).float()
-    flat_k = k_cache.view(-1, KV_HEADS, HEAD).clone()
-    flat_v = v_cache.view(-1, KV_HEADS, HEAD).clone()
-    flat_k[slot], flat_v[slot] = k, v
-    first = max(0, L - window + 1) if window else 0
-    pos = torch.arange(first, L + 1)
-    slots = table[pos // PAGE].long() * PAGE + pos % PAGE
-    keys, values = flat_k[slots].float(), flat_v[slots].float()  # [n, 2, 64]
-    z = torch.empty(HEADS, HEAD)
-    for h in range(HEADS):
-        a = _split_attention(q[h], keys[:, h // GROUP], values[:, h // GROUP], splits)
-        a = a.to(torch.bfloat16).float()
-        z[h] = a * torch.rsqrt(a.pow(2).mean() + 1e-5) * torch.sigmoid(gate[h])
-
-    got = (
-        payloads(scratch, plan, "z", HEADS * HEAD // 2, tag).view(torch.bfloat16).cpu()
+    # Reference: the regular path's math with its BF16 rounding points. The
+    # cache slots of the launch's tokens hold stale values: the kernel must
+    # take those keys from the projection.
+    z, k, v, _ = ref.attention_z(
+        qkvg,
+        k_cache.view(-1, KV_HEADS, HEAD),
+        v_cache.view(-1, KV_HEADS, HEAD),
+        table,
+        length,
+        window,
+        splits,
+        cs,
     )
-    # FP32 sums in another order: within about one BF16 rounding step.
-    torch.testing.assert_close(got.float().view(HEADS, HEAD), z, rtol=2**-7, atol=1e-3)
-    # The cache gets the rotated k and the raw v of the token.
-    got_k = kc.view(-1, KV_HEADS, HEAD)[slot].cpu()
-    got_v = vc.view(-1, KV_HEADS, HEAD)[slot].cpu()
-    torch.testing.assert_close(got_k.float(), k.float(), rtol=2**-7, atol=1e-2)
-    assert torch.equal(got_v, v)
+    for t in range(rows):
+        got = payloads(scratch, plan, "z", HEADS * HEAD // 2, tag, row=t)
+        # FP32 sums in another order: within about one BF16 rounding step.
+        torch.testing.assert_close(
+            got.view(torch.bfloat16).cpu().float(),
+            z[t].float(),
+            rtol=2**-7,
+            atol=1e-3,
+        )
+        # The cache gets the rotated k and the raw v of each row's token.
+        got_k = kc.view(-1, KV_HEADS, HEAD)[slots[t]].cpu()
+        got_v = vc.view(-1, KV_HEADS, HEAD)[slots[t]].cpu()
+        torch.testing.assert_close(got_k.float(), k[t].float(), rtol=2**-7, atol=1e-2)
+        assert torch.equal(got_v, v[t])

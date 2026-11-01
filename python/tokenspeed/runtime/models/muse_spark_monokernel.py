@@ -478,10 +478,10 @@ class MonokernelStep:
         a_out = attention_input.new_empty(1, HIDDEN)
         muse_spark_layer_decode(
             fused,
-            h=h,
-            a=attention_input[0],
-            h_out=h_out,
-            a_out=a_out[0],
+            h=h[None],
+            a=attention_input[:1],
+            h_out=h_out[None],
+            a_out=a_out,
             seq_len=leaf.forward_decode_metadata.seq_lens[:1],
             slot=slot[:1],
             page_table=view.page_table[0],

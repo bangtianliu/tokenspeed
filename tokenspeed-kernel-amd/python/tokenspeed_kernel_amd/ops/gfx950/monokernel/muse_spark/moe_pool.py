@@ -18,12 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Pre-expert projection (the pooler) of one Muse Spark rank (one row).
+"""Pre-expert projection (the pooler) of one Muse Spark rank.
 
 pool, 32 tasks: one 16-row block of the rank's 512 pooler rows (BF16
 ``[512, 8192]``, 256 KiB a task) times the whole BF16 MoE input ``xin``,
-rounded to BF16 like the regular path. A task puts its 16 values into every
-rank's ``cg``, so every rank gets the whole pooled row (4096, rank-major).
+rounded to BF16 like the regular path, for every row. A task puts its 16
+values of each row into every rank's ``cg``, so every rank gets the whole
+pooled rows (4096 each, rank-major).
 """
 
 from __future__ import annotations
@@ -45,6 +46,7 @@ def regions() -> tuple[tuple[str, int], ...]:
 
 
 def stages(bases: dict[str, int]) -> tuple[Stage, ...]:
+    """The pool stage (one task serves every row), placed by ``bases``."""
     (pool,) = placement(bases, ("pool",))
     return (Stage("pool", int(POOL_TASKS), pool, reads=("xin",), writes=("cg",)),)
 
@@ -56,7 +58,7 @@ def pool_stage(mb, task, w, RANK: gl.constexpr, STAGE: gl.constexpr):
     Args:
         w: This rank's pooler rows, BF16 ``[512, 8192]`` (``weights.bf16_tiles``).
     """
-    gl.static_assert(schedule.rows(mb.plan) == 1, "the pooler serves one row")
+    R: gl.constexpr = schedule.rows(mb.plan)
     mb.stamp(STAGE, trace.START)
     tiles = bf16.load_weight_tiles(
         w,
@@ -69,14 +71,19 @@ def pool_stage(mb, task, w, RANK: gl.constexpr, STAGE: gl.constexpr):
         GROUP=1,
         GROUP_STRIDE=0,
     )
-    x_smem, _ = bf16.load_rows(mb, "xin", 0, HIDDEN, 1)
+    x_smem, _ = bf16.load_rows(mb, "xin", 0, HIDDEN, R)
     mb.stamp(STAGE, trace.READY)
-    out = bf16.gemv(x_smem, tiles, FIRST=0, ROWS=1)  # FP32 [1, 16]
+    out = bf16.gemv(x_smem, tiles, FIRST=0, ROWS=R)  # FP32 [RP, 16]
     mb.stamp(STAGE, trace.COMPUTED)
+    RP: gl.constexpr = out.shape[0]
     pairs: gl.constexpr = gl.BlockedLayout([1, 2], [1, 64], [gl.num_warps(), 1], [1, 0])
     values = gl.convert_layout(out.to(gl.bfloat16), pairs)
-    word = gl.reshape(mx.pack_bf16_pairs(gl.reshape(values, [1, 8, 2])), [8])
-    p = gl.arange(0, 8, word.type.layout)
+    word = gl.reshape(mx.pack_bf16_pairs(gl.reshape(values, [RP, 8, 2])), [RP, 8])
+    wl: gl.constexpr = word.type.layout
+    row = gl.arange(0, RP, gl.SliceLayout(1, wl))[:, None]
+    p = gl.arange(0, 8, gl.SliceLayout(0, wl))[None, :]
+    at = mb.row_offset(row) + RANK * (POOL_ROWS // 2) + task * 8 + p
     for r in gl.static_range(WORLD):
-        mb.put_peer("cg", r, RANK * (POOL_ROWS // 2) + task * 8 + p, word)
+        # The padding rows past R are masked.
+        mb.put_peer("cg", r, at, word, mask=(row < R) & (p >= 0))
     mb.stamp(STAGE, trace.END)
