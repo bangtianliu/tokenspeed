@@ -3005,6 +3005,7 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             # The mailbox scratch lives on the same Iris heap.
             self.model.monokernels.prepare(
                 process_group_manager.get_device_process_group(group),
+                process_group_manager.get_process_group("gloo", group),
                 group.index(dist.get_rank()),
             )
         return True

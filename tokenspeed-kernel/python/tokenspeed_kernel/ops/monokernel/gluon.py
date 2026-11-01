@@ -262,6 +262,7 @@ if _muse_spark_layer is not None:
         step: torch.Tensor,
         peer_bases: torch.Tensor,
         layer_index: int,
+        compile_only: bool,
         **operands: torch.Tensor,
     ) -> None:
         _muse_spark_layer.launch_gluon_muse_spark_layer_gfx950(
@@ -271,6 +272,7 @@ if _muse_spark_layer is not None:
             peer_bases=peer_bases,
             layer=layer_index,
             trace_buf=None,
+            compile_only=compile_only,
             **operands,
         )
 
