@@ -637,9 +637,16 @@ _PREFERRED_BUCKETS: dict[tuple[int, int], frozenset[int]] = {
     # Attention QKV with the output gate, 8192-wide hidden.
     (2304, 8192): frozenset({4, 16}),
     # 8192-hidden MLP at TP8 (gate/up and down): beat hipBLASLt at 8 and 16
-    # rows in cold-weight graph replay on MI355X.
+    # rows in cold-weight graph replay on MI355X. Muse Spark's DFlash2 draft
+    # at TP8 runs these too.
     (7168, 8192): frozenset({16}),
     (8192, 3584): frozenset({16}),
+    # Muse Spark's DFlash2 draft TP8 (blocks of 8 rows; the context fc takes
+    # the round's accepted tokens).
+    (1280, 8192): frozenset({16}),  # attention QKV
+    (2048, 8192): frozenset({16}),  # convolution coefficients (replicated)
+    (8192, 40960): frozenset({1, 4, 16}),  # context fc, whole
+    (1024, 40960): frozenset({1}),  # context fc, one rank's output block
 }
 
 
