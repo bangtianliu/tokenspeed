@@ -26,10 +26,9 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.embedding import apply_k_rope as _apply_k_rope
-from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from torch import nn
 
-from tokenspeed.runtime.distributed.comm_ops import all_gather, all_reduce
+from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.activation import SiluAndMul
@@ -396,18 +395,7 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
         self._residual_buffer: torch.Tensor | None = None
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        tp = self.mapping.dense
-        if tp.tp_size <= 1 or target_hidden.shape[0] == 0:
-            return self.hidden_norm(self.fc(target_hidden)[0])
-        # ``fc`` is replicated (the incremental projection reads all of it),
-        # but its input is the whole concatenated taps, so it is the largest
-        # matrix of the draft step: each rank projects onto its block of the
-        # output columns, a contiguous row block of the weight, and the
-        # blocks are gathered in rank order.
-        rows = self.fc.weight.shape[0] // tp.tp_size
-        weight = self.fc.weight[tp.tp_rank * rows : (tp.tp_rank + 1) * rows]
-        projected = all_gather(kernel_mm(target_hidden, weight), tp.tp_group, dim=-1)
-        return self.hidden_norm(projected)
+        return self.hidden_norm(self.fc(target_hidden)[0])
 
     # ------------------------------------------------------------------
     # Context-injection contract

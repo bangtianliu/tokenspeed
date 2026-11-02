@@ -597,42 +597,6 @@ def test_a_mixed_batch_derives_draft_lengths_without_reading_the_device() -> Non
     assert written == [{"decode_only": False}]
 
 
-def test_the_context_projection_gathers_each_ranks_block_of_fc() -> None:
-    """Each rank projects the taps onto its block of ``fc``'s output columns;
-    the blocks gathered in rank order are the replicated projection."""
-    hidden, taps, world = 16, 3, 4
-    fc = ReplicatedLinear(taps * hidden, hidden, bias=False)
-    torch.nn.init.normal_(fc.weight)
-    x = torch.randn(5, taps * hidden)
-    blocks: list[torch.Tensor] = []
-
-    def gather(tensor, group, dim):
-        assert dim == -1
-        blocks.append(tensor)
-        return tensor
-
-    for rank in range(world):
-        model = DFlashDraftModel.__new__(DFlashDraftModel)
-        torch.nn.Module.__init__(model)
-        model.fc = fc
-        model.hidden_norm = torch.nn.Identity()
-        model.mapping = SimpleNamespace(
-            dense=SimpleNamespace(tp_size=world, tp_rank=rank, tp_group=None)
-        )
-        with (
-            mock.patch.object(
-                dflash_model, "kernel_mm", side_effect=torch.nn.functional.linear
-            ),
-            mock.patch.object(dflash_model, "all_gather", side_effect=gather),
-        ):
-            model.project_target_hidden(x)
-
-    assert [block.shape for block in blocks] == [(5, hidden // world)] * world
-    torch.testing.assert_close(
-        torch.cat(blocks, dim=-1), torch.nn.functional.linear(x, fc.weight)
-    )
-
-
 def test_the_draft_residual_buffer_is_reused_and_recleared() -> None:
     """A resident residual costs one allocation, not one per draft forward."""
     model = DFlashDraftModel.__new__(DFlashDraftModel)
