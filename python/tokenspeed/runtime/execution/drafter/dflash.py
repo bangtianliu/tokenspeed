@@ -950,6 +950,12 @@ class DFlash(BaseDrafter):
             return
         if self._kv_aux_stream is None:
             return
+        if self.draft_model_runner.server_args.disable_dflash_incremental_projection:
+            logger.info(
+                "DFLASH incremental projection disabled "
+                "(--disable-dflash-incremental-projection)."
+            )
+            return
         if getattr(self.draft_model_runner.model, "fc_norm", None) is not None:
             logger.info(
                 "DFLASH incremental projection disabled: this draft normalizes "

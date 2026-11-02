@@ -576,6 +576,7 @@ parser option keeps its existing behavior.
 | `--speculative-eagle-topk` | Children each draft node expands to per step. Defaults to `1` (a chain); above 1 the draft is a tree. |
 | `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters, EAGLE-Harness trees and chains, and `DFLASH` with a DFlash2 draft (see below). Off by default. |
 | `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. No effect on `DFLASH`. |
+| `--disable-dflash-incremental-projection` | `DFLASH`: project the target taps into the draft context after the target forward instead of on an aux stream during the target's later layers. Off by default; on Muse Spark at TP8 on gfx950 the overlap slows the target more than it saves. |
 | `--eagle3-layers-to-capture` | Target layers whose hidden states feed an `EAGLE3` or `EAGLE4` draft. A target whose forward returns no layer taps (for example Qwen3, Qwen3-MoE or DeepSeek V4.1) refuses these drafts and `DFLASH` at startup. |
 | `--speculative-exec-mode` | `EAGLE4` drafting (see below): `-1` (default) static chains and trees, `0` EAGLE-Harness dynamic chains and trees, `1` the same for evaluation runs, `2` measures the EAGLE-Harness cost data. |
 | `--speculative-data-path` | EAGLE-Harness run directory: the cost data exec modes 0 and 1 read, which exec mode 2 writes. |

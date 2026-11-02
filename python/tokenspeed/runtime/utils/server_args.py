@@ -635,6 +635,11 @@ class ServerArgs:
     # are written as threshold + 1, so it must lie within
     # [SPEC_REJECT_DRAFT_PROB_THRESHOLD_MIN, SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX].
     spec_reject_draft_prob_threshold: float = 2.0
+    # DFLASH folds each target tap into the draft's context projection on an
+    # aux stream while the target's later layers run. Where those weight
+    # streams slow the target more than the overlap saves, this projects the
+    # taps after the target instead.
+    disable_dflash_incremental_projection: bool = False
     enable_replay_ssm: bool = True
     eagle3_layers_to_capture: str | None = None
     # EAGLE-Harness dynamic draft trees for EAGLE4 (see the flags' help).
@@ -3648,6 +3653,14 @@ class ServerArgs:
             "draft and the triton backend; refused on the prefill role of "
             "a disaggregated deployment. EAGLE3/MTP cost a per-request fp32 "
             "draft distribution buffer; see docs/configuration/server.md.",
+        )
+        parser.add_argument(
+            "--disable-dflash-incremental-projection",
+            action="store_true",
+            default=ServerArgs.disable_dflash_incremental_projection,
+            help="DFLASH: project the target taps into the draft context after "
+            "the target forward instead of folding each tap in on an aux stream "
+            "while the target's later layers run.",
         )
         parser.add_argument(
             "--spec-reject-draft-prob-threshold",

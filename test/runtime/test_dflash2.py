@@ -609,3 +609,27 @@ def test_the_draft_residual_buffer_is_reused_and_recleared() -> None:
     assert second.data_ptr() == first.data_ptr()
     assert second.shape == (2, 8)
     assert not second.any()
+
+
+@_CUDA_ONLY
+@pytest.mark.parametrize("disabled", [False, True])
+def test_the_incremental_projection_follows_its_server_flag(disabled: bool) -> None:
+    """``--disable-dflash-incremental-projection`` keeps the tap projection
+    after the target forward even where the aux-stream overlap could run."""
+    hidden, taps = 16, 2
+    drafter = DFlash.__new__(DFlash)
+    drafter.draft_model_runner = SimpleNamespace(
+        server_args=SimpleNamespace(disable_dflash_incremental_projection=disabled),
+        model=SimpleNamespace(
+            fc=ReplicatedLinear(taps * hidden, hidden, bias=False),
+            hidden_norm=torch.nn.Identity(),
+        ),
+    )
+    drafter._fused_kv_enabled = True
+    drafter._kv_aux_stream = torch.cuda.Stream()
+    drafter.target_layer_ids = [1, 3]
+    drafter.input_buffers = SimpleNamespace(max_bs=1)
+    drafter.spec_num_tokens = 8
+    drafter.device = torch.device("cuda")
+    drafter._init_incremental_proj()
+    assert drafter._incremental_proj_enabled is not disabled
