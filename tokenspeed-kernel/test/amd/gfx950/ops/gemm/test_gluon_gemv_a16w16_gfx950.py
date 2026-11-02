@@ -51,8 +51,9 @@ _RTOL = {torch.bfloat16: 2**-7, torch.float16: 2**-10}
 _ATOL = 1e-3
 
 # (N, K): the register FMA tile (one chunk and several), the LDS-staged FMA
-# tile, ragged N, a tiny N below one row per CU, and a long row whose MFMA
-# tile splits K over eight waves (with a K tail).
+# tile, ragged N, a tiny N below one row per CU, a long row whose MFMA
+# tile splits K over eight waves (with a K tail), and a wide N over a mid K
+# (a DFlash2 draft's MLP down projection).
 _SHAPES = [
     (2560, 320),
     (2560, 3072),
@@ -62,6 +63,7 @@ _SHAPES = [
     (8, 64),
     (2304, 8192),
     (300, 8208),
+    (8192, 3584),
 ]
 
 
