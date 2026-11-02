@@ -40,6 +40,10 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (  # noqa: E402
     qkvg as qkvg_stage,
 )
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.layer import (  # noqa: E402
+    FULL_SPLITS,
+    SLIDING_SPLITS,
+)
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import (  # noqa: E402
     Plan,
     launch_tag,
@@ -48,7 +52,6 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import (  # noqa: E402
 HEAD, HEADS, KV_HEADS, GROUP, PAGE = 64, 16, 2, 8, 64
 QKVG = 2304
 K_ROW, V_ROW, GATE_ROW = 1024, 1152, 1280
-SLIDING_SPLITS, FULL_SPLITS = 16, 64
 
 
 @gluon.jit
@@ -111,6 +114,8 @@ def _plan(splits: int, rows: int) -> Plan:
         (3000, 2048, SLIDING_SPLITS),
         (3000, 0, FULL_SPLITS),
         (9000, 0, FULL_SPLITS),
+        # Several key chunks a split.
+        (50000, 0, FULL_SPLITS),
     ],
 )
 def test_attention_matches_the_regular_path_math(length, window, splits, rows):
