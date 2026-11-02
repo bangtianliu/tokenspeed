@@ -951,6 +951,14 @@ class DFlash(BaseDrafter):
         self._sink_cache_locs: torch.Tensor | None = None
         # Whether this round's last tap already wrote the draft's context KV.
         self._context_written = False
+        if self.draft_model_runner.server_args.disable_dflash_incremental_projection:
+            # The target's taps then stay with the target (a decode monokernel
+            # stores them and writes the draft context itself).
+            logger.info(
+                "DFLASH capture sink disabled "
+                "(--disable-dflash-incremental-projection)."
+            )
+            return
         model = self.draft_model_runner.model
         if getattr(model, "fc_norm", None) is not None:
             logger.info(
