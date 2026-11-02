@@ -595,3 +595,25 @@ def test_the_draft_residual_buffer_is_reused_and_recleared() -> None:
     assert second.data_ptr() == first.data_ptr()
     assert second.shape == (2, 8)
     assert not second.any()
+
+
+@_CUDA_ONLY
+@pytest.mark.parametrize("disabled", [False, True])
+def test_the_capture_sink_follows_its_server_flag(disabled: bool) -> None:
+    """``--disable-dflash-incremental-projection`` leaves the target's taps with
+    the target: no context rows are sized, so the capture sink never arms."""
+    hidden, taps = 16, 2
+    drafter = DFlash.__new__(DFlash)
+    drafter.draft_model_runner = SimpleNamespace(
+        server_args=SimpleNamespace(disable_dflash_incremental_projection=disabled),
+        model=SimpleNamespace(
+            context_in_features=taps * hidden, context_dtype=torch.bfloat16
+        ),
+    )
+    drafter.hidden_size = hidden
+    drafter.target_layer_ids = [1, 3]
+    drafter.input_buffers = SimpleNamespace(max_bs=1)
+    drafter.spec_num_tokens = 8
+    drafter.device = torch.device("cuda")
+    drafter._init_context_taps()
+    assert (drafter._tap_rows is None) is disabled

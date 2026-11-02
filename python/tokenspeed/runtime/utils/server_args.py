@@ -666,6 +666,12 @@ class ServerArgs:
     # are written as threshold + 1, so it must lie within
     # [SPEC_REJECT_DRAFT_PROB_THRESHOLD_MIN, SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX].
     spec_reject_draft_prob_threshold: float = 2.0
+    # DFLASH copies each target tap into its context rows as the target
+    # produces it and projects them at the last tap (the capture sink). This
+    # leaves the taps with the target instead, and the draft projects them
+    # after the target forward (a decode monokernel stores the taps and writes
+    # the draft context itself).
+    disable_dflash_incremental_projection: bool = False
     enable_replay_ssm: bool = True
     eagle3_layers_to_capture: str | None = None
     # EAGLE-Harness dynamic draft trees for EAGLE4 (see the flags' help).
@@ -3891,6 +3897,14 @@ class ServerArgs:
             "aggregate TP (including DCP) without DP, PP or PD disaggregation. "
             "'synthetic': benchmark-only forced acceptance; set by "
             "--synthetic-acceptance-length.",
+        )
+        parser.add_argument(
+            "--disable-dflash-incremental-projection",
+            action="store_true",
+            default=ServerArgs.disable_dflash_incremental_projection,
+            help="DFLASH: project the target taps into the draft context after "
+            "the target forward instead of at the target's last tap (the "
+            "capture sink).",
         )
         parser.add_argument(
             "--spec-reject-draft-prob-threshold",
