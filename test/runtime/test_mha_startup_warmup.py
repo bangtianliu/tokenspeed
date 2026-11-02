@@ -80,7 +80,6 @@ def test_fresh_prefill_warmup_also_runs_the_cached_extend(monkeypatch, window):
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
-        prefix_granularity=PAGE,
         context_len=256,
         max_bs=4,
         speculative_num_draft_tokens=1,

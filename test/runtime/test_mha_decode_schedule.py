@@ -97,7 +97,6 @@ class _Step:
             dtype=torch.bfloat16,
             kv_cache_dtype=torch.bfloat16,
             kv_cache_quant_method="none",
-            prefix_granularity=PAGE_SIZE,
             context_len=CONTEXT,
             max_bs=MAX_BS,
             speculative_num_draft_tokens=width,

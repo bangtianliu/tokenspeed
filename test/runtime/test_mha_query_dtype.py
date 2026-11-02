@@ -55,7 +55,6 @@ def _backend(kv_cache_dtype: torch.dtype) -> MHAAttnBackend:
         dtype=BF16,
         kv_cache_dtype=kv_cache_dtype,
         kv_cache_quant_method="none",
-        prefix_granularity=16,
         context_len=256,
         max_bs=4,
         speculative_num_draft_tokens=1,
