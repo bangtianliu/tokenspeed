@@ -131,9 +131,9 @@ def _pick_layout(NP, num_warps):
 @gluon.jit
 def slots(ids):
     """The slots of the launch's picks ``ids [NP]`` (from :func:`ex1_poll`, a
-    lane each, rows major). Returns ``(ids, owner, slot, count)``: every
-    thread's copy of the ids, whether each pick (a lane each) owns its
-    expert, its slot, and the number of slots. Only a wave's lanes talk.
+    lane each, rows major). Returns ``(ids, owner, slot, count)``: the ids,
+    whether each pick owns its expert, and its slot (a lane each), and the
+    number of slots. Only a wave's lanes talk.
 
     It issues no global load: it runs while the first slots' weights
     stream."""
@@ -150,7 +150,9 @@ def slots(ids):
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     owner = gl.convert_layout(1 - gl.max(seen.to(gl.int32), axis=1), lanes)
     slot = gl.cumsum(owner, axis=0) - owner
-    return ids, owner, slot, gl.sum(owner, axis=0)
+    # The ids stay a lane each, not a copy in every thread: the expert steps
+    # run at the register limit past one row, and the copies spill.
+    return gl.convert_layout(ids, lanes), owner, slot, gl.sum(owner, axis=0)
 
 
 @gluon.jit
@@ -164,7 +166,7 @@ def _slot_expert(union, i):
 @gluon.jit
 def _row_picks(union, expert, R: gl.constexpr):
     """The pick of each row that chose ``expert``, or -1: a tuple of ``R``
-    scalars (from each thread's own copy of the ids)."""
+    scalars (reduced across the lanes of a wave)."""
     ids = union[0]
     at = gl.arange(0, ids.shape[0], ids.type.layout)
     picks = ()
