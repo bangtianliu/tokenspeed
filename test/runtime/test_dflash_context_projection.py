@@ -113,7 +113,10 @@ def _sink_drafter(model, device, max_bs: int, spec_num_tokens: int):
     drafter.hidden_size = int(model.config.hidden_size)
     drafter.target_layer_ids = list(model.target_layer_ids)
     drafter.spec_num_tokens = spec_num_tokens
-    drafter.draft_model_runner = SimpleNamespace(model=model)
+    drafter.draft_model_runner = SimpleNamespace(
+        model=model,
+        server_args=SimpleNamespace(disable_dflash_incremental_projection=False),
+    )
     drafter.input_buffers = SimpleNamespace(
         max_bs=max_bs,
         positions_buf=torch.arange(max_bs * spec_num_tokens, device=device),
