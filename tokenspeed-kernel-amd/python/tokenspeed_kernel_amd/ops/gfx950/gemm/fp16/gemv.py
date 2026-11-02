@@ -535,6 +535,14 @@ _PREFERRED_BUCKETS: dict[tuple[int, int], frozenset[int]] = {
     (32, 5120): frozenset({1, 4, 16}),
     # Attention QKV with the output gate, 8192-wide hidden.
     (2304, 8192): frozenset({4, 16}),
+    # Muse Spark's DFlash2 draft TP8 (blocks of 8 rows; the context fc takes
+    # the round's accepted tokens).
+    (1280, 8192): frozenset({16}),  # attention QKV
+    (2048, 8192): frozenset({16}),  # convolution coefficients (replicated)
+    (7168, 8192): frozenset({16}),  # MLP gate-up
+    (8192, 3584): frozenset({16}),  # MLP down
+    (8192, 40960): frozenset({1, 4, 16}),  # context fc, whole
+    (1024, 40960): frozenset({1}),  # context fc, one rank's output block
 }
 
 
