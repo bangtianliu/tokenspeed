@@ -226,7 +226,7 @@ def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
         dev = torch.device(f"cuda:{rank}")
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
-        plan = layer.layer_plan(full, rows)
+        plan = layer.layer_plan(full, rows, rows)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         # A draft's taps: the launch stores its residual into slot 3 of
         # every rank's copy.
@@ -261,6 +261,7 @@ def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
                 step=torch.full((1,), step, dtype=torch.int32, device=dev),
                 peer_bases=group.bases,
                 layer=index,
+                chain=rows,
                 tap=tap,
                 tap_slot=3,
                 trace_buf=None,
@@ -366,6 +367,116 @@ def test_layer_matches_the_regular_path_math(full, rows):
     mp.spawn(_worker, args=(port, 3000, full, rows), nprocs=WORLD, join=True)
 
 
+def _two_requests_worker(rank: int, port: int, full: bool) -> None:
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://localhost:{port}",
+        rank=rank,
+        world_size=WORLD,
+        timeout=timedelta(seconds=900),
+    )
+    try:
+        dev = torch.device(f"cuda:{rank}")
+        ctx = get_or_create_context(heap_size=256 << 20)
+        group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
+        rows = 8  # a verify of 7 draft tokens a request
+        plan = layer.layer_plan(full, 2 * rows, rows)
+        scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
+        own = slice(rank * OWNED, (rank + 1) * OWNED)
+        lengths = (3000, 3100)
+        ends = [n + rows - 1 for n in lengths]
+        # Request 0 is _shared's; request 1 has inputs and pages of its own.
+        sh = _shared(42, lengths[0], rows)
+        g = torch.Generator().manual_seed(7)
+        reqs = [
+            dict(a=sh["a_in"], h=sh["h"], table=sh["table"]),
+            dict(
+                a=torch.randn(rows, HIDDEN, generator=g).to(torch.bfloat16),
+                h=torch.randn(rows, HIDDEN, generator=g) * 2,
+                table=(
+                    int(sh["table"].max())
+                    + 1
+                    + torch.randperm((ends[1] + 63) // 64, generator=g)
+                ).to(torch.int32),
+            ),
+        ]
+        w = _rank_weights(rank, 3 * max(ends))
+        weights = _pack(rank, dev, sh, ends[1], full)
+        cos_sin = ref.rope_table(max(ends) + 1).to(dev)
+        for b, r in enumerate(reqs):
+            pos = torch.arange(lengths[b] - 1, lengths[b] - 1 + rows)
+            r["seq_len"] = (pos + 1).to(torch.int32)
+            r["slot"] = (r["table"][pos // 64].long() * 64 + pos % 64).to(torch.int32)
+
+        def launch(rs, step, k_cache, v_cache):
+            n = len(rs) * rows
+            h_out = torch.empty(n, OWNED, device=dev)
+            a_out = torch.empty(n, HIDDEN, dtype=torch.bfloat16, device=dev)
+            width = max(len(r["table"]) for r in rs)
+            table = torch.zeros(len(rs), width, dtype=torch.int32)
+            for b, r in enumerate(rs):
+                table[b, : len(r["table"])] = r["table"]
+            layer.launch_gluon_muse_spark_layer_gfx950(
+                weights,
+                h=torch.cat([r["h"][:, own] for r in rs]).contiguous().to(dev),
+                a=torch.cat([r["a"] for r in rs]).to(dev),
+                h_out=h_out,
+                a_out=a_out,
+                seq_len=torch.cat([r["seq_len"] for r in rs]).to(dev),
+                slot=torch.cat([r["slot"] for r in rs]).to(dev),
+                page_table=table.to(dev),
+                k_cache=k_cache,
+                v_cache=v_cache,
+                cos_sin=cos_sin,
+                scratch=scratch,
+                step=torch.full((1,), step, dtype=torch.int32, device=dev),
+                peer_bases=group.bases,
+                layer=1 if full else 2,
+                chain=rows,
+                tap=None,
+                tap_slot=None,
+                trace_buf=None,
+                compile_only=False,
+            )
+            torch.cuda.synchronize()
+            dist.barrier()
+            return h_out.cpu(), a_out.cpu()
+
+        group.finish_prepare()
+        caches = [w["k_cache"].to(dev), w["v_cache"].to(dev)]
+        apart = [c.clone() for c in caches]
+        one = [launch([r], 3 + b, *apart) for b, r in enumerate(reqs)]
+        together = [c.clone() for c in caches]
+        h2, a2 = launch(reqs, 5, *together)
+        # Every row's arithmetic is its own: the same values as each
+        # request in a launch of its own. A row's FP32 sums reduce across
+        # lanes in a tree that the launch's row count shapes, so the FP32
+        # residual may differ by a rounding step of a row factor (an
+        # absolute error at the row's scale); everything rounded to BF16
+        # (the next input, the caches) is the same bits.
+        want = torch.cat([o[0] for o in one])
+        scale = want.abs().amax(dim=1, keepdim=True)
+        assert torch.all((h2 - want).abs() <= 2**-21 * scale)
+        assert torch.equal(a2, torch.cat([o[1] for o in one]))
+        assert torch.equal(together[0], apart[0])
+        assert torch.equal(together[1], apart[1])
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_two_requests_in_one_launch_match_their_own_launches(full):
+    """The verify rows of two requests (their own lengths and page tables)
+    in one launch give what each request's own launch gives."""
+    if torch.cuda.device_count() < WORLD:
+        pytest.skip(f"requires {WORLD} GPUs")
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_two_requests_worker, args=(port, full), nprocs=WORLD, join=True)
+
+
 def _graph_worker(rank: int, port: int, length: int) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
@@ -379,7 +490,7 @@ def _graph_worker(rank: int, port: int, length: int) -> None:
         dev = torch.device(f"cuda:{rank}")
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
-        plan = layer.layer_plan(False, 1)
+        plan = layer.layer_plan(False, 1, 1)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         sh = _shared(42, length, 1)
         weights = _pack(rank, dev, sh, length, False)
@@ -415,6 +526,7 @@ def _graph_worker(rank: int, port: int, length: int) -> None:
                 step=step,
                 peer_bases=group.bases,
                 layer=2,
+                chain=1,
                 tap=None,
                 tap_slot=None,
                 trace_buf=None,
@@ -473,7 +585,8 @@ def test_both_kinds_of_layer_lay_the_scratch_out_alike(rows: int):
     regions' copies. A rank a launch ahead must then put only into the copy
     no slower rank still reads, which holds only if both plans place every
     region, and both copies of each peer region, at the same pairs."""
-    sliding, full = layer.layer_plan(False, rows), layer.layer_plan(True, rows)
+    sliding = layer.layer_plan(False, rows, rows)
+    full = layer.layer_plan(True, rows, rows)
     assert sliding.regions == full.regions
     assert sliding.peers == full.peers
     assert sliding.row_pairs == full.row_pairs

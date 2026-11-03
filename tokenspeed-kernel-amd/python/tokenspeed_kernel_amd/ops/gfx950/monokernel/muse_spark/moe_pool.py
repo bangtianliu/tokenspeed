@@ -76,10 +76,24 @@ def pool_stage(mb, task, w, RANK: gl.constexpr, STAGE: gl.constexpr):
         # one wave spins on hints first (unthrottled, the flood of polls
         # starves the producers' stores across ranks and the grid livelocks).
         mb.row(R - 1).pre_poll_spread("xin", HIDDEN // 2)
-    x_smem, _ = bf16.load_rows(mb, "xin", 0, HIDDEN, R)
-    mb.stamp(STAGE, trace.READY)
-    out = bf16.gemv(x_smem, tiles, FIRST=0, ROWS=R)  # FP32 [RP, 16]
+    # The whole rows of K sit in LDS (16 KiB a row): past 8 rows, the rows
+    # go through in two passes of the weights the task holds.
+    if R > 8:
+        _pool_pass(mb, tiles, 0, 8, task, RANK)
+        _pool_pass(mb, tiles, 8, R - 8, task, RANK)
+    else:
+        _pool_pass(mb, tiles, 0, R, task, RANK)
     mb.stamp(STAGE, trace.COMPUTED)
+    mb.stamp(STAGE, trace.END)
+
+
+@gluon.jit
+def _pool_pass(mb, tiles, p0: gl.constexpr, n: gl.constexpr, task, RANK: gl.constexpr):
+    """Rows ``p0 .. p0 + n - 1`` of pool task ``task``: their whole rows of
+    ``xin`` in LDS times the task's weight ``tiles``, BF16, into every
+    rank's ``cg``."""
+    x_smem, _ = bf16.load_rows(mb.row(p0), "xin", 0, HIDDEN, n)
+    out = bf16.gemv(x_smem, tiles, FIRST=0, ROWS=n)  # FP32 [RP, 16]
     RP: gl.constexpr = out.shape[0]
     pairs: gl.constexpr = gl.BlockedLayout([1, 2], [1, 64], [gl.num_warps(), 1], [1, 0])
     values = gl.convert_layout(out.to(gl.bfloat16), pairs)
@@ -87,8 +101,7 @@ def pool_stage(mb, task, w, RANK: gl.constexpr, STAGE: gl.constexpr):
     wl: gl.constexpr = word.type.layout
     row = gl.arange(0, RP, gl.SliceLayout(1, wl))[:, None]
     p = gl.arange(0, 8, gl.SliceLayout(0, wl))[None, :]
-    at = mb.row_offset(row) + RANK * (POOL_ROWS // 2) + task * 8 + p
+    at = mb.row_offset(p0 + row) + RANK * (POOL_ROWS // 2) + task * 8 + p
     for r in gl.static_range(WORLD):
-        # The padding rows past R are masked.
-        mb.put_peer("cg", r, at, word, mask=(row < R) & (p >= 0))
-    mb.stamp(STAGE, trace.END)
+        # The padding rows past n are masked.
+        mb.put_peer("cg", r, at, word, mask=(row < n) & (p >= 0))
