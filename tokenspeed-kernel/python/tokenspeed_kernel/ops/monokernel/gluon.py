@@ -51,12 +51,16 @@ except ImportError:
 
 try:
     from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
+        draft_context as _muse_spark_draft_context,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
         draft_head as _muse_spark_draft_head,
     )
     from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
         draft_layer as _muse_spark_draft_layer,
     )
 except ImportError:
+    _muse_spark_draft_context = None
     _muse_spark_draft_head = None
     _muse_spark_draft_layer = None
 
@@ -405,6 +409,55 @@ if _muse_spark_draft_layer is not None:
         **operands: torch.Tensor,
     ) -> None:
         _muse_spark_draft_head.launch_gluon_muse_spark_draft_head_gfx950(
+            weights,
+            scratch=scratch,
+            step=step,
+            peer_bases=peer_bases,
+            trace_buf=None,
+            compile_only=compile_only,
+            **operands,
+        )
+
+    # One request's verify rows per launch.
+    _CONTEXT_TRAITS = {"rows": frozenset({_muse_spark_draft_context.ROWS})}
+
+    @register_kernel(
+        "monokernel",
+        "muse_spark_draft_context_prepare",
+        name="gluon_muse_spark_draft_context_prepare_gfx950",
+        solution="gluon",
+        capability=_DRAFT_GFX950,
+        signatures=format_signatures("h", "dense", {torch.bfloat16}),
+        priority=Priority.SPECIALIZED,
+        traits=_CONTEXT_TRAITS,
+    )
+    def gluon_muse_spark_draft_context_prepare_gfx950(
+        *, tensors: dict[str, torch.Tensor], rank: int, max_rows: int
+    ) -> tuple[Any, int, None]:
+        weights = _muse_spark_draft_context.pack_draft_context(tensors, rank)
+        plan = _muse_spark_draft_context.context_plan(max_rows)
+        return weights, plan.scratch_pairs, None
+
+    @register_kernel(
+        "monokernel",
+        "muse_spark_draft_context_decode",
+        name="gluon_muse_spark_draft_context_gfx950",
+        solution="gluon",
+        capability=_DRAFT_GFX950,
+        signatures=format_signatures("h", "dense", {torch.bfloat16}),
+        priority=Priority.SPECIALIZED,
+        traits=_CONTEXT_TRAITS,
+    )
+    def gluon_muse_spark_draft_context_gfx950(
+        *,
+        weights: Any,
+        scratch: torch.Tensor,
+        step: torch.Tensor,
+        peer_bases: torch.Tensor,
+        compile_only: bool,
+        **operands: Any,
+    ) -> None:
+        _muse_spark_draft_context.launch_gluon_muse_spark_draft_context_gfx950(
             weights,
             scratch=scratch,
             step=step,
