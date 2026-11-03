@@ -13,7 +13,8 @@ Qwen3.8-Flash-Next (`qwen4_exp`), whose Gated DeltaNet and QSA attention
 layers each have one monokernel, and Muse Spark Open (`muse_spark`), whose
 decoder layers 1 to 60 have one monokernel per rank of a TP8 group (MoE TP8
 / EP1 or MoE TP1 / EP8). Muse Spark's DFlash2 draft (`dflash2`) has one
-monokernel per draft layer for one request's block of 8 rows.
+monokernel per draft layer for one request's block of 8 rows, and one for
+its head (the vocabulary-parallel top 16 and the candidate selector).
 
 ## Where the pieces live
 
@@ -53,10 +54,11 @@ regular layer that follows.
 The DFlash2 draft's regular layers pass this rank's partial of the layer
 output (its reduction moves into the next norm) and the BF16 residual. A
 draft launch also takes and returns the partial, but keeps only the rank's
-1024 residual columns, so the seam serves all draft layers or none. After
-the last launch it gathers the residual rows for the regular final norm.
-The draft has a mailbox scratch and step counter of its own: its tags would
-repeat the target's.
+1024 residual columns, so the seam serves all draft layers or none. The last
+launch also runs the final norm and stores the normed rows on every rank, so
+the draft forward still returns its regular output. The draft layers and the
+draft head each have a mailbox scratch and step counter of their own: their
+tags would repeat the target's.
 
 **Same caches, same layouts.** A monokernel reads and writes the KV cache,
 the GDN state pages and the QSA indexer caches exactly as the regular decode

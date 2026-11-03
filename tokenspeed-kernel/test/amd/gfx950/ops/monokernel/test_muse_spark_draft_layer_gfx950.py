@@ -66,8 +66,8 @@ WORLD, HIDDEN, OWNED, HEAD, HALF, Q_HEADS = 8, ref.HIDDEN, 1024, 128, 64, 8
 SPLITS, PAGE, WINDOW_KEYS = attn_t.SPLITS, attn_t.PAGE, attn_t.WINDOW_KEYS
 
 
-def plan(rows: int) -> Plan:
-    return draft_layer.layer_plan(rows)
+def plan(rows: int, last: bool) -> Plan:
+    return draft_layer.layer_plan(rows, last)
 
 
 def layer_inputs(prefix: int, rank: int, rows: int, device):
@@ -144,6 +144,8 @@ def layer_inputs(prefix: int, rank: int, rows: int, device):
         residual=residual.to(device),
         residual_out=torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=device),
         out=torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=device),
+        final_gain=None,
+        normed=None,
         seq_len=torch.full((1,), end, dtype=torch.int32, device=device),
         positions=host["positions"].to(device),
         slots=slots.to(device),
@@ -180,19 +182,34 @@ def _worker(rank: int, port: int, prefix: int) -> None:
         device = torch.device(f"cuda:{rank}")
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, device)
-        p = plan(rows)
+        # The last layer's plan is the larger; both share the scratch.
+        p = plan(rows, True)
         scratch = ctx.zeros((p.scratch_pairs,), dtype=torch.int64)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         group.finish_prepare()
         step = 31
-        for layer in (3, 4):
+        for layer in (2, 3, 4):
             host, weights, rt = layer_inputs(prefix + layer, rank, rows, device)
+            last = layer == 4
+            if last:
+                # The last layer runs the draft's final norm in place of
+                # storing its partial.
+                g = torch.Generator().manual_seed(prefix)
+                final_w = (1 + 0.1 * torch.randn(HIDDEN, generator=g)).to(
+                    torch.bfloat16
+                )
+                host["final_w"] = final_w
+                rt["out"] = None
+                rt["final_gain"] = final_w[own].float().to(device)
+                rt["normed"] = torch.zeros(
+                    rows, HIDDEN, dtype=torch.bfloat16, device=device
+                )
             # The next layer, at another length, runs the first one's binary.
             no_compile = (
                 assert_no_triton_compile(
                     draft_layer.gluon_muse_spark_draft_layer_gfx950
                 )
-                if layer == 4
+                if layer == 3
                 else contextlib.nullcontext()
             )
             with no_compile:
@@ -207,7 +224,7 @@ def _worker(rank: int, port: int, prefix: int) -> None:
                     compile_only=False,
                 )
             torch.cuda.synchronize()
-            _check(p, scratch, step, layer, host, rt, rank, rows)
+            _check(plan(rows, last), scratch, step, layer, host, rt, rank, rows)
             dist.barrier()
     finally:
         dist.destroy_process_group()
@@ -218,7 +235,7 @@ def _check(p, scratch, step, layer, host, rt, rank, rows) -> None:
     own = slice(rank * OWNED, (rank + 1) * OWNED)
     tag = launch_tag(step, layer)
     copy = (step * 5 + layer) & 1
-    residual_out, out = rt["residual_out"], rt["out"]
+    residual_out = rt["residual_out"]
 
     def words(name, width, copy=0):
         return torch.stack(
@@ -274,7 +291,18 @@ def _check(p, scratch, step, layer, host, rt, rank, rows) -> None:
     )
     _close(act, (torch.nn.functional.silu(gate) * up).to(torch.bfloat16))
     partial = (act.float() @ host["down_w"].float().T).to(torch.bfloat16)
-    _close(out.cpu(), ref.grouped_conv(partial, m_delta[:, 1], host["m_base"][1]))
+    mlp_part = ref.grouped_conv(partial, m_delta[:, 1], host["m_base"][1])
+    if rt["normed"] is None:
+        _close(rt["out"].cpu(), mlp_part)
+        return
+    # The last layer: the final norm of the ranks' MLP partials and the
+    # residual after the attention sublayer, the whole rows on every rank.
+    parts = [torch.empty_like(mlp_part) for _ in range(WORLD)]
+    dist.all_gather(parts, mlp_part)
+    want_normed, _ = ref.tp_sum_norm(
+        parts, want_res, host["final_w"], round_tp_sum=True
+    )
+    _close(rt["normed"].cpu(), want_normed)
 
 
 @pytest.mark.parametrize("prefix", [3000])

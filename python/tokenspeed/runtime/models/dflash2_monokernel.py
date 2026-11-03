@@ -30,13 +30,21 @@ rank of the TP8 group. The draft model touches this module in three places:
   with the reasons logged;
 * ``prepare_communication_runtime`` calls :meth:`DFlash2Monokernels.prepare`,
   which allocates the mailbox scratch on the Iris symmetric heap;
-* the layer loop asks :meth:`DFlash2Monokernels.plan` for the forward's
-  launches and runs them in place of the layers when it gets some.
+* the layer loop asks :meth:`DFlash2Monokernels.serves` whether the forward
+  takes the launches and runs :meth:`DFlash2Monokernels.forward` in place of
+  the layers when it does;
+* once the drafter is wired to the target's LM head,
+  :meth:`DFlash2Monokernels.enable_head` packs the draft head (the
+  vocabulary-parallel top 16 of each draft step and the candidate selector's
+  scores) as one more launch, :class:`DraftHeadMonokernel`, which the
+  drafter runs in place of its top-k and selector for one request. It keeps
+  a tiled copy of the rank's LM-head shard (414 MB a GPU): the tiles stream
+  faster than the row-major weight the target's verify reads.
 
 The launches hand each other this rank's partial of the layer output and its
 owned residual columns (``1024 rank ..``), so the layers are served all
-together or not at all. The final norm keeps the regular path: it reads the
-whole residual rows, gathered after the last launch.
+together or not at all. The last launch also runs the draft's final norm and
+stores its output, the whole rows on every rank.
 """
 
 from __future__ import annotations
@@ -47,13 +55,17 @@ import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.monokernel import (
     FusedDecodeLayer,
+    muse_spark_draft_head_decode,
     muse_spark_draft_layer_decode,
+    prepare_muse_spark_draft_head,
     prepare_muse_spark_draft_layer,
 )
 
-from tokenspeed.runtime.distributed.comm_ops import all_gather
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
+from tokenspeed.runtime.layers.logits_processor import (
+    should_apply_lm_head_quant_method,
+)
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
@@ -92,6 +104,12 @@ OTHER_ATTENTION = (
     f"window_left {WINDOW}, RMS eps {RMS_NORM_EPS})"
 )
 NOT_BF16 = "a projection is quantized or a weight is not BF16"
+# The draft head the kernel bakes in.
+VOCAB = 202048
+SHARD = VOCAB // WORLD
+SELECTOR_RANK = 256
+TOPK = 16
+STEPS = BLOCK_ROWS - 1  # the block's rows 1 .. 7 draft a token each
 NO_KERNEL = "no draft monokernel for this platform"
 
 
@@ -116,8 +134,11 @@ def model_reasons(model: torch.nn.Module) -> list[str]:
         _config_value(config, k) != v for k, v in KERNEL_DFLASH.items()
     ):
         reasons.append(OTHER_SHAPES)
-    if str(_config_value(config, "attention_mode") or "gqa").lower() != "gqa" or any(
-        not _attention_matches(layer) for layer in model.layers
+    if (
+        str(_config_value(config, "attention_mode") or "gqa").lower() != "gqa"
+        or any(not _attention_matches(layer) for layer in model.layers)
+        # The last launch runs the final norm.
+        or abs(model.norm.variance_epsilon - RMS_NORM_EPS) >= 1e-12
     ):
         reasons.append(OTHER_ATTENTION)
     if any(not _bf16(layer) for layer in model.layers):
@@ -218,21 +239,32 @@ class DFlash2Monokernels:
     Attributes:
         layers: The draft's decoder layers.
         fused: The packed launch of each layer, in layer order.
-        group: The TP8 device group the final residual is gathered over.
+        final_gain: FP32 ``[1024]``: the final norm's gain of the rank's
+            owned columns (the last launch runs the final norm).
         steps: The mailbox scratch, the heap bases and the step counter, from
             :meth:`prepare` (None before it).
         cpu_group: The TP8 group's CPU (gloo) process group, from
             :meth:`prepare` (None before it).
-        compiled: Whether every rank compiled the launches.
+        device_group, rank: The TP8 device group and this process's rank in
+            it, from :meth:`prepare` (None before it).
+        compiled: Which binaries every rank compiled: the last layer's
+            (True) and the others' (False).
+        head: The draft head's launch, from :meth:`enable_head` (None
+            before it, or when the head keeps the regular path).
     """
 
     def __init__(self, model: torch.nn.Module, fused: list[FusedDecodeLayer]) -> None:
         self.layers = model.layers
         self.fused = fused
-        self.group = model.mapping.attn.tp_group
+        rank = fused[0].weights.rank
+        own = slice(rank * OWNED, (rank + 1) * OWNED)
+        self.final_gain = model.norm.weight.data[own].float().contiguous()
         self.steps: DraftMonokernelSteps | None = None
+        self.device_group: dist.ProcessGroup | None = None
         self.cpu_group: dist.ProcessGroup | None = None
-        self.compiled = False
+        self.rank: int | None = None
+        self.compiled: set[bool] = set()
+        self.head: DraftHeadMonokernel | None = None
 
     def prepare(
         self, group: dist.ProcessGroup, cpu_group: dist.ProcessGroup, rank: int
@@ -243,7 +275,9 @@ class DFlash2Monokernels:
         if self.steps is None:
             scratch_pairs = max(f.scratch_pairs for f in self.fused)
             self.steps = DraftMonokernelSteps(group, rank, scratch_pairs)
+            self.device_group = group
             self.cpu_group = cpu_group
+            self.rank = rank
 
     def serves(self, rows: int, ctx: ForwardContext) -> bool:
         """Whether this forward runs the launches (:meth:`forward`) rather
@@ -256,8 +290,9 @@ class DFlash2Monokernels:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         ctx: ForwardContext,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run every layer's launch on the block, as the layer loop would.
+    ) -> torch.Tensor:
+        """Run every layer's launch on the block, as the layer loop and the
+        final norm would.
 
         Args:
             positions: The block rows' positions.
@@ -266,13 +301,11 @@ class DFlash2Monokernels:
             ctx: The draft forward's context.
 
         Returns:
-            ``(hidden_states, residual)`` after the last layer: this rank's
-            partial of its output and the whole residual rows.
+            The final norm's output, BF16 ``[rows, 8192]``.
         """
         steps = self.steps
-        rank = self.fused[0].weights.rank
-        own = slice(rank * OWNED, (rank + 1) * OWNED)
         backend = ctx.attn_backend
+        last = len(self.fused) - 1
         positions = positions.to(torch.int32)
         x, res = hidden_states, residual
         for index, (layer, fused) in enumerate(zip(self.layers, self.fused)):
@@ -291,7 +324,9 @@ class DFlash2Monokernels:
                 x=x,
                 residual=res,
                 residual_out=res_out,
-                out=out,
+                out=None if index == last else out,
+                final_gain=self.final_gain if index == last else None,
+                normed=out if index == last else None,
                 # Every block row's length: the request's after the block.
                 seq_len=leaf.decode_seq_lens_buffer[:1],
                 positions=positions,
@@ -305,19 +340,162 @@ class DFlash2Monokernels:
                 peer_bases=steps.bases,
                 layer_index=index,
             )
-            if not self.compiled:
+            if (index == last) not in self.compiled:
                 # A launch traps when its peers' values do not come within a
                 # few seconds, and a first launch compiles for longer on some
                 # ranks than on others: every rank compiles, then the ranks
-                # meet. Every layer shares one binary.
+                # meet. The layers before the last share one binary.
                 muse_spark_draft_layer_decode(fused, compile_only=True, **operands)
                 dist.barrier(group=self.cpu_group)
-                self.compiled = True
+                self.compiled.add(index == last)
             muse_spark_draft_layer_decode(fused, compile_only=False, **operands)
             x, res = out, res_out
         steps.advance()
-        # The launches store only the owned residual columns.
-        return x, all_gather(res[:, own].contiguous(), self.group, dim=-1)
+        return x
+
+    def enable_head(
+        self,
+        lm_head: torch.nn.Module,
+        selector: torch.nn.Module,
+        *,
+        top_k_exact: bool,
+        scale: float,
+        softcap: float,
+    ) -> None:
+        """Pack the draft head once the drafter holds the target's LM head
+        (``lm_head``, vocabulary-parallel) and the draft's candidate
+        ``selector``, after :meth:`prepare`. ``top_k_exact``: whether the
+        shard-local top-k is exact for the head's shard geometry
+        (``VocabParallelTopK.enabled``). Logs why the head keeps the regular
+        path otherwise."""
+        reasons = head_reasons(lm_head, selector, top_k_exact, softcap)
+        fused = None
+        if not reasons:
+            fused = prepare_muse_spark_draft_head(
+                tensors={
+                    "lm_head": lm_head.weight.data[:SHARD],
+                    "hidden_proj": selector.hidden_projection.weight.data,
+                    "pred_codebook": selector.predecessor_codebook.data,
+                    "succ_codebook": selector.successor_codebook.data,
+                },
+                rank=self.rank,
+                max_rows=STEPS,
+                scale=scale,
+                softcap=softcap,
+            )
+            if fused is None:
+                reasons.append(NO_KERNEL)
+        if reasons:
+            logger.warning(
+                f"Decode monokernel: the DFlash2 draft head keeps the regular path "
+                f"({'; '.join(reasons)})"
+            )
+            return
+        self.head = DraftHeadMonokernel(
+            fused, self.device_group, self.cpu_group, self.rank
+        )
+        logger.info("Decode monokernel: the DFlash2 draft head (top 16 and selector)")
+
+
+HEAD_NOT_SHARDED = "the LM head is quantized or not an exact 8-way vocabulary shard"
+HEAD_OTHER_SHAPES = "an LM head or selector of other dimensions than the kernel's"
+HEAD_NO_SOFTCAP = "no final logit softcap"
+
+
+def head_reasons(
+    lm_head: torch.nn.Module,
+    selector: torch.nn.Module,
+    top_k_exact: bool,
+    softcap: float,
+) -> list[str]:
+    """Why the draft head (``lm_head``, ``selector``) cannot have its
+    monokernel; empty when it can."""
+    reasons = []
+    weight = lm_head.weight
+    if (
+        not top_k_exact
+        or should_apply_lm_head_quant_method(lm_head, lm_head.quant_method)
+        or weight.dtype != torch.bfloat16
+        or weight.shape[0] < SHARD
+        or weight.shape[1] != HIDDEN
+    ):
+        reasons.append(HEAD_NOT_SHARDED)
+    if (
+        selector.top_k != TOPK
+        or tuple(selector.predecessor_codebook.shape) != (VOCAB, SELECTOR_RANK)
+        or tuple(selector.hidden_projection.weight.shape) != (SELECTOR_RANK, HIDDEN)
+        or not isinstance(
+            selector.hidden_projection.quant_method, UnquantizedLinearMethod
+        )
+    ):
+        reasons.append(HEAD_OTHER_SHAPES)
+    if not softcap > 0:
+        reasons.append(HEAD_NO_SOFTCAP)
+    return reasons
+
+
+def takes_head(rows: int) -> bool:
+    """Whether a draft head over ``rows`` draft rows (``bs * 7``) takes the
+    monokernel: one request's. Several requests keep the regular path."""
+    return rows == STEPS
+
+
+class DraftHeadMonokernel:
+    """The draft head's launch: its packed weights, its own mailbox scratch
+    and step counter, and the TP8 group's CPU group for the compile-ahead.
+
+    Attributes:
+        fused: The packed head.
+        steps: Its mailbox scratch, heap bases and step counter.
+        cpu_group: The TP8 group's CPU (gloo) process group.
+        compiled: Whether every rank compiled the launch.
+    """
+
+    def __init__(
+        self,
+        fused: FusedDecodeLayer,
+        group: dist.ProcessGroup,
+        cpu_group: dist.ProcessGroup,
+        rank: int,
+    ) -> None:
+        self.fused = fused
+        self.steps = DraftMonokernelSteps(group, rank, fused.scratch_pairs)
+        self.cpu_group = cpu_group
+        self.compiled = False
+
+    def __call__(
+        self, hidden_states: torch.Tensor, anchor: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The candidates and edge scores of one request's draft steps.
+
+        Args:
+            hidden_states: BF16 ``[7, 8192]``: the draft's final-norm output
+                of the block's rows 1 .. 7.
+            anchor: int64 ``[1]``: the block's first token.
+
+        Returns:
+            ``(candidate_ids, scores)``: int64 ``[7, 16]`` and FP32
+            ``[7, 16, 16]``, as ``VocabParallelTopK`` and
+            ``CandidateSelector`` give them.
+        """
+        device = hidden_states.device
+        operands = dict(
+            x=hidden_states.contiguous(),
+            anchor=anchor,
+            cand_ids=torch.empty(STEPS, TOPK, dtype=torch.int64, device=device),
+            unary=torch.empty(STEPS, TOPK, dtype=torch.float32, device=device),
+            scores=torch.empty(STEPS, TOPK, TOPK, dtype=torch.float32, device=device),
+            scratch=self.steps.scratch,
+            step=self.steps.step,
+            peer_bases=self.steps.bases,
+        )
+        if not self.compiled:
+            muse_spark_draft_head_decode(self.fused, compile_only=True, **operands)
+            dist.barrier(group=self.cpu_group)
+            self.compiled = True
+        muse_spark_draft_head_decode(self.fused, compile_only=False, **operands)
+        self.steps.advance()
+        return operands["cand_ids"], operands["scores"]
 
 
 def enable_draft_monokernels(model: torch.nn.Module) -> None:
@@ -352,9 +530,12 @@ def enable_draft_monokernels(model: torch.nn.Module) -> None:
 __all__ = [
     "BLOCK_ROWS",
     "DFlash2Monokernels",
+    "DraftHeadMonokernel",
     "DraftMonokernelSteps",
     "enable_draft_monokernels",
+    "head_reasons",
     "layer_tensors",
     "model_reasons",
+    "takes_head",
     "takes_monokernels",
 ]

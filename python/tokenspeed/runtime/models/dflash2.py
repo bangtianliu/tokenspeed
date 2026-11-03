@@ -483,21 +483,22 @@ class DFlash2DraftModel(DFlashDraftModel):
         # The draft monokernels (--decode-monokernel), packed after loading.
         self.monokernels: DFlash2Monokernels | None = None
 
-    def run_layers(
+    def run_decoder(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         ctx: ForwardContext,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """The layers, or their monokernel launches for one request's block."""
+    ) -> torch.Tensor:
+        """The layers and the final norm, or their monokernel launches (the
+        last one runs the final norm) for one request's block."""
         if (
             self.monokernels is not None
             and residual is not None
             and self.monokernels.serves(hidden_states.shape[0], ctx)
         ):
             return self.monokernels.forward(positions, hidden_states, residual, ctx)
-        return super().run_layers(positions, hidden_states, residual, ctx)
+        return super().run_decoder(positions, hidden_states, residual, ctx)
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         """Allocate the draft monokernels' mailbox scratch on the Iris heap,
