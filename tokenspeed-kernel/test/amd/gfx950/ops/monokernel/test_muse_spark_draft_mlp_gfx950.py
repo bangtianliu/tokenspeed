@@ -85,10 +85,22 @@ def draft_mlp_kernel(
     G: gl.constexpr = schedule.grid(PLAN)
     task, active = schedule.stage_task(PLAN, "scat")
     if active:
-        draft_mlp.scat_stage(mb, task, z, RANK, "scat")
+        draft_mlp.scat_stage(mb, task, z, RANK, "red", "scat")
     task, active = schedule.stage_task(PLAN, "sum1")
     if active:
-        draft_mlp.sum_norm_stages(mb, task, residual, residual_out, gain, RANK)
+        draft_mlp.sum_norm_stages(
+            mb,
+            task,
+            residual,
+            residual_out,
+            gain,
+            RANK,
+            "red",
+            "ss",
+            "hin",
+            "sum1",
+            "norm",
+        )
     task, active = schedule.stage_task(PLAN, "coef")
     if active:
         draft_mlp.proj_task(
@@ -125,7 +137,7 @@ def draft_mlp_kernel(
         )
     task, active = schedule.stage_task(PLAN, "conv0")
     if active:
-        draft_mlp.conv0_stage(mb, task, base, "conv0")
+        draft_mlp.conv0_stage(mb, task, base, "hin", "cpart", "hc", "conv0")
     for i in range(gl.where(free, 1, 0), rounds):
         draft_mlp.proj_task(
             mb,
@@ -179,7 +191,9 @@ def draft_mlp_kernel(
         )
     task, active = schedule.stage_task(PLAN, "fin")
     if active:
-        draft_mlp.fin_stage(mb, task, base, out, "fin")
+        draft_mlp.fin_stage(
+            mb, task, base, out, "dpart", draft_mlp.DOWN_KPARTS, "cpart", "fin"
+        )
     trace.flush(table, trace_buf)
 
 

@@ -87,6 +87,7 @@ docstring gives its math and task split):
 | `moe_pool.py` | pool | The pre-expert projection, gathered on every rank. |
 | `moe_experts.py` | ex1, ex2 | The MXFP4 experts, each rank's 512 of 4096 intermediate values. The rows' distinct experts are slots: each streams once for every row that picked it. |
 | `moe_tail.py` | comb1, comb2, unpool, fin, out | Combine the routes, the post-expert projection, the post-FFN norm, residual gate and the next layer's input norm. |
+| `draft_attn.py` | head, attn, merge (with draft_mlp's sum, norm, coefficient, convolution and projection stages around them) | The attention half of a DFlash2 draft layer: the input norm of the ranks' sum, the attention convolution, qkv, the per-head q / k RMSNorm and RoPE with the KV write, non-causal block attention over the window from the paged cache, `o_proj` and the convolution after it, ending in this rank's partial. Not served yet. |
 | `draft_mlp.py` | scat, sum1, norm, coef, conv0, gu, act, down, fin | The MLP half of a DFlash2 draft layer (Muse Spark's draft, TP8): the ranks' sum of the attention partials, the residual add and post-attention norm, the convolution coefficients, the convolutions around the MLP, gate/up, `silu(g) u` and down, ending in this rank's partial. Not served yet. |
 
 ## Weights
@@ -126,7 +127,7 @@ docstring gives its math and task split):
 | `dims.py` | The dimensions that several modules use. |
 | `qkvg.py`, `attention.py`, `attn_tail.py` | The attention stages. |
 | `moe_route.py`, `moe_pool.py`, `moe_experts.py`, `moe_tail.py` | The MoE stages and the layer boundary. |
-| `draft_mlp.py` | The DFlash2 draft layer's MLP half. |
+| `draft_mlp.py`, `draft_attn.py` | The DFlash2 draft layer's MLP and attention halves. |
 | `weights.py` | Host packing of the layer weights. |
 
 ## Tests
@@ -143,6 +144,7 @@ QKVG and attention tests need 8 GPUs.
 | `test_muse_spark_pool_gfx950.py` | The pooler. |
 | `test_muse_spark_experts_gfx950.py` | The experts, on the regular path's preprocessed weights. |
 | `test_muse_spark_moe_tail_gfx950.py` | The combine, post-expert projection and boundary. |
+| `test_muse_spark_draft_attn_gfx950.py` | The draft's head stage and block attention on one GPU (window cut, short and empty prefixes), and the whole attention half in one launch across the 8 ranks, each stage on the kernel's own input. |
 | `test_muse_spark_draft_mlp_gfx950.py` | The DFlash2 draft's MLP half in one launch across the 8 ranks, each stage on the kernel's own input against `dflash2_draft_reference.py` (the regular path's rounding points). |
 | `test_muse_spark_layer_gfx950.py` | The whole layer through the packer and the launcher, a compile-only call that runs nothing, no recompiles across layers, steps and lengths, CUDA graph replays against eager launches, and the packer's errors. |
 
