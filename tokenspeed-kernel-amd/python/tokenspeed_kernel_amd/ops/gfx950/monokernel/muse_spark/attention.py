@@ -27,15 +27,18 @@ token at position ``L0 + t``, where ``L0`` is the request's own.
 
 * head, 2 tasks per row: KV head ``g``. The per-head RMS norm of k in FP32
   (gain 1), then interleaved RoPE (GPT-J pairs) on sliding layers, then one
-  BF16 rounding; the rotated k and the raw v go to the KV cache slot of the
-  row's token.
+  rounding to the cache's dtype (BF16, or FP8 e4m3 at unit scale, as the
+  regular path's prologue writes it); the rotated k and the raw v go to the
+  KV cache slot of the row's token.
 * attn, ``2 * SPLITS`` tasks a request: KV head ``g``, split ``s``, for every
   row of the request (its length and page table row are its own). A
   task forms the rotated q of its 8 q heads (q gain 5.473) of every row,
   one MFMA row per (row, head), and the launch's k and v itself, as head
   does, from the projection: no hand-off between them. It takes the
   launch's k and v from there, not from the cache: a CTA never reads
-  another CTA's plain store of the same launch. Row ``t`` attends keys
+  another CTA's plain store of the same launch; it rounds them to the
+  cache's dtype as head does, so they are the cached values. An FP8 cache's
+  keys and values widen to BF16 (exactly) for the BF16 MFMAs. Row ``t`` attends keys
   ``max(0, L0 + t - WINDOW + 1) .. L0 + t`` (from 0 on a full layer). The
   splits share the cached keys before ``L0``, ``ceil(n / SPLITS)`` each
   (from the first key that row 0 attends), in chunks of 128 with an online
@@ -66,7 +69,9 @@ HEAD = HEAD_DIM
 GROUP = gl.constexpr(8)  # q heads per KV head
 PAGE = gl.constexpr(64)  # tokens a KV page
 KV_STRIDE = gl.constexpr(128)  # cache elements a slot: 2 KV heads x 64
-BN = gl.constexpr(128)  # keys a chunk
+# Keys a chunk, for either cache dtype: 256 FP8 keys (the bytes of 128 BF16
+# ones) made a full layer slower below ~200k cached keys (8-GPU bench).
+BN = gl.constexpr(128)
 WINDOW = 2048  # a sliding layer attends the last 2048 positions, its own included
 EPS = gl.constexpr(1e-5)
 Q_GAIN = gl.constexpr(5.473006248474121)  # qk_scale_factor as an FP32 norm gain
@@ -140,7 +145,8 @@ def _pair_values(got, e, AX: gl.constexpr):
 
 @gluon.jit
 def _norm_rope(lo, hi, gain, cos_sin, pos, j, ROPE: gl.constexpr):
-    """Per-head RMS norm over the 64 values (pairs ``j``), then RoPE."""
+    """Per-head RMS norm over the 64 values (pairs ``j``), then RoPE, in
+    FP32."""
     inv = gl.rsqrt(gl.sum(lo * lo + hi * hi, axis=0) / HEAD + EPS)
     lo = lo * inv * gain
     hi = hi * inv * gain
@@ -148,7 +154,7 @@ def _norm_rope(lo, hi, gain, cos_sin, pos, j, ROPE: gl.constexpr):
         c = gl.load(cos_sin + pos * HEAD + j)
         s = gl.load(cos_sin + pos * HEAD + HEAD // 2 + j)
         lo, hi = gl.fma(lo, c, -(hi * s)), gl.fma(hi, c, lo * s)
-    return lo.to(gl.bfloat16), hi.to(gl.bfloat16)
+    return lo, hi
 
 
 @gluon.jit
@@ -170,10 +176,11 @@ def head_stage(
         seq_len: int32 ``[rows]``: ``L + 1`` for the row's token at position
             ``L``.
         slot: int32 ``[rows]``: KV cache slot of the row's token.
-        k_cache, v_cache: BF16 ``[slots, 2, 64]``.
+        k_cache, v_cache: BF16 or FP8 e4m3 (unit scale) ``[slots, 2, 64]``.
         cos_sin: FP32 ``[positions, 64]``: ``cos`` of the 32 pairs, then ``sin``
             (unused when ``ROPE`` is false).
     """
+    kv_dtype: gl.constexpr = k_cache.dtype.element_ty
     mb.stamp(STAGE, trace.START)
     row, g, _ = schedule.row_task(mb.plan, task, HEAD_TASKS)
     mb = mb.row(row)
@@ -192,13 +199,13 @@ def head_stage(
     mb.stamp(STAGE, trace.READY)
     lo, hi = _pair_values(kw, e, 1)
     lo, hi = _norm_rope(lo, hi, 1.0, cos_sin, pos, j, ROPE)
-    # The cache keeps the rotated k and the raw v.
+    # The cache keeps the rotated k and the raw v, each rounded once.
     at = slot_at + g * HEAD
-    gl.store(k_cache + at, lo)
-    gl.store(k_cache + at + 1, hi)
+    gl.store(k_cache + at, lo.to(kv_dtype))
+    gl.store(k_cache + at + 1, hi.to(kv_dtype))
     vlo, vhi = _pair_values(vw, e, 1)
-    gl.store(v_cache + at, vlo.to(gl.bfloat16))
-    gl.store(v_cache + at + 1, vhi.to(gl.bfloat16))
+    gl.store(v_cache + at, vlo.to(kv_dtype))
+    gl.store(v_cache + at + 1, vhi.to(kv_dtype))
     mb.stamp(STAGE, trace.END)
 
 
@@ -230,7 +237,7 @@ def _load_kv(
     v_load: gl.constexpr,
 ):
     """Keys ``[64, BN]`` and values ``[BN, 64]`` of chunk ``c0 ..`` from the
-    cache (zero from ``hi``)."""
+    cache (zero from ``hi``), in BF16 (an FP8 cache's widen exactly)."""
     jk = c0 + gl.arange(0, BN, gl.SliceLayout(0, k_layout))
     jv = c0 + gl.arange(0, BN, gl.SliceLayout(1, v_load))
     old_k = jk < hi
@@ -249,7 +256,7 @@ def _load_kv(
         mask=old_v[:, None],
         other=0.0,
     )
-    return keys, values
+    return keys.to(gl.bfloat16), values.to(gl.bfloat16)
 
 
 @gluon.jit
@@ -390,11 +397,17 @@ def attn_stage(
     )
     q = gl.convert_layout(q.to(gl.bfloat16), q_layout)
     v_lo, v_hi = _pair_values(got_v, eq, 2)
+    # The launch's k and v as the cache holds them: rounded once to its dtype.
+    kv_dtype: gl.constexpr = k_cache.dtype.element_ty
     plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     cur_k = gl.allocate_shared_memory(gl.bfloat16, [KT, HEAD], plain)
     cur_v = gl.allocate_shared_memory(gl.bfloat16, [KT, HEAD], plain)
-    cur_k.store(gl.reshape(gl.join(k_lo, k_hi), [KT, HEAD]).to(gl.bfloat16))
-    cur_v.store(gl.reshape(gl.join(v_lo, v_hi), [KT, HEAD]).to(gl.bfloat16))
+    cur_k.store(
+        gl.reshape(gl.join(k_lo, k_hi), [KT, HEAD]).to(kv_dtype).to(gl.bfloat16)
+    )
+    cur_v.store(
+        gl.reshape(gl.join(v_lo, v_hi), [KT, HEAD]).to(kv_dtype).to(gl.bfloat16)
+    )
     v_smem = gl.allocate_shared_memory(gl.bfloat16, [BN, HEAD], plain)
 
     # Row t's first attended key (a sliding layer's window).

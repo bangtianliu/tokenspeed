@@ -45,16 +45,17 @@ def rope_table(positions: int) -> torch.Tensor:
 
 
 def norm_rope(
-    x: torch.Tensor, gain: float, cs: torch.Tensor, rope: bool
+    x: torch.Tensor, gain: float, cs: torch.Tensor, rope: bool, dtype: torch.dtype
 ) -> torch.Tensor:
-    """Per-head RMS norm, then interleaved RoPE: FP32, one BF16 rounding."""
+    """Per-head RMS norm, then interleaved RoPE: FP32, one rounding to
+    ``dtype``."""
     x = x.float()
     y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-5) * gain
     if rope:
         c, s = cs[:32], cs[32:]
         lo, hi = y[..., 0::2], y[..., 1::2]
         y = torch.stack([lo * c - hi * s, hi * c + lo * s], dim=-1).flatten(-2)
-    return y.to(torch.bfloat16)
+    return y.to(dtype)
 
 
 def _online(state, scores, values):
@@ -70,10 +71,12 @@ def _online(state, scores, values):
     return m_new, l * alpha + p.sum(-1), acc
 
 
-def verify_attention(q, keys, values, own_k, own_v, t, first, L0, row_first, splits):
+def verify_attention(
+    q, keys, values, own_k, own_v, t, first, L0, row_first, splits, chunk
+):
     """The monokernel's split attention of row ``t``'s q heads ``q [heads,
     64]`` (of one KV head): the splits share the cached keys ``first .. L0 -
-    1`` (``keys`` / ``values`` ``[L0 - first, 64]``) in chunks of 128, the
+    1`` (``keys`` / ``values`` ``[L0 - first, 64]``) in chunks of ``chunk``, the
     keys before ``row_first`` masked; the last split then takes the launch's
     keys ``0 .. t`` (``own_k`` / ``own_v``) as one more chunk. Then the LSE
     merge. Returns ``[heads, 64]``."""
@@ -92,8 +95,8 @@ def verify_attention(q, keys, values, own_k, own_v, t, first, L0, row_first, spl
             torch.zeros(heads),
             torch.zeros(heads, HEAD),
         )
-        for c0 in range(lo, hi, 128):
-            c1 = min(c0 + 128, hi)
+        for c0 in range(lo, hi, chunk):
+            c1 = min(c0 + chunk, hi)
             state = _online(state, scores[:, c0:c1], values[c0:c1])
         if s == splits - 1:
             own = (q.float() @ own_k[: t + 1].T) * scale
@@ -113,18 +116,27 @@ def attention_z(qkvg, k_cache, v_cache, table, length, window, splits, cs):
     request (``qkvg [rows, 2304]``; row ``t`` at position ``length - 1 +
     t``), and the rows' K, V ``[rows, 2, 64]`` and cache slots.
 
-    ``k_cache`` / ``v_cache``: BF16 ``[slots, 2, 64]`` before the rows' writes.
+    ``k_cache`` / ``v_cache``: ``[slots, 2, 64]`` before the rows' writes, BF16
+    or FP8 e4m3 at unit scale: the rows' K and V round once to that dtype,
+    and attention reads them (and the cache) exactly widened.
     """
     rope = window != 0
+    kv_dtype = k_cache.dtype
     rows = qkvg.shape[0]
     L0 = length - 1
     k = torch.stack(
         [
-            norm_rope(qkvg[t, K_ROW:V_ROW].view(KV_HEADS, HEAD), 1.0, cs[L0 + t], rope)
+            norm_rope(
+                qkvg[t, K_ROW:V_ROW].view(KV_HEADS, HEAD),
+                1.0,
+                cs[L0 + t],
+                rope,
+                kv_dtype,
+            )
             for t in range(rows)
         ]
     )
-    v = qkvg[:, V_ROW:GATE_ROW].view(rows, KV_HEADS, HEAD)
+    v = qkvg[:, V_ROW:GATE_ROW].view(rows, KV_HEADS, HEAD).to(kv_dtype)
     positions = torch.arange(L0, L0 + rows)
     slots = table[positions // PAGE].long() * PAGE + positions % PAGE
     first = max(0, L0 - window + 1) if window else 0
@@ -134,7 +146,11 @@ def attention_z(qkvg, k_cache, v_cache, table, length, window, splits, cs):
     z = torch.empty(rows, HEADS, HEAD)
     for t in range(rows):
         q = norm_rope(
-            qkvg[t, :K_ROW].view(HEADS, HEAD), 5.473006248474121, cs[L0 + t], rope
+            qkvg[t, :K_ROW].view(HEADS, HEAD),
+            5.473006248474121,
+            cs[L0 + t],
+            rope,
+            torch.bfloat16,
         )
         gate = qkvg[t, GATE_ROW:].view(HEADS, HEAD).float()
         row_first = L0 + t - window + 1 if window else 0
@@ -151,6 +167,7 @@ def attention_z(qkvg, k_cache, v_cache, table, length, window, splits, cs):
                 L0,
                 row_first,
                 splits,
+                128,
             )
             a = a.to(torch.bfloat16).float()
             inv = torch.rsqrt(a.pow(2).mean(-1, keepdim=True) + 1e-5)
