@@ -255,7 +255,8 @@ if _muse_spark_layer is not None:
         weights = _muse_spark_weights.pack_layer(**tensors)
         # One scratch serves launches of every row count up to max_rows.
         scratch_pairs = max(
-            _muse_spark_layer.layer_plan(weights.full, rows).scratch_pairs
+            # The scratch's size depends on the rows, not on how they chain.
+            _muse_spark_layer.layer_plan(weights.full, rows, rows).scratch_pairs
             for rows in range(1, max_rows + 1)
         )
         return weights, scratch_pairs, None
@@ -277,6 +278,7 @@ if _muse_spark_layer is not None:
         step: torch.Tensor,
         peer_bases: torch.Tensor,
         layer_index: int,
+        chain: int,
         tap: torch.Tensor | None,
         tap_slot: int | None,
         compile_only: bool,
@@ -288,6 +290,7 @@ if _muse_spark_layer is not None:
             step=step,
             peer_bases=peer_bases,
             layer=layer_index,
+            chain=chain,
             tap=tap,
             tap_slot=tap_slot,
             trace_buf=None,

@@ -20,15 +20,17 @@
 
 """Attention of one Muse Spark rank: 16 q heads, 2 KV heads.
 
-The launch's rows are one request's consecutive tokens (``Plan.chain``):
-one row for decode, ``k + 1`` for a speculative verify of ``k`` draft
-tokens. Row ``t`` is the token at position ``L0 + t``.
+The launch's rows are the consecutive tokens of one or more requests
+(``Plan.chain`` a request): one row a request for decode, ``k + 1`` for a
+speculative verify of ``k`` draft tokens. Row ``t`` of a request is its
+token at position ``L0 + t``, where ``L0`` is the request's own.
 
 * head, 2 tasks per row: KV head ``g``. The per-head RMS norm of k in FP32
   (gain 1), then interleaved RoPE (GPT-J pairs) on sliding layers, then one
   BF16 rounding; the rotated k and the raw v go to the KV cache slot of the
   row's token.
-* attn, ``2 * SPLITS`` tasks: KV head ``g``, split ``s``, for every row. A
+* attn, ``2 * SPLITS`` tasks a request: KV head ``g``, split ``s``, for every
+  row of the request (its length and page table row are its own). A
   task forms the rotated q of its 8 q heads (q gain 5.473) of every row,
   one MFMA row per (row, head), and the launch's k and v itself, as head
   does, from the projection: no hand-off between them. It takes the
@@ -83,15 +85,17 @@ def regions(splits: int) -> tuple[tuple[str, int], ...]:
     )
 
 
-def stages(bases: dict[str, int], splits: int, rows: int) -> tuple[Stage, ...]:
-    """Head, attn and merge of ``rows`` token rows of one request, placed by
-    ``bases``."""
+def stages(
+    bases: dict[str, int], splits: int, rows: int, chain: int
+) -> tuple[Stage, ...]:
+    """Head, attn and merge of ``rows`` token rows (requests of ``chain``
+    tokens), placed by ``bases``."""
     head, attn, merge = placement(bases, ("head", "attn", "merge"))
     return (
         Stage("head", int(HEAD_TASKS) * rows, head, reads=("qkvg",)),
         Stage(
             "attn",
-            int(KV_HEADS) * splits,
+            rows // chain * int(KV_HEADS) * splits,
             attn,
             reads=("qkvg",),
             writes=("part", "lse"),
@@ -273,6 +277,7 @@ def attn_stage(
     task,
     seq_len,
     table,
+    table_stride,
     k_cache,
     v_cache,
     cos_sin,
@@ -281,26 +286,29 @@ def attn_stage(
     WINDOW: gl.constexpr,
     STAGE: gl.constexpr,
 ):
-    """Attn task ``task`` = (KV head ``task // SPLITS``, split ``task % SPLITS``)
-    of every row.
+    """Attn task ``task`` = (request ``task // (2 SPLITS)``, KV head, split)
+    of every row of the request.
 
     Args:
-        seq_len: int32 ``[rows]``, as head_stage takes it (row 0's is read).
-        table: int32 page table of the request (``PAGE`` tokens a page).
+        seq_len: int32 ``[rows]``, as head_stage takes it (the request's
+            first row's is read).
+        table: int32 page tables of the requests, one row each (``PAGE``
+            tokens a page), ``table_stride`` apart.
         cos_sin, ROPE: As head_stage takes them.
         WINDOW: Attended positions of a sliding layer, 0 on a full layer.
     """
     C: gl.constexpr = schedule.chain(mb.plan)
-    gl.static_assert(
-        schedule.rows(mb.plan) == C, "attention serves the rows of one request"
-    )
     gl.static_assert(C <= 16, "the launch's keys are one chunk of 16")
     # One MFMA row per (row, q head): rows past C * GROUP are zero.
     QM: gl.constexpr = max(16, triton.next_power_of_2(C * GROUP))
     KT: gl.constexpr = 16  # the launch's keys, rows past C zero
     mb.stamp(STAGE, trace.START)
-    g = task // SPLITS
+    req = task // (KV_HEADS * SPLITS)
+    g = task % (KV_HEADS * SPLITS) // SPLITS
     s = task % SPLITS
+    # The request's rows and its page table row.
+    base = req * C
+    table = table + req.to(gl.int64) * table_stride
     nw: gl.constexpr = gl.num_warps()
     qk_mma: gl.constexpr = _layouts(nw)[0]
     pv_mma: gl.constexpr = _layouts(nw)[1]
@@ -310,7 +318,7 @@ def attn_stage(
     p_layout: gl.constexpr = gl.DotOperandLayout(0, pv_mma, 4)
     v_layout: gl.constexpr = gl.DotOperandLayout(1, pv_mma, 4)
 
-    L0 = gl.load(seq_len) - 1
+    L0 = gl.load(seq_len + base) - 1
     # The cached keys of the splits: from row 0's first key, before L0.
     if WINDOW == 0:
         first = 0
@@ -349,16 +357,16 @@ def attn_stage(
     got_q, got_k, got_v = mb.poll_many(
         ("qkvg", "qkvg", "qkvg"),
         (
-            mb.row_offset(q_tok)[:, :, None]
+            mb.row_offset(base + q_tok)[:, :, None]
             + _pair_index(
                 qp[:, :, None],
                 eq,
                 GATE_ROW,
                 ((g * GROUP + q_head) * HEAD)[:, :, None],
             ),
-            mb.row_offset(k_tok)[:, :, None]
+            mb.row_offset(base + k_tok)[:, :, None]
             + _pair_index(qp[:, :, None], eq, GATE_ROW, K_ROW + g * HEAD),
-            mb.row_offset(k_tok)[:, :, None]
+            mb.row_offset(base + k_tok)[:, :, None]
             + _pair_index(qp[:, :, None], eq, GATE_ROW, V_ROW + g * HEAD),
         ),
     )
@@ -437,13 +445,13 @@ def attn_stage(
     part = ((s * KV_HEADS + g) * GROUP + r[:, None] % GROUP) * HEAD + c[None, :]
     mb.put(
         "part",
-        mb.row_offset(r[:, None] // GROUP) + part,
+        mb.row_offset(base + r[:, None] // GROUP) + part,
         out.to(gl.int32, bitcast=True),
         mask=(r < C * GROUP)[:, None] & (c >= 0)[None, :],
     )
     mb.put(
         "lse",
-        mb.row_offset(qi // GROUP) + s * Q_HEADS + g * GROUP + qi % GROUP,
+        mb.row_offset(base + qi // GROUP) + s * Q_HEADS + g * GROUP + qi % GROUP,
         lse.to(gl.int32, bitcast=True),
         mask=qi < C * GROUP,
     )

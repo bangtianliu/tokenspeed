@@ -625,6 +625,8 @@ def launch_gluon_muse_spark_draft_layer_gfx950(
         written.data_ptr(),
     }:
         raise ValueError("the outputs must not alias the inputs")
+    if k_cache.dtype != torch.bfloat16 or v_cache.dtype != torch.bfloat16:
+        raise ValueError("k_cache, v_cache: BF16 (the kernel reads BF16 keys)")
     if not 0 <= layer < int(DRAFT_LAYERS):
         raise ValueError(f"layer {layer} out of range({int(DRAFT_LAYERS)})")
     plan = layer_plan(rows, last)

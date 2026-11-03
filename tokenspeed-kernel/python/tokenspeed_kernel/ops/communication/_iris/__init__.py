@@ -38,8 +38,8 @@ logger = logging.getLogger(__name__)
 
 MIN_HEAP_BYTES = 256 << 20
 # Heap beyond the communication buffers. The decode monokernels' mailbox
-# scratch lives here: Muse Spark's target layers take 12.8 MiB and its DFlash2
-# draft layers 17 MiB more.
+# scratch lives here: Muse Spark's target layers take 12.8 MiB (8 rows; 25.7
+# MiB for 16) and its DFlash2 draft launches 22 MiB more.
 HEAP_HEADROOM_BYTES = 48 << 20
 _context = None
 _heap_size: int | None = None

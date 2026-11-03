@@ -155,6 +155,7 @@ def _operands(rank: int, length: int, rows: int, experts: int, dev):
         (pos + 1).to(torch.int32).to(dev),
         slots.to(torch.int32).to(dev),
         sh["table"].to(dev),
+        sh["table"].numel(),  # one request: the page table row stride
         w["k_cache"].to(dev),
         w["v_cache"].to(dev),
         ref.rope_table(end + 1).to(dev),
@@ -237,7 +238,7 @@ def worker(rank: int, port: int, args) -> None:
     dev = torch.device(f"cuda:{rank}")
     ctx = get_or_create_context(heap_size=256 << 20)
     group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
-    plan = layer.layer_plan(args.full, args.rows)
+    plan = layer.layer_plan(args.full, args.rows, args.rows)
     scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
     ghost = torch.zeros_like(scratch)
     bases = torch.empty(TP, dtype=torch.int64, device=dev)
@@ -293,6 +294,7 @@ def worker(rank: int, port: int, args) -> None:
             trace_buf,
             rank,
             args.full,
+            args.rows,
             args.rows,
             False,
         )
