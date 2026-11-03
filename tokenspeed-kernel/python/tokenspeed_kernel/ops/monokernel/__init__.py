@@ -45,9 +45,11 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
     "FusedDecodeLayer",
+    "muse_spark_draft_context_decode",
     "muse_spark_draft_head_decode",
     "muse_spark_draft_layer_decode",
     "muse_spark_layer_decode",
+    "prepare_muse_spark_draft_context",
     "prepare_muse_spark_draft_head",
     "prepare_muse_spark_draft_layer",
     "prepare_muse_spark_experts",
@@ -457,6 +459,94 @@ def muse_spark_layer_decode(
         step=step,
         peer_bases=peer_bases,
         layer_index=layer_index,
+        compile_only=compile_only,
+    )
+
+
+def prepare_muse_spark_draft_context(
+    *,
+    tensors: dict[str, torch.Tensor],
+    rank: int,
+    max_rows: int,
+    override: str | None = None,
+) -> FusedDecodeLayer | None:
+    """Pack one TP8 rank's DFlash2 context write (``fc`` and ``hidden_norm``
+    of the target's taps, then every draft layer's K and V into the draft
+    cache) for its monokernel.
+
+    Args:
+        tensors: The rank's weights by role (see
+            ``tokenspeed_kernel_amd...muse_spark.draft_context
+            .pack_draft_context``).
+        rank: The rank in the TP8 group.
+        max_rows: The verify rows of one request.
+        override: Optional registered kernel name to force.
+
+    Returns:
+        The packed write, or None when no monokernel serves ``max_rows``
+        here.
+    """
+    try:
+        prepare = _select("muse_spark_draft_context_prepare", max_rows, override)
+        decode = _select("muse_spark_draft_context_decode", max_rows, override)
+    except NoKernelFoundError:
+        if override is not None:
+            raise
+        return None
+    weights, scratch_pairs, late_weights = prepare(
+        tensors=tensors, rank=rank, max_rows=max_rows
+    )
+    return FusedDecodeLayer(
+        decode=decode,
+        weights=weights,
+        scratch_pairs=scratch_pairs,
+        late_weights=late_weights,
+    )
+
+
+def muse_spark_draft_context_decode(
+    context: FusedDecodeLayer,
+    *,
+    taps: torch.Tensor,
+    positions: torch.Tensor,
+    slots: torch.Tensor,
+    k_caches: tuple[torch.Tensor, ...],
+    v_caches: tuple[torch.Tensor, ...],
+    cos_sin: torch.Tensor,
+    scratch: torch.Tensor,
+    step: torch.Tensor,
+    peer_bases: torch.Tensor,
+    compile_only: bool,
+) -> None:
+    """The DFlash2 context write of one request's verify rows, on every rank
+    of the TP8 group at once (the launches exchange the norm).
+
+    Args:
+        context: From :func:`prepare_muse_spark_draft_context`.
+        taps: BF16 ``[rows, 40960]``: the target's tapped hidden states.
+        positions: int32 or int64 ``[rows]``: the rows' positions.
+        slots: int32 or int64 ``[rows]``: the rows' draft cache slots.
+        k_caches, v_caches: The draft layers' BF16 ``[slots, 1, 128]``
+            caches of the rank's KV head.
+        cos_sin: FP32 ``[positions, 128]`` RoPE table, cos then sin.
+        scratch: int64 mailbox scratch of at least ``context.scratch_pairs``
+            on the Iris symmetric heap.
+        step: int32 ``[1]`` counter that changes from launch to launch.
+        peer_bases: int64 ``[8]`` Iris heap bases of the group's ranks.
+        compile_only: Only compile the launch for these operands (compile on
+            every rank, synchronize the ranks, then launch).
+    """
+    context.decode(
+        weights=context.weights,
+        taps=taps,
+        positions=positions,
+        slots=slots,
+        k_caches=k_caches,
+        v_caches=v_caches,
+        cos_sin=cos_sin,
+        scratch=scratch,
+        step=step,
+        peer_bases=peer_bases,
         compile_only=compile_only,
     )
 

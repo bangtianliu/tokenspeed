@@ -698,6 +698,15 @@ class DFlash(BaseDrafter):
             self._kv_aux_stream = torch.cuda.Stream(device=self.device)
             self._kv_fork_event = torch.cuda.Event()
             self._kv_join_event = torch.cuda.Event()
+            # The aux stream runs its first BLAS GEMM under graph capture when
+            # no eager round wrote the context on it (the graph phase's warm-up
+            # writes on the main stream; a monokernel writes one request's).
+            # hipBLASLt sets up a stream on its first GEMM there, which a
+            # capture refuses: set it up now.
+            warm = torch.zeros(16, 16, dtype=torch.bfloat16, device=self.device)
+            with torch.cuda.stream(self._kv_aux_stream):
+                torch.mm(warm, warm)
+            torch.cuda.current_stream().wait_stream(self._kv_aux_stream)
         if self.draft_model_runner.mapping.attn.kvp_size > 1:
             # The fused scatter takes physical slots and has no ownership
             # mask; the per-layer writer translates through the placement.

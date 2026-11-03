@@ -88,6 +88,7 @@ docstring gives its math and task split):
 | `moe_experts.py` | ex1, ex2 | The MXFP4 experts, each rank's 512 of 4096 intermediate values. The rows' distinct experts are slots: each streams once for every row that picked it. |
 | `moe_tail.py` | comb1, comb2, unpool, fin, out | Combine the routes, the post-expert projection, the post-FFN norm, residual gate and the next layer's input norm. |
 | `draft_layer.py` | both halves in one plan | A whole DFlash2 draft layer as one launch: the attention half hands its partial to the MLP half's owners through the mailbox (afin in place of scat) and the residual between the two sums stays in registers. The last layer's launch also runs the draft's final norm (fin puts its partial to the owners; fsum, fnorm and fout store the normed rows on every rank). Served with `--decode-monokernel` for one request's draft block (`python/tokenspeed/runtime/models/dflash2_monokernel.py`). |
+| `draft_context.py` | fc, fsum, fnorm, kv, kvout | The DFlash2 context write after a verify as one launch: the rank's eighth of `fc` over the target's 5 taps (K split over all CTAs), `hidden_norm` with the sum of squares exchanged, then every draft layer's K and V of the rank's KV head (k RMSNorm and RoPE) into the draft cache. Served with the draft layers. |
 | `draft_head.py` | lmh, hproj, merge1, merge2, score | The DFlash2 draft head as one launch: the logits of the rank's 25256-row LM-head shard with each draft step's best 16 a task, the rank's best 16 put to every rank, the sorted best 16 of the 8 ranks (softcapped), and the candidate selector's 16 x 16 edge scores. Served with the draft layers. |
 | `draft_attn.py` | head, attn, merge (with draft_mlp's sum, norm, coefficient, convolution and projection stages around them) | The attention half of a DFlash2 draft layer: the input norm of the ranks' sum, the attention convolution, qkv, the per-head q / k RMSNorm and RoPE with the KV write, non-causal block attention over the window from the paged cache, `o_proj` and the convolution after it, ending in this rank's partial. Served as part of `draft_layer.py`. |
 | `draft_mlp.py` | scat, sum1, norm, coef, conv0, gu, act, down, fin | The MLP half of a DFlash2 draft layer (Muse Spark's draft, TP8): the ranks' sum of the attention partials, the residual add and post-attention norm, the convolution coefficients, the convolutions around the MLP, gate/up, `silu(g) u` and down, ending in this rank's partial. Served as part of `draft_layer.py`. |
@@ -129,7 +130,7 @@ docstring gives its math and task split):
 | `dims.py` | The dimensions that several modules use. |
 | `qkvg.py`, `attention.py`, `attn_tail.py` | The attention stages. |
 | `moe_route.py`, `moe_pool.py`, `moe_experts.py`, `moe_tail.py` | The MoE stages and the layer boundary. |
-| `draft_mlp.py`, `draft_attn.py`, `draft_layer.py`, `draft_head.py` | The DFlash2 draft layer's MLP and attention halves, the whole layer in one plan, and the draft head. |
+| `draft_mlp.py`, `draft_attn.py`, `draft_layer.py`, `draft_head.py`, `draft_context.py` | The DFlash2 draft layer's MLP and attention halves, the whole layer in one plan, the draft head and the context write. |
 | `weights.py` | Host packing of the layer weights. |
 
 ## Tests
@@ -147,6 +148,7 @@ QKVG and attention tests need 8 GPUs.
 | `test_muse_spark_experts_gfx950.py` | The experts, on the regular path's preprocessed weights. |
 | `test_muse_spark_moe_tail_gfx950.py` | The combine, post-expert projection and boundary. |
 | `test_muse_spark_draft_layer_gfx950.py` | The whole DFlash2 draft layer in one launch across the 8 ranks: the attention half's output, the hand-off to the MLP half (its input is the ranks' sum of every rank's attention partial) and the MLP half's stages; the last layer's final norm. |
+| `test_muse_spark_draft_context_gfx950.py` | The context write in one launch across the 8 ranks: every layer's K and V at the rows' slots against fc, hidden_norm and the K/V projection with k RMSNorm and RoPE. |
 | `test_muse_spark_draft_head_gfx950.py` | The draft head in one launch across the 8 ranks: a valid top 16 of every step (BF16 ties may pick other tokens of the same value), the same on every rank, sorted with ties by token id, and the selector's scores of those candidates. |
 | `test_muse_spark_draft_attn_gfx950.py` | The draft's head stage and block attention on one GPU (window cut, short and empty prefixes), and the whole attention half in one launch across the 8 ranks, each stage on the kernel's own input. |
 | `test_muse_spark_draft_mlp_gfx950.py` | The DFlash2 draft's MLP half in one launch across the 8 ranks, each stage on the kernel's own input against `dflash2_draft_reference.py` (the regular path's rounding points). |

@@ -172,6 +172,33 @@ class DFlash2(DFlash):
                 softcap=self.final_logit_softcapping,
             )
 
+    @override
+    def _write_native_cache(
+        self,
+        target_hidden: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_cache_locs: torch.Tensor,
+        decode_only: bool = False,
+    ) -> None:
+        """The context write, as one launch for one request's verify rows
+        under --decode-monokernel."""
+        monokernels = self.model.monokernels
+        if (
+            monokernels is not None
+            and decode_only
+            and monokernels.serves_context(int(target_hidden.shape[0]))
+        ):
+            monokernels.write_context(
+                target_hidden,
+                target_positions,
+                target_cache_locs,
+                self.token_to_kv_pool,
+            )
+            return
+        super()._write_native_cache(
+            target_hidden, target_positions, target_cache_locs, decode_only=decode_only
+        )
+
     def _compute_candidates(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
