@@ -53,7 +53,12 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import HIDDEN, 
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Plan
 
 SLIDING_SPLITS = 16
-FULL_SPLITS = 64
+# A full layer's attention splits: one request's tasks (2 KV heads x splits)
+# fill the grid, so at long context each walks half the keys that 64 splits
+# leave it (a full layer at 200k keys: 156 vs 192 us). Several requests' tasks
+# run in rounds: the splits, and so each request's sums, do not depend on how
+# many requests share the launch.
+FULL_SPLITS = 128
 WINDOW = attention.WINDOW
 
 # The first placement: weight-heavy stages on the CTAs that finish their
@@ -235,11 +240,13 @@ def gluon_muse_spark_layer_gfx950(
         attention.head_stage(
             mb, task, seq_len, slot, k_cache, v_cache, cos_sin, ROPE, "head"
         )
-    task, active = schedule.stage_task(PLAN, "attn")
-    if active:
+    # Several requests' attention tasks may outnumber the CTAs: rounds.
+    G: gl.constexpr = schedule.grid(PLAN)
+    attn_task, attn_rounds = schedule.stage_rounds(PLAN, "attn")
+    for i in range(attn_rounds):
         attention.attn_stage(
             mb,
-            task,
+            attn_task + i * G,
             seq_len,
             page_table,
             table_stride,
