@@ -196,6 +196,15 @@ def scat_stage(mb, task, z, RANK: gl.constexpr, RED: gl.constexpr, STAGE: gl.con
 
 
 @gluon.jit
+def residual_zeros():
+    """Zeros in the layout of :func:`sum_norm_regs`' residual (even or odd
+    owned columns of one sum task), for a CTA that has no such task."""
+    nw: gl.constexpr = gl.num_warps()
+    rl: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [1, nw], [1, 0])
+    return gl.zeros([SUM_COLS // 2], gl.float32, gl.SliceLayout(0, rl))
+
+
+@gluon.jit
 def sum_norm_stages(
     mb,
     task,
@@ -208,18 +217,106 @@ def sum_norm_stages(
     HIN: gl.constexpr,
     SUM: gl.constexpr,
     NORM: gl.constexpr,
+    STORE: gl.constexpr,
 ):
-    """Tasks ``task`` of sum1 and norm: owned columns ``128 (task % 8) ..``
-    (of the rank's 1024) of row ``task // 8``.
+    """Tasks ``task`` of the sum and the norm (stages ``SUM``, ``NORM``):
+    owned columns ``128 (task % 8) ..`` (of the rank's 1024) of row
+    ``task // 8``, with the residual from memory (:func:`sum_norm_regs`).
 
     Args:
-        residual: BF16 ``[rows, 8192]`` residual before the attention
-            sublayer (the same on every rank).
-        residual_out: BF16 ``[rows, 8192]``; this rank stores its owned
-            columns of the residual after the attention sublayer.
-        gain: FP32 ``[1024]`` post-attention norm gain, owned columns.
+        residual: BF16 ``[rows, 8192]`` residual before the sublayer (the
+            same on every rank), written by an earlier launch.
+        residual_out: BF16 ``[rows, 8192]``; with ``STORE`` this rank stores
+            its owned columns of the residual after the sublayer.
+        gain: FP32 ``[1024]`` norm gain, owned columns.
+
+    Returns:
+        The residual after the sublayer, as :func:`sum_norm_regs`.
     """
     mb.stamp(SUM, trace.START)
+    row, t, _ = schedule.row_task(mb.plan, task, SUM_TASKS)
+    nw: gl.constexpr = gl.num_warps()
+    rl: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [1, nw], [1, 0])
+    j = gl.arange(0, SUM_COLS // 2, gl.SliceLayout(0, rl))
+    at = row * HIDDEN + RANK * OWNED + t * SUM_COLS + 2 * j
+    res_lo = gl.load(residual + at).to(gl.float32)
+    res_hi = gl.load(residual + at + 1).to(gl.float32)
+    return _sum_norm(
+        mb,
+        task,
+        res_lo,
+        res_hi,
+        residual_out,
+        gain,
+        RANK,
+        RED,
+        SS,
+        HIN,
+        SUM,
+        NORM,
+        STORE,
+    )
+
+
+@gluon.jit
+def sum_norm_regs(
+    mb,
+    task,
+    res_lo,
+    res_hi,
+    residual_out,
+    gain,
+    RANK: gl.constexpr,
+    RED: gl.constexpr,
+    SS: gl.constexpr,
+    HIN: gl.constexpr,
+    SUM: gl.constexpr,
+    NORM: gl.constexpr,
+    STORE: gl.constexpr,
+):
+    """:func:`sum_norm_stages` with the residual from registers: the even and
+    odd owned columns that an earlier sum task of this CTA returned (a CTA
+    never reads another CTA's store of the same launch, so the stages that
+    pass the residual on run on the same CTAs).
+
+    Returns:
+        ``(res_lo, res_hi)``: the residual after the sublayer, BF16-rounded
+        (FP32), as the regular path stores it.
+    """
+    mb.stamp(SUM, trace.START)
+    return _sum_norm(
+        mb,
+        task,
+        res_lo,
+        res_hi,
+        residual_out,
+        gain,
+        RANK,
+        RED,
+        SS,
+        HIN,
+        SUM,
+        NORM,
+        STORE,
+    )
+
+
+@gluon.jit
+def _sum_norm(
+    mb,
+    task,
+    res_lo,
+    res_hi,
+    residual_out,
+    gain,
+    RANK: gl.constexpr,
+    RED: gl.constexpr,
+    SS: gl.constexpr,
+    HIN: gl.constexpr,
+    SUM: gl.constexpr,
+    NORM: gl.constexpr,
+    STORE: gl.constexpr,
+):
     row, task, _ = schedule.row_task(mb.plan, task, SUM_TASKS)
     mb = mb.row(row)
     nw: gl.constexpr = gl.num_warps()
@@ -230,8 +327,6 @@ def sum_norm_stages(
     # start only when the poll returns.
     c = task * SUM_COLS + 2 * j  # owned column of the low half
     at = row * HIDDEN + RANK * OWNED + c
-    res_lo = gl.load(residual + at).to(gl.float32)
-    res_hi = gl.load(residual + at + 1).to(gl.float32)
     gain_lo = gl.load(gain + c)
     gain_hi = gl.load(gain + c + 1)
     (got,) = mb.poll_many(
@@ -249,8 +344,9 @@ def sum_norm_stages(
     # The all-reduce returns BF16; the norm then adds the residual in FP32.
     lo = lo.to(gl.bfloat16).to(gl.float32) + res_lo
     hi = hi.to(gl.bfloat16).to(gl.float32) + res_hi
-    gl.store(residual_out + at, lo.to(gl.bfloat16))
-    gl.store(residual_out + at + 1, hi.to(gl.bfloat16))
+    if STORE:
+        gl.store(residual_out + at, lo.to(gl.bfloat16))
+        gl.store(residual_out + at + 1, hi.to(gl.bfloat16))
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
     one = gl.arange(0, 1, lanes)
     total = gl.sum(lo * lo + hi * hi, axis=0)
@@ -271,6 +367,7 @@ def sum_norm_stages(
     for p in gl.static_range(WORLD):
         mb.put_peer(HIN, p, RANK * (OWNED // 2) + c // 2, word)
     mb.stamp(NORM, trace.END)
+    return lo.to(gl.bfloat16).to(gl.float32), hi.to(gl.bfloat16).to(gl.float32)
 
 
 @gluon.jit
@@ -492,17 +589,17 @@ def act_stage(mb, task, STAGE: gl.constexpr):
 
 
 @gluon.jit
-def fin_stage(
+def _fin_values(
     mb,
     task,
     base,
-    out,
     SRC: gl.constexpr,
     KP: gl.constexpr,
     CPART: gl.constexpr,
+    COLS: gl.constexpr,
     STAGE: gl.constexpr,
 ):
-    """Fin task ``task``: columns ``32 task ..`` of every row.
+    """Fin task ``task``: columns ``COLS task ..`` of every row.
 
     Args:
         base: BF16 ``[2, 2, 8192]`` ``base_kernel`` (side, tap, channel).
@@ -513,18 +610,18 @@ def fin_stage(
     mb.stamp(STAGE, trace.START)
     nw: gl.constexpr = gl.num_warps()
     KQ: gl.constexpr = triton.next_power_of_2(KP)
-    ll: gl.constexpr = kq_layout(KQ, FIN_COLS, nw)
+    ll: gl.constexpr = kq_layout(KQ, COLS, nw)
     r = gl.arange(0, RP, gl.SliceLayout(1, gl.SliceLayout(2, ll)))[:, None, None]
     k = gl.arange(0, KQ, gl.SliceLayout(0, gl.SliceLayout(2, ll)))[None, :, None]
-    n = gl.arange(0, FIN_COLS, gl.SliceLayout(0, gl.SliceLayout(1, ll)))[None, None, :]
+    n = gl.arange(0, COLS, gl.SliceLayout(0, gl.SliceLayout(1, ll)))[None, None, :]
     sl: gl.constexpr = gl.SliceLayout(1, ll)
     r2 = gl.arange(0, RP, gl.SliceLayout(1, sl))[:, None]
-    c2 = task * FIN_COLS + gl.arange(0, FIN_COLS, gl.SliceLayout(0, sl))[None, :]
+    c2 = task * COLS + gl.arange(0, COLS, gl.SliceLayout(0, sl))[None, :]
     b0 = gl.load(base + 2 * HIDDEN + c2).to(gl.float32)  # side 1, tap 0
     b1 = gl.load(base + 3 * HIDDEN + c2).to(gl.float32)  # side 1, tap 1
     rc = gl.minimum(r, R - 1)
     rp = gl.maximum(rc - 1, 0)
-    col = gl.minimum(k, KP - 1) * HIDDEN + task * FIN_COLS + n
+    col = gl.minimum(k, KP - 1) * HIDDEN + task * COLS + n
     rc2 = gl.minimum(r2, R - 1)
     g2 = c2 // GROUP_SIZE
     # Side 1's coefficients: tap 0 at 2 GROUPS + g, tap 1 at 3 GROUPS + g.
@@ -542,5 +639,62 @@ def fin_stage(
     dp = dp.to(gl.bfloat16).to(gl.float32)
     live = (rc2 % BLOCK) >= 1
     y = (b0 + t0) * d + gl.where(live, (b1 + t1) * dp, 0.0)
+    return r2, c2, y
+
+
+@gluon.jit
+def fin_stage(
+    mb,
+    task,
+    base,
+    out,
+    SRC: gl.constexpr,
+    KP: gl.constexpr,
+    CPART: gl.constexpr,
+    COLS: gl.constexpr,
+    STAGE: gl.constexpr,
+):
+    """Fin task ``task`` (:func:`_fin_values`), stored in ``out``, BF16
+    ``[rows, 8192]``: this rank's partial of the half, for a later launch."""
+    R: gl.constexpr = schedule.rows(mb.plan)
+    r2, c2, y = _fin_values(mb, task, base, SRC, KP, CPART, COLS, STAGE)
     gl.store(out + r2 * HIDDEN + c2, y.to(gl.bfloat16), mask=(r2 < R) & (c2 >= 0))
+    mb.stamp(STAGE, trace.END)
+
+
+@gluon.jit
+def fin_to_owners(
+    mb,
+    task,
+    base,
+    SRC: gl.constexpr,
+    KP: gl.constexpr,
+    CPART: gl.constexpr,
+    COLS: gl.constexpr,
+    RANK: gl.constexpr,
+    RED: gl.constexpr,
+    STAGE: gl.constexpr,
+):
+    """Fin task ``task`` (:func:`_fin_values`) put into the owner rank's
+    ``RED`` slot of this rank, as scat would: the next sum in the same
+    launch reads it from there."""
+    R: gl.constexpr = schedule.rows(mb.plan)
+    RP: gl.constexpr = triton.next_power_of_2(R)
+    r2, c2, y = _fin_values(mb, task, base, SRC, KP, CPART, COLS, STAGE)
+    pairs: gl.constexpr = gl.BlockedLayout(
+        [1, 2], [64 // (COLS // 2), COLS // 2], [gl.num_warps(), 1], [1, 0]
+    )
+    values = gl.convert_layout(y.to(gl.bfloat16), pairs)
+    word = gl.reshape(
+        mx.pack_bf16_pairs(gl.reshape(values, [RP, COLS // 2, 2])),
+        [RP, COLS // 2],
+    )
+    wl: gl.constexpr = word.type.layout
+    r = gl.arange(0, RP, gl.SliceLayout(1, wl))[:, None]
+    p = gl.arange(0, COLS // 2, gl.SliceLayout(0, wl))[None, :]
+    col0 = task * COLS
+    at = RANK * (OWNED // 2) + (col0 % OWNED) // 2 + p
+    mb.put_peer(
+        RED, col0 // OWNED, mb.row_offset(r) + at, word, mask=(r < R) & (p >= 0)
+    )
     mb.stamp(STAGE, trace.END)

@@ -340,6 +340,7 @@ def attn_half_kernel(
             "ahin",
             "isum1",
             "inorm",
+            True,
         )
     task, active = schedule.stage_task(PLAN, "acoef")
     if active:
@@ -391,7 +392,15 @@ def attn_half_kernel(
     task, active = schedule.stage_task(PLAN, "afin")
     if active:
         draft_mlp.fin_stage(
-            mb, task, base, out, "opart", draft_attn.OPROJ_KPARTS, "acpart", "afin"
+            mb,
+            task,
+            base,
+            out,
+            "opart",
+            draft_attn.OPROJ_KPARTS,
+            "acpart",
+            draft_attn.AFIN_COLS,
+            "afin",
         )
 
 
