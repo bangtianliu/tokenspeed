@@ -615,6 +615,9 @@ class MonokernelStep:
             chain=self._chain,
             tap=None,
             tap_slot=None,
+            # The next fused layer's QKVG weights, warmed into the MALL after
+            # this launch's experts.
+            warm_next=monokernels.fused.get(index + 1),
         )
         slot_of_next = monokernels.tap_slots.get(index + 1)
         if self._store_taps and slot_of_next is not None:

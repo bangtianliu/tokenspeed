@@ -413,6 +413,7 @@ def muse_spark_layer_decode(
     chain: int,
     tap: torch.Tensor | None,
     tap_slot: int | None,
+    warm_next: FusedDecodeLayer | None,
     compile_only: bool,
 ) -> None:
     """One step of a packed Muse Spark layer for the rows of one or more
@@ -449,6 +450,10 @@ def muse_spark_layer_decode(
             layer (BF16) into slot ``tap_slot`` of every rank's copy, the
             tap a draft reads.
         tap_slot: The tap's slot, or None without ``tap``.
+        warm_next: None, or the next layer's prepared launch (from
+            :func:`prepare_muse_spark_layer`) that follows this one: this
+            launch reads its QKVG weights into the memory-side cache after
+            the experts, so the next launch's projections read the MALL.
         compile_only: Only compile the launch for these operands, without
             running it. A launch polls its peers' values for a few seconds
             before it traps, so a rank that compiles much longer than its
@@ -474,6 +479,7 @@ def muse_spark_layer_decode(
         chain=chain,
         tap=tap,
         tap_slot=tap_slot,
+        warm_next=None if warm_next is None else warm_next.weights,
         compile_only=compile_only,
     )
 
