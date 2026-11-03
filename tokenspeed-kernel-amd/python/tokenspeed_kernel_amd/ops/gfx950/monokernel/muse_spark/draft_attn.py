@@ -30,7 +30,8 @@ stages below, oproj, and afin (the convolution after the output projection).
 A rank holds 8 query heads and one KV head of 128 (64 / 8 heads). The block
 of 8 rows a request is non-causal and every row shares one window, as in the
 regular draft (``attention/backends/paged/mha.py``, block decode): the keys
-``[seq_len - 2049, seq_len)``, the block's 8 and the 2041 before them.
+``[seq_len - 2048, seq_len)``, the block's 8 and the 2040 before them (the
+layers' ``window_left`` of 2047 plus the row's own key).
 
 * head, 10 tasks per row (8 q heads, then k, then v): the qkv projection's K
   parts summed and rounded once to BF16 (the projection's output), then for q
@@ -41,8 +42,8 @@ regular draft (``attention/backends/paged/mha.py``, block decode): the keys
   from the mailbox, since a CTA never reads another CTA's store of the same
   launch.
 * attn, ``SPLITS`` tasks: one task per split of the cached keys
-  ``[max(seq_len - 2049, 0), seq_len - 8)``, ``ceil(n / SPLITS)`` each, one
-  chunk of at most 128 (16 splits hold the 2041) with a base-2 softmax; every row's 8 heads are one
+  ``[max(seq_len - 2048, 0), seq_len - 8)``, ``ceil(n / SPLITS)`` each, one
+  chunk of at most 128 (16 splits hold the 2040) with a base-2 softmax; every row's 8 heads are one
   MFMA row each (64 rows). The last split also takes the block's 8 keys from
   ``kb`` / ``vb``, as one more chunk, for every row (non-causal). A task
   publishes FP32 ``acc / l`` and the LSE (``-inf`` for an empty split).
@@ -71,7 +72,7 @@ PAGE = gl.constexpr(64)  # tokens a KV page
 BN = gl.constexpr(128)  # keys a chunk
 QM = gl.constexpr(64)  # MFMA rows of attention: 8 block rows x 8 heads
 KT = gl.constexpr(16)  # MFMA rows of the block's keys (8, the rest zero)
-WINDOW_KEYS = gl.constexpr(2049)  # every row's keys: the window and its own
+WINDOW_KEYS = gl.constexpr(2048)  # every row's keys: the window and its own
 BLOCK_ROWS = gl.constexpr(8)  # rows of a draft block
 # exp2 softmax of (q . k) / sqrt(128).
 QK_SCALE = gl.constexpr(0.08838834764831845 * 1.4426950408889634)
@@ -185,7 +186,7 @@ def head_stage(
         q_norm, k_norm: BF16 ``[128]`` per-head RMSNorm weights.
         cos_sin: FP32 ``[positions, 128]`` RoPE table, cos then sin.
         positions: int32 ``[rows]`` the rows' positions.
-        slots: int64 ``[rows]`` the rows' cache slots.
+        slots: int32 or int64 ``[rows]`` the rows' cache slots.
         k_cache, v_cache: BF16 ``[slots, 1, 128]`` this layer's cache.
     """
     mb.stamp(STAGE, trace.START)
@@ -208,7 +209,7 @@ def head_stage(
     position = gl.load(positions + row)
     cos = gl.load(cos_sin + position.to(gl.int64) * HEAD + i)
     sin = gl.load(cos_sin + position.to(gl.int64) * HEAD + HALF + i)
-    slot = gl.load(slots + row)
+    slot = gl.load(slots + row).to(gl.int64)
     at = k * QKV + head * HEAD + i[None, :]
     lo_w, hi_w = mb.poll_many(("qpart", "qpart"), (at, at + HALF))
     mb.stamp(STAGE, trace.READY)

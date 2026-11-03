@@ -45,7 +45,9 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
     "FusedDecodeLayer",
+    "muse_spark_draft_layer_decode",
     "muse_spark_layer_decode",
+    "prepare_muse_spark_draft_layer",
     "prepare_muse_spark_experts",
     "prepare_muse_spark_layer",
     "qwen4_exp_mtp_front",
@@ -445,6 +447,115 @@ def muse_spark_layer_decode(
         a_out=a_out,
         seq_len=seq_len,
         slot=slot,
+        page_table=page_table,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cos_sin=cos_sin,
+        scratch=scratch,
+        step=step,
+        peer_bases=peer_bases,
+        layer_index=layer_index,
+        compile_only=compile_only,
+    )
+
+
+def prepare_muse_spark_draft_layer(
+    *,
+    tensors: dict[str, torch.Tensor],
+    rank: int,
+    max_rows: int,
+    override: str | None = None,
+) -> FusedDecodeLayer | None:
+    """Pack one TP8 rank's layer of Muse Spark's DFlash2 draft for its
+    monokernel.
+
+    Args:
+        tensors: The rank's weights by role (see
+            ``tokenspeed_kernel_amd...muse_spark.draft_layer.pack_draft_layer``).
+        rank: The rank in the TP8 group.
+        max_rows: The rows of one draft block forward (one request's block).
+        override: Optional registered kernel name to force.
+
+    Returns:
+        The packed layer, or None when no monokernel serves ``max_rows``
+        here.
+    """
+    try:
+        prepare = _select("muse_spark_draft_layer_prepare", max_rows, override)
+        decode = _select("muse_spark_draft_layer_decode", max_rows, override)
+    except NoKernelFoundError:
+        if override is not None:
+            raise
+        return None
+    weights, scratch_pairs, late_weights = prepare(
+        tensors=tensors, rank=rank, max_rows=max_rows
+    )
+    return FusedDecodeLayer(
+        decode=decode,
+        weights=weights,
+        scratch_pairs=scratch_pairs,
+        late_weights=late_weights,
+    )
+
+
+def muse_spark_draft_layer_decode(
+    layer: FusedDecodeLayer,
+    *,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    residual_out: torch.Tensor,
+    out: torch.Tensor,
+    seq_len: torch.Tensor,
+    positions: torch.Tensor,
+    slots: torch.Tensor,
+    page_table: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cos_sin: torch.Tensor,
+    scratch: torch.Tensor,
+    step: torch.Tensor,
+    peer_bases: torch.Tensor,
+    layer_index: int,
+    compile_only: bool,
+) -> None:
+    """One step of a packed DFlash2 draft layer for one request's block of
+    rows, on every rank of the TP8 group at once (the launches exchange
+    values).
+
+    Args:
+        layer: From :func:`prepare_muse_spark_draft_layer`.
+        x: BF16 ``[rows, 8192]``: this rank's partial of the layer input.
+        residual: BF16 ``[rows, 8192]``: the residual before the layer.
+        residual_out: BF16 ``[rows, 8192]``: the rank stores its owned
+            columns (``1024 rank ..``) of the residual after the attention
+            sublayer; the other columns are left as they are.
+        out: BF16 ``[rows, 8192]``: this rank's partial of the layer output.
+        seq_len: int32 ``[1]``: the request's length after the block.
+        positions: int32 ``[rows]``: the block rows' positions.
+        slots: int32 or int64 ``[rows]``: the block rows' cache slots.
+        page_table: int32 page table of the request (64 tokens a page).
+        k_cache, v_cache: BF16 ``[slots, 1, 128]``: the layer's cache.
+        cos_sin: FP32 ``[positions, 128]`` rotary table, cos then sin.
+        scratch: int64 mailbox scratch of at least ``layer.scratch_pairs``
+            on the Iris symmetric heap (the same offset on every rank).
+        step: int32 ``[1]`` counter that changes once per draft forward
+            (CUDA graph safe: the kernel reads it on device).
+        peer_bases: int64 ``[8]`` Iris heap bases of the group's ranks.
+        layer_index: Draft layer index, below 5.
+        compile_only: Only compile the launch for these operands, without
+            running it: compile on every rank, synchronize the ranks, then
+            launch (a launch polls its peers for a few seconds before it
+            traps).
+    """
+    layer.decode(
+        weights=layer.weights,
+        x=x,
+        residual=residual,
+        residual_out=residual_out,
+        out=out,
+        seq_len=seq_len,
+        positions=positions,
+        slots=slots,
         page_table=page_table,
         k_cache=k_cache,
         v_cache=v_cache,

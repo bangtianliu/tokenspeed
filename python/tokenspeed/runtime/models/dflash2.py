@@ -26,6 +26,7 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.conv import dflash2_grouped_conv
 from torch import nn
@@ -33,6 +34,7 @@ from torch import nn
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping, MappingBase
+from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
@@ -43,6 +45,10 @@ from tokenspeed.runtime.models.dflash import (
     DFlashDecoderLayer,
     DFlashDraftModel,
     _get_dflash_layer_sliding_window,
+)
+from tokenspeed.runtime.models.dflash2_monokernel import (
+    DFlash2Monokernels,
+    enable_draft_monokernels,
 )
 from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkAttention
 from tokenspeed.runtime.utils import add_prefix
@@ -437,6 +443,37 @@ class DFlash2DraftModel(DFlashDraftModel):
             params_dtype=dtype,
             prefix=add_prefix("candidate_selector", prefix),
         )
+        # The draft monokernels (--decode-monokernel), packed after loading.
+        self.monokernels: DFlash2Monokernels | None = None
+
+    def run_layers(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        ctx: ForwardContext,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The layers, or their monokernel launches for one request's block."""
+        if (
+            self.monokernels is not None
+            and residual is not None
+            and self.monokernels.serves(hidden_states.shape[0], ctx)
+        ):
+            return self.monokernels.forward(positions, hidden_states, residual, ctx)
+        return super().run_layers(positions, hidden_states, residual, ctx)
+
+    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        """Allocate the draft monokernels' mailbox scratch on the Iris heap,
+        before graph capture."""
+        if self.monokernels is None:
+            return False
+        group = self.mapping.attn.tp_group
+        self.monokernels.prepare(
+            process_group_manager.get_device_process_group(group),
+            process_group_manager.get_process_group("gloo", group),
+            group.index(dist.get_rank()),
+        )
+        return True
 
     def final_norm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor | None
@@ -496,7 +533,9 @@ class DFlash2DraftModel(DFlashDraftModel):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         if not self._uses_mla:
-            return super().load_weights(weights)
+            loaded = super().load_weights(weights)
+            enable_draft_monokernels(self)
+            return loaded
 
         params = dict(self.named_parameters())
         loaded: set[str] = set()
