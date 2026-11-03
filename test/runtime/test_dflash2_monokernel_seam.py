@@ -45,12 +45,14 @@ from tokenspeed.runtime.execution.output_layout import (  # noqa: E402
 from tokenspeed.runtime.models.dflash2 import DFlash2DraftModel  # noqa: E402
 from tokenspeed.runtime.models.dflash2_monokernel import (  # noqa: E402
     BLOCK_ROWS,
+    NOT_BF16_KV,
     NOT_TP8,
     OTHER_ATTENTION,
     OTHER_SHAPES,
     model_reasons,
     takes_monokernels,
 )
+from tokenspeed.runtime.utils.env import global_server_args_dict  # noqa: E402
 
 
 def _ctx(mode: ForwardMode, bs: int, rows: int) -> ForwardContext:
@@ -169,3 +171,9 @@ def test_a_tp4_draft_keeps_the_regular_path() -> None:
 )
 def test_other_drafts_keep_the_regular_path(overrides, reason) -> None:
     assert reason in model_reasons(_draft(_config(**overrides)))
+
+
+def test_an_fp8_kv_cache_keeps_the_regular_path(monkeypatch) -> None:
+    """The kernels read and write BF16 keys and values."""
+    monkeypatch.setitem(global_server_args_dict, "kv_cache_dtype", "fp8_e4m3")
+    assert model_reasons(_draft(_config())) == [NOT_BF16_KV]

@@ -104,6 +104,7 @@ class LayerWeights:
             seq_len,
             slot,
             page_table,
+            page_table.stride(0),
             k_cache,
             v_cache,
             cos_sin,

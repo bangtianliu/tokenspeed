@@ -49,7 +49,9 @@ from tokenspeed.runtime.layers.moe.weights.loaders import (  # noqa: E402
     load_w13,
 )
 from tokenspeed.runtime.models.muse_spark_monokernel import (  # noqa: E402
+    MAX_REQUESTS,
     MAX_ROWS,
+    NOT_BF16_KV,
     NOT_TP8,
     OTHER_CONSTANTS,
     OTHER_SHAPES,
@@ -58,6 +60,7 @@ from tokenspeed.runtime.models.muse_spark_monokernel import (  # noqa: E402
     model_reasons,
     takes_monokernels,
 )
+from tokenspeed.runtime.utils.env import global_server_args_dict  # noqa: E402
 
 
 def _ctx(mode: ForwardMode, bs: int, rows: int) -> ForwardContext:
@@ -72,29 +75,36 @@ def _ctx(mode: ForwardMode, bs: int, rows: int) -> ForwardContext:
     )
 
 
-def test_decode_steps_of_one_request_take_the_kernels() -> None:
-    """A launch computes the rows of one request: a decode token or a
-    speculative verify of up to MAX_ROWS tokens. Prefill, several requests
-    and wider verifies keep the regular path."""
+def test_decode_steps_of_up_to_two_requests_take_the_kernels() -> None:
+    """A launch computes the rows of up to MAX_REQUESTS requests: a decode
+    token each, or a speculative verify's tokens each, MAX_ROWS rows at
+    most. Prefill, more requests and wider verifies keep the regular path."""
     assert takes_monokernels(1, _ctx(ForwardMode.DECODE, 1, 1))
     assert takes_monokernels(4, _ctx(ForwardMode.DECODE, 1, 4))
-    assert takes_monokernels(MAX_ROWS, _ctx(ForwardMode.DECODE, 1, MAX_ROWS))
-    assert not takes_monokernels(MAX_ROWS + 1, _ctx(ForwardMode.DECODE, 1, 9))
-    assert not takes_monokernels(2, _ctx(ForwardMode.DECODE, 2, 2))
+    assert takes_monokernels(8, _ctx(ForwardMode.DECODE, 1, 8))
+    # Two requests' rows only while MAX_REQUESTS allows them.
+    two = MAX_REQUESTS >= 2
+    assert takes_monokernels(2, _ctx(ForwardMode.DECODE, 2, 2)) == two
+    assert takes_monokernels(MAX_ROWS, _ctx(ForwardMode.DECODE, 2, MAX_ROWS)) == two
+    assert not takes_monokernels(MAX_ROWS + 2, _ctx(ForwardMode.DECODE, 2, 18))
+    assert not takes_monokernels(3, _ctx(ForwardMode.DECODE, 3, 3))
     assert not takes_monokernels(1, _ctx(ForwardMode.EXTEND, 1, 1))
     assert not takes_monokernels(1, _ctx(ForwardMode.IDLE, 1, 1))
 
 
 def test_a_verify_step_gives_each_row_its_token_length() -> None:
-    """Verify metadata holds the request's length after the step; row t of
-    the request's rows is the token at position seq - rows + t."""
+    """Verify metadata holds each request's length after the step; row t of
+    a request's rows is its token at position seq - chain + t."""
     monokernels = SimpleNamespace()
     seq_lens = torch.tensor([100, 7], dtype=torch.int32)
-    verify = MonokernelStep(monokernels, 8, [], False)
+    verify = MonokernelStep(monokernels, 8, 1, [], False)
     assert verify._row_lengths(0, seq_lens).tolist() == list(range(93, 101))
-    # One decode row reads the metadata as is.
-    decode = MonokernelStep(monokernels, 1, [], False)
-    assert decode._row_lengths(0, seq_lens).tolist() == [100]
+    # Two requests: each request's rows end at its own length.
+    both = MonokernelStep(monokernels, 6, 2, [], False)
+    assert both._row_lengths(0, seq_lens).tolist() == [98, 99, 100, 5, 6, 7]
+    # One decode row a request reads the metadata as is.
+    decode = MonokernelStep(monokernels, 2, 2, [], False)
+    assert decode._row_lengths(0, seq_lens).tolist() == [100, 7]
 
 
 def _text_config(**overrides) -> dict:
@@ -194,6 +204,12 @@ def test_muse_spark_open_at_tp8_has_monokernels(moe_tp, moe_ep) -> None:
 @pytest.mark.parametrize("moe_tp, moe_ep", [(4, 2), (2, 4)])
 def test_other_moe_splits_keep_the_regular_path(moe_tp, moe_ep) -> None:
     assert model_reasons(_config(), _mapping(moe_tp, moe_ep)) == [NOT_TP8]
+
+
+def test_an_fp8_kv_cache_keeps_the_regular_path(monkeypatch) -> None:
+    """The kernels read and write BF16 keys and values."""
+    monkeypatch.setitem(global_server_args_dict, "kv_cache_dtype", "fp8_e4m3")
+    assert model_reasons(_config(), _mapping(8, 1)) == [NOT_BF16_KV]
 
 
 def _loaded(
