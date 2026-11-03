@@ -111,6 +111,7 @@ def _plan(splits: int, rows: int, chain: int) -> Plan:
     )
 
 
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("requests", [1, 2])
 @pytest.mark.parametrize("rows", [1, 8])
 @pytest.mark.parametrize(
@@ -125,11 +126,12 @@ def _plan(splits: int, rows: int, chain: int) -> Plan:
     ],
 )
 def test_attention_matches_the_regular_path_math(
-    length, window, splits, rows, requests
+    length, window, splits, rows, requests, kv_dtype
 ):
     """``requests`` requests of ``rows`` tokens each in one launch: each
     attends its own cache (its length and page table) and takes its own
-    tokens' keys from the projection."""
+    tokens' keys from the projection. An FP8 cache holds the regular path's
+    unit-scale e4m3 bytes: the rows' K and V round once to it."""
     rope = window != 0
     g = torch.Generator().manual_seed(length + window)
     # The second request is longer and has pages of its own.
@@ -146,12 +148,8 @@ def test_attention_matches_the_regular_path_math(
     table = torch.zeros(requests, width, dtype=torch.int32)
     for b, t in enumerate(tables):
         table[b, : len(t)] = t
-    k_cache = torch.randn(pages + 2, PAGE, KV_HEADS, HEAD, generator=g).to(
-        torch.bfloat16
-    )
-    v_cache = torch.randn(pages + 2, PAGE, KV_HEADS, HEAD, generator=g).to(
-        torch.bfloat16
-    )
+    k_cache = torch.randn(pages + 2, PAGE, KV_HEADS, HEAD, generator=g).to(kv_dtype)
+    v_cache = torch.randn(pages + 2, PAGE, KV_HEADS, HEAD, generator=g).to(kv_dtype)
     R = requests * rows
     qkvg = torch.randn(R, QKVG, generator=g).to(torch.bfloat16)
     cs = ref.rope_table(max(ends) + 1)
@@ -224,7 +222,10 @@ def test_attention_matches_the_regular_path_math(
             # The cache gets the rotated k and the raw v of each row's token.
             got_k = kc.view(-1, KV_HEADS, HEAD)[slots[row]].cpu()
             got_v = vc.view(-1, KV_HEADS, HEAD)[slots[row]].cpu()
+            # FP32 norm sums in another order: within one step of k's dtype
+            # (BF16 2^-7, e4m3 2^-3).
+            step_k = 2**-7 if kv_dtype == torch.bfloat16 else 2**-3
             torch.testing.assert_close(
-                got_k.float(), k[t].float(), rtol=2**-7, atol=1e-2
+                got_k.float(), k[t].float(), rtol=step_k, atol=1e-2
             )
-            assert torch.equal(got_v, v[t])
+            assert torch.equal(got_v.view(torch.uint8), v[t].view(torch.uint8))
