@@ -90,10 +90,10 @@ def test_a_verify_step_gives_each_row_its_token_length() -> None:
     the request's rows is the token at position seq - rows + t."""
     monokernels = SimpleNamespace()
     seq_lens = torch.tensor([100, 7], dtype=torch.int32)
-    verify = MonokernelStep(monokernels, 8, [])
+    verify = MonokernelStep(monokernels, 8, [], False)
     assert verify._row_lengths(0, seq_lens).tolist() == list(range(93, 101))
     # One decode row reads the metadata as is.
-    decode = MonokernelStep(monokernels, 1, [])
+    decode = MonokernelStep(monokernels, 1, [], False)
     assert decode._row_lengths(0, seq_lens).tolist() == [100]
 
 

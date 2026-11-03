@@ -2527,8 +2527,10 @@ class MuseSparkModel(BaseTransformerModel):
         aux_hidden_states: list[torch.Tensor] = []
         # An idle forward captures no hidden states, as in the base model's loop.
         taps_live = owned_global_rows is not None or not ctx.forward_mode.is_idle()
+        # The launches may store the draft's taps themselves.
+        launch_taps = step is not None and step.serves_taps()
         for layer_index, layer in enumerate(self.layers):
-            if taps_live and layer_index in self.layers_to_capture:
+            if taps_live and not launch_taps and layer_index in self.layers_to_capture:
                 self._capture(
                     layer_index,
                     hidden_states,
@@ -2564,6 +2566,8 @@ class MuseSparkModel(BaseTransformerModel):
             )
         if step is not None:
             step.finish()
+        if launch_taps:
+            aux_hidden_states = [step.tap_rows()]
         if taps_live:
             final_layer_index = len(self.layers) + 1
             if final_layer_index in self.layers_to_capture:
@@ -3009,6 +3013,7 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 process_group_manager.get_device_process_group(group),
                 process_group_manager.get_process_group("gloo", group),
                 group.index(dist.get_rank()),
+                list(self.model.layers_to_capture),
             )
         return True
 

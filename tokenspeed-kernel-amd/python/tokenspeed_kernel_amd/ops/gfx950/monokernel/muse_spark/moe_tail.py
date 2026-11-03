@@ -267,7 +267,20 @@ def _ffn_scales(got):
 
 
 @gluon.jit
-def unpool_stages(mb, task, w, post_gain, alpha, beta, h_next, RANK: gl.constexpr):
+def unpool_stages(
+    mb,
+    task,
+    w,
+    post_gain,
+    alpha,
+    beta,
+    h_next,
+    tap,
+    tap_col,
+    tap_row,
+    RANK: gl.constexpr,
+    TAP: gl.constexpr,
+):
     """Unpool and fin task ``task``: owned hidden columns ``16 task ..`` of
     every row.
 
@@ -278,6 +291,11 @@ def unpool_stages(mb, task, w, post_gain, alpha, beta, h_next, RANK: gl.constexp
         alpha: FP32 residual-gate coefficient of the FFN, owned columns.
         beta: FP32 residual-gate coefficient of the FFN, all 8192 columns.
         h_next: Where the owned FP32 residual ``h''`` goes, ``[rows, 1024]``.
+        tap, tap_col, tap_row: With ``TAP``, a BF16 buffer on the Iris
+            symmetric heap where every rank's copy gets ``bf16(h'')`` of the
+            owned columns: row ``r``, column ``c`` (of 8192) at ``tap + r
+            tap_row + tap_col + c``. A draft reads this residual (the one
+            entering the next layer) as a tap. Unused without ``TAP``.
     """
     R: gl.constexpr = schedule.rows(mb.plan)
     nw: gl.constexpr = gl.num_warps()
@@ -391,8 +409,20 @@ def unpool_stages(mb, task, w, post_gain, alpha, beta, h_next, RANK: gl.constexp
         inv = gl.where(r2 == r, invs[r], inv)
     at = h_next + r2 * OWNED + c2
     keep = (r2 < R) & (j2 >= 0)
-    gl.store(at, gl.fma(b2_lo, y_lo * inv, ah_lo), mask=keep)
-    gl.store(at + 1, gl.fma(b2_hi, y_hi * inv, ah_hi), mask=keep)
+    h_lo = gl.fma(b2_lo, y_lo * inv, ah_lo)
+    h_hi = gl.fma(b2_hi, y_hi * inv, ah_hi)
+    gl.store(at, h_lo, mask=keep)
+    gl.store(at + 1, h_hi, mask=keep)
+    if TAP:
+        # The draft's tap of the residual, rounded once to BF16 as the
+        # regular capture rounds the FP32 stream, into every rank's buffer.
+        # Its reader runs after later collectives of the forward, which
+        # order these stores before it.
+        t_at = tap + r2.to(gl.int64) * tap_row + tap_col + RANK * OWNED + c2
+        for p in gl.static_range(WORLD):
+            peer_at = mb.peers.translate(t_at, p)
+            gl.store(peer_at, h_lo.to(gl.bfloat16), mask=keep)
+            gl.store(peer_at + 1, h_hi.to(gl.bfloat16), mask=keep)
     mb.stamp("fin", trace.END)
 
 
