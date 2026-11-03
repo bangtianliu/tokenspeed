@@ -228,6 +228,9 @@ def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
         plan = layer.layer_plan(full, rows)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
+        # A draft's taps: the launch stores its residual into slot 3 of
+        # every rank's copy.
+        tap = ctx.zeros((rows, 5, HIDDEN), dtype=torch.bfloat16)
         end = length + rows - 1
         sh = _shared(42, length, rows)
         w = _rank_weights(rank, end)
@@ -258,6 +261,8 @@ def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
                 step=torch.full((1,), step, dtype=torch.int32, device=dev),
                 peer_bases=group.bases,
                 layer=index,
+                tap=tap,
+                tap_slot=3,
                 trace_buf=None,
                 compile_only=compile_only,
             )
@@ -314,6 +319,15 @@ def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
             torch.testing.assert_close(
                 kernel_pooled[t].float(), pooled[t].float(), rtol=2**-6, atol=atol
             )
+        # The tap: every rank's h'' in its columns, rounded once to BF16, the
+        # other slots untouched.
+        parts = [torch.empty_like(h_next.cpu()) for _ in range(WORLD)]
+        dist.all_gather(parts, h_next.cpu())
+        torch.cuda.synchronize()
+        dist.barrier()
+        got_tap = tap.cpu()
+        assert torch.equal(got_tap[:, 3], torch.cat(parts, dim=1).to(torch.bfloat16))
+        assert not got_tap[:, [0, 1, 2, 4]].any()
         err = (h_next.cpu() - h2[:, own]).abs()
         # In the same way, a BF16 step of the projection is an absolute
         # error at the scale of beta y.
@@ -401,6 +415,8 @@ def _graph_worker(rank: int, port: int, length: int) -> None:
                 step=step,
                 peer_bases=group.bases,
                 layer=2,
+                tap=None,
+                tap_slot=None,
                 trace_buf=None,
                 compile_only=False,
             )
