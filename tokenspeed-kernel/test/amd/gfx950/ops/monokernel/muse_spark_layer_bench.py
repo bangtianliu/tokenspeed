@@ -288,6 +288,8 @@ def worker(rank: int, port: int, args) -> None:
             bases,
             attn_ops,
             moe_ops,
+            None,
+            None,
             trace_buf,
             rank,
             args.full,
