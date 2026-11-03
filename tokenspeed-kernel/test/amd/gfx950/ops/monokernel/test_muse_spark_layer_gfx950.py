@@ -226,7 +226,7 @@ def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
         dev = torch.device(f"cuda:{rank}")
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
-        plan = layer.layer_plan(full, rows, rows)
+        plan = layer.layer_plan(full, rows, rows, True)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         # A draft's taps: the launch stores its residual into slot 3 of
         # every rank's copy.
@@ -264,6 +264,9 @@ def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
                 chain=rows,
                 tap=tap,
                 tap_slot=3,
+                # The warm stage reads weights only: it runs here (on the
+                # layer's own QKVG weights) and changes no output.
+                warm_next=weights,
                 trace_buf=None,
                 compile_only=compile_only,
             )
@@ -381,7 +384,7 @@ def _two_requests_worker(rank: int, port: int, full: bool) -> None:
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
         rows = 8  # a verify of 7 draft tokens a request
-        plan = layer.layer_plan(full, 2 * rows, rows)
+        plan = layer.layer_plan(full, 2 * rows, rows, False)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         lengths = (3000, 3100)
@@ -436,6 +439,7 @@ def _two_requests_worker(rank: int, port: int, full: bool) -> None:
                 chain=rows,
                 tap=None,
                 tap_slot=None,
+                warm_next=None,
                 trace_buf=None,
                 compile_only=False,
             )
@@ -492,7 +496,7 @@ def _graph_worker(rank: int, port: int, length: int) -> None:
         dev = torch.device(f"cuda:{rank}")
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
-        plan = layer.layer_plan(False, 1, 1)
+        plan = layer.layer_plan(False, 1, 1, False)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         sh = _shared(42, length, 1)
         weights = _pack(rank, dev, sh, length, False)
@@ -531,6 +535,7 @@ def _graph_worker(rank: int, port: int, length: int) -> None:
                 chain=1,
                 tap=None,
                 tap_slot=None,
+                warm_next=None,
                 trace_buf=None,
                 compile_only=False,
             )
@@ -581,14 +586,16 @@ def test_graph_replays_match_eager_launches():
     mp.spawn(_graph_worker, args=(port, 3000), nprocs=WORLD, join=True)
 
 
+@pytest.mark.parametrize("warm", [(False, False), (False, True), (True, False)])
 @pytest.mark.parametrize("rows", range(1, layer.MAX_ROWS + 1))
-def test_both_kinds_of_layer_lay_the_scratch_out_alike(rows: int):
+def test_both_kinds_of_layer_lay_the_scratch_out_alike(rows: int, warm):
     """Sliding and full launches share one scratch and alternate the peer
     regions' copies. A rank a launch ahead must then put only into the copy
     no slower rank still reads, which holds only if both plans place every
-    region, and both copies of each peer region, at the same pairs."""
-    sliding = layer.layer_plan(False, rows, rows)
-    full = layer.layer_plan(True, rows, rows)
+    region, and both copies of each peer region, at the same pairs, with or
+    without the warm stage (the last fused layer has none)."""
+    sliding = layer.layer_plan(False, rows, rows, warm[0])
+    full = layer.layer_plan(True, rows, rows, warm[1])
     assert sliding.regions == full.regions
     assert sliding.peers == full.peers
     assert sliding.row_pairs == full.row_pairs
