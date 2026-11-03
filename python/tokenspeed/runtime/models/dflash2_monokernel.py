@@ -30,6 +30,10 @@ rank of the TP8 group. The draft model touches this module in three places:
   with the reasons logged;
 * ``prepare_communication_runtime`` calls :meth:`DFlash2Monokernels.prepare`,
   which allocates the mailbox scratch on the Iris symmetric heap;
+* after a verify of one request, the drafter runs
+  :meth:`DFlash2Monokernels.write_context` in place of its context write
+  (``fc`` and ``hidden_norm`` of the target's taps, then every layer's K and
+  V of the verify rows into the draft cache);
 * the layer loop asks :meth:`DFlash2Monokernels.serves` whether the forward
   takes the launches and runs :meth:`DFlash2Monokernels.forward` in place of
   the layers when it does;
@@ -55,8 +59,10 @@ import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.monokernel import (
     FusedDecodeLayer,
+    muse_spark_draft_context_decode,
     muse_spark_draft_head_decode,
     muse_spark_draft_layer_decode,
+    prepare_muse_spark_draft_context,
     prepare_muse_spark_draft_head,
     prepare_muse_spark_draft_layer,
 )
@@ -110,6 +116,7 @@ SHARD = VOCAB // WORLD
 SELECTOR_RANK = 256
 TOPK = 16
 STEPS = BLOCK_ROWS - 1  # the block's rows 1 .. 7 draft a token each
+CONTEXT_ROWS = 8  # one request's verify rows
 NO_KERNEL = "no draft monokernel for this platform"
 
 
@@ -248,6 +255,12 @@ class DFlash2Monokernels:
     Attributes:
         layers: The draft's decoder layers.
         fused: The packed launch of each layer, in layer order.
+        context: The packed context write, or None when it keeps the regular
+            path.
+        context_scratch: Its mailbox scratch, from :meth:`prepare`.
+        context_pending: Whether a context write ran whose block forward
+            has not run yet (the write reads the layers' step counter, which
+            the block forward advances).
         final_gain: FP32 ``[1024]``: the final norm's gain of the rank's
             owned columns (the last launch runs the final norm).
         steps: The mailbox scratch, the heap bases and the step counter, from
@@ -264,9 +277,17 @@ class DFlash2Monokernels:
             before it, or when the head keeps the regular path).
     """
 
-    def __init__(self, model: torch.nn.Module, fused: list[FusedDecodeLayer]) -> None:
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        fused: list[FusedDecodeLayer],
+        context: FusedDecodeLayer | None,
+    ) -> None:
         self.layers = model.layers
         self.fused = fused
+        self.context = context
+        self.context_scratch: torch.Tensor | None = None
+        self.context_pending = False
         rank = fused[0].weights.rank
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         self.final_gain = model.norm.weight.data[own].float().contiguous()
@@ -276,6 +297,7 @@ class DFlash2Monokernels:
         self.rank: int | None = None
         self.compiled: set[bool] = set()
         self.block_pending = False
+        self.context_compiled = False
         self.head: DraftHeadMonokernel | None = None
 
     def prepare(
@@ -287,6 +309,10 @@ class DFlash2Monokernels:
         if self.steps is None:
             scratch_pairs = max(f.scratch_pairs for f in self.fused)
             self.steps = DraftMonokernelSteps(group, rank, scratch_pairs)
+            if self.context is not None:
+                self.context_scratch, _ = mailbox_scratch(
+                    group, rank, self.context.scratch_pairs
+                )
             self.device_group = group
             self.cpu_group = cpu_group
             self.rank = rank
@@ -364,7 +390,55 @@ class DFlash2Monokernels:
             x, res = out, res_out
         steps.advance()
         self.block_pending = True
+        self.context_pending = False
         return x
+
+    def serves_context(self, rows: int) -> bool:
+        """Whether a context write of ``rows`` verify rows (decode rows only)
+        takes :meth:`write_context`: one request's."""
+        return self.context_scratch is not None and rows == CONTEXT_ROWS
+
+    def write_context(
+        self,
+        taps: torch.Tensor,
+        positions: torch.Tensor,
+        slots: torch.Tensor,
+        token_to_kv_pool,
+    ) -> None:
+        """The context write of one request's verify rows as one launch.
+
+        Args:
+            taps: BF16 ``[8, 40960]``: the target's tapped hidden states.
+            positions: ``[8]``: the rows' positions.
+            slots: ``[8]``: the rows' draft cache slots.
+            token_to_kv_pool: The draft's KV pool.
+        """
+        if self.context_pending:
+            raise RuntimeError(
+                "a second draft context write before the block forward would "
+                "repeat its launch's tag"
+            )
+        caches = [
+            token_to_kv_pool.get_kv_buffer(layer.self_attn.attn.layer_id)
+            for layer in self.layers
+        ]
+        operands = dict(
+            taps=taps.contiguous(),
+            positions=positions,
+            slots=slots,
+            k_caches=tuple(k.view(-1, 1, k.shape[-1]) for k, _ in caches),
+            v_caches=tuple(v.view(-1, 1, v.shape[-1]) for _, v in caches),
+            cos_sin=self.layers[0].self_attn.rotary_emb.cos_sin_cache,
+            scratch=self.context_scratch,
+            step=self.steps.step,
+            peer_bases=self.steps.bases,
+        )
+        if not self.context_compiled:
+            muse_spark_draft_context_decode(self.context, compile_only=True, **operands)
+            dist.barrier(group=self.cpu_group)
+            self.context_compiled = True
+        muse_spark_draft_context_decode(self.context, compile_only=False, **operands)
+        self.context_pending = True
 
     def run_head(
         self, hidden_states: torch.Tensor, first_token: torch.Tensor
@@ -559,8 +633,52 @@ def enable_draft_monokernels(model: torch.nn.Module) -> None:
             f"({'; '.join(reasons)})"
         )
         return
-    model.monokernels = DFlash2Monokernels(model, fused)
-    logger.info(f"Decode monokernel: {len(fused)} of {len(fused)} {name} layers")
+    context = None
+    reasons = context_reasons(model)
+    if not reasons:
+        context = prepare_muse_spark_draft_context(
+            tensors=context_tensors(model), rank=rank, max_rows=CONTEXT_ROWS
+        )
+        if context is None:
+            reasons.append(NO_KERNEL)
+    if reasons:
+        logger.warning(
+            f"Decode monokernel: the {name} context write keeps the regular path "
+            f"({'; '.join(reasons)})"
+        )
+    model.monokernels = DFlash2Monokernels(model, fused, context)
+    logger.info(
+        f"Decode monokernel: {len(fused)} of {len(fused)} {name} layers"
+        + ("" if context is None else ", and the context write")
+    )
+
+
+CONTEXT_OTHER = "an fc or hidden_norm other than the kernel's (5 taps, BF16)"
+
+
+def context_reasons(model: torch.nn.Module) -> list[str]:
+    """Why the context write of ``model`` (whose layers have monokernels)
+    cannot have its monokernel; empty when it can."""
+    fc, norm = model.fc, model.hidden_norm
+    if (
+        not isinstance(fc.quant_method, UnquantizedLinearMethod)
+        or fc.weight.dtype != torch.bfloat16
+        or tuple(fc.weight.shape) != (HIDDEN, 5 * HIDDEN)
+        or norm.weight.dtype != torch.bfloat16
+        or abs(norm.variance_epsilon - RMS_NORM_EPS) >= 1e-12
+    ):
+        return [CONTEXT_OTHER]
+    return []
+
+
+def context_tensors(model: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """The context write's weights by the roles of
+    :func:`prepare_muse_spark_draft_context`."""
+    tensors = {"fc": model.fc.weight.data, "hidden_norm": model.hidden_norm.weight.data}
+    for i, layer in enumerate(model.layers):
+        tensors[f"qkv_{i}"] = layer.self_attn.qkv_proj.weight.data
+        tensors[f"k_norm_{i}"] = layer.self_attn.k_norm.weight.data
+    return tensors
 
 
 __all__ = [
