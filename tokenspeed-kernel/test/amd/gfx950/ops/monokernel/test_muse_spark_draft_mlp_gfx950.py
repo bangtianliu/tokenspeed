@@ -100,6 +100,7 @@ def draft_mlp_kernel(
             "hin",
             "sum1",
             "norm",
+            True,
         )
     task, active = schedule.stage_task(PLAN, "coef")
     if active:
@@ -192,7 +193,15 @@ def draft_mlp_kernel(
     task, active = schedule.stage_task(PLAN, "fin")
     if active:
         draft_mlp.fin_stage(
-            mb, task, base, out, "dpart", draft_mlp.DOWN_KPARTS, "cpart", "fin"
+            mb,
+            task,
+            base,
+            out,
+            "dpart",
+            draft_mlp.DOWN_KPARTS,
+            "cpart",
+            draft_mlp.FIN_COLS,
+            "fin",
         )
     trace.flush(table, trace_buf)
 

@@ -41,8 +41,8 @@ regular draft (``attention/backends/paged/mha.py``, block decode): the keys
   from the mailbox, since a CTA never reads another CTA's store of the same
   launch.
 * attn, ``SPLITS`` tasks: one task per split of the cached keys
-  ``[max(seq_len - 2049, 0), seq_len - 8)``, ``ceil(n / SPLITS)`` each, in
-  chunks of 128 with an online base-2 softmax; every row's 8 heads are one
+  ``[max(seq_len - 2049, 0), seq_len - 8)``, ``ceil(n / SPLITS)`` each, one
+  chunk of at most 128 (16 splits hold the 2041) with a base-2 softmax; every row's 8 heads are one
   MFMA row each (64 rows). The last split also takes the block's 8 keys from
   ``kb`` / ``vb``, as one more chunk, for every row (non-causal). A task
   publishes FP32 ``acc / l`` and the LSE (``-inf`` for an empty split).
@@ -72,6 +72,7 @@ BN = gl.constexpr(128)  # keys a chunk
 QM = gl.constexpr(64)  # MFMA rows of attention: 8 block rows x 8 heads
 KT = gl.constexpr(16)  # MFMA rows of the block's keys (8, the rest zero)
 WINDOW_KEYS = gl.constexpr(2049)  # every row's keys: the window and its own
+BLOCK_ROWS = gl.constexpr(8)  # rows of a draft block
 # exp2 softmax of (q . k) / sqrt(128).
 QK_SCALE = gl.constexpr(0.08838834764831845 * 1.4426950408889634)
 
@@ -79,6 +80,8 @@ QK_SCALE = gl.constexpr(0.08838834764831845 * 1.4426950408889634)
 QKV_TASKS = gl.constexpr(160)  # 10 groups of 128 rows x 16 K parts of 512
 OPROJ_KPARTS = gl.constexpr(2)  # o_proj's K (1024) in parts of 512
 OPROJ_TASKS = gl.constexpr(128)  # 64 groups of 128 rows x 2 K parts
+AFIN_TASKS = gl.constexpr(256)
+AFIN_COLS = gl.constexpr(32)  # 8192 / AFIN_TASKS
 
 
 def regions(splits: int) -> tuple[tuple[str, int], ...]:
@@ -158,7 +161,7 @@ def stages(bases: dict[str, int], splits: int, rows: int) -> tuple[Stage, ...]:
             writes=("ao",),
         ),
         Stage("oproj", int(OPROJ_TASKS), oproj, reads=("ao",), writes=("opart",)),
-        Stage("afin", int(draft_mlp.FIN_TASKS), afin, reads=("opart", "acpart")),
+        Stage("afin", int(AFIN_TASKS), afin, reads=("opart", "acpart")),
     )
 
 
@@ -342,6 +345,8 @@ def attn_stage(
     """
     R: gl.constexpr = schedule.rows(mb.plan)
     gl.static_assert(R * Q_HEADS <= QM)
+    # Every split's cached keys fit one chunk: ceil(2041 / SPLITS) <= BN.
+    gl.static_assert((WINDOW_KEYS - BLOCK_ROWS + SPLITS - 1) // SPLITS <= BN)
     mb.stamp(STAGE, trace.START)
     s = task
     nw: gl.constexpr = gl.num_warps()
@@ -399,23 +404,17 @@ def attn_stage(
     m = gl.full([QM], float("-inf"), gl.float32, gl.SliceLayout(1, qk_mma))
     l = gl.zeros([QM], gl.float32, gl.SliceLayout(1, qk_mma))
     acc = gl.zeros([QM, HEAD], gl.float32, pv_mma)
-    for c0 in range(lo, hi, BN):
-        js = c0 + gl.arange(0, BN, gl.SliceLayout(0, qk_mma))
-        valid = (js[None, :] < hi) & (gl.arange(0, QM, gl.SliceLayout(1, qk_mma)) >= 0)[
-            :, None
-        ]
-        # The next chunk's loads go before this chunk's math.
-        next_keys, next_values = _load_kv(
-            table, k_cache, v_cache, c0 + BN, hi, dk, dv, k_layout, v_load
-        )
-        gl.barrier()
-        v_smem.store(values)
-        gl.barrier()
-        m, l, acc = _softmax_step(
-            q, keys, v_smem.load(v_layout), valid, m, l, acc, p_layout
-        )
-        keys = next_keys
-        values = next_values
+    # A split's cached keys fit one chunk (see the static assert): no loop,
+    # and no second chunk's registers.
+    js = lo + gl.arange(0, BN, gl.SliceLayout(0, qk_mma))
+    valid = (js[None, :] < hi) & (gl.arange(0, QM, gl.SliceLayout(1, qk_mma)) >= 0)[
+        :, None
+    ]
+    v_smem.store(values)
+    gl.barrier()
+    m, l, acc = _softmax_step(
+        q, keys, v_smem.load(v_layout), valid, m, l, acc, p_layout
+    )
     # The block's keys, for every row (the block is non-causal).
     gl.barrier()
     qi = gl.arange(0, QM, gl.SliceLayout(1, qk_mma))
