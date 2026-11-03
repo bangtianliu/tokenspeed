@@ -78,6 +78,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import (  # noqa: E402
 )
 
 TP, HIDDEN, OWNED, POOL_OWNED, EXPERTS = 8, 8192, 1024, 512, 16
+KV_DTYPES = {"bf16": torch.bfloat16, "fp8": torch.float8_e4m3fn}
 # Launches per graph: one per layer copy, so the timings average over them.
 LAUNCHES = 40
 # The trace buffer: [CTA, 4 points per stage, wave] in 10 ns ticks.
@@ -131,9 +132,10 @@ def rank0_payloads(plan, parity: int, gpus: int, scratch) -> torch.Tensor:
     )
 
 
-def _operands(rank: int, length: int, rows: int, experts: int, dev):
+def _operands(rank: int, length: int, rows: int, experts: int, kv_dtype, dev):
     """The launch operands of ``rows`` chained rows (row 0 at ``length``)
-    whose routing picks among the first ``experts`` experts."""
+    whose routing picks among the first ``experts`` experts, with a
+    ``kv_dtype`` KV cache."""
     sh = layer_test._shared(42, length, rows)
     end = length + rows - 1
     w = layer_test._rank_weights(rank, end)
@@ -156,8 +158,8 @@ def _operands(rank: int, length: int, rows: int, experts: int, dev):
         slots.to(torch.int32).to(dev),
         sh["table"].to(dev),
         sh["table"].numel(),  # one request: the page table row stride
-        w["k_cache"].to(dev),
-        w["v_cache"].to(dev),
+        w["k_cache"].to(kv_dtype).to(dev),
+        w["v_cache"].to(kv_dtype).to(dev),
         ref.rope_table(end + 1).to(dev),
         bf16_tiles(w["w_o"]).to(dev),
         sh["h"][:, own].contiguous().to(dev),
@@ -245,7 +247,7 @@ def worker(rank: int, port: int, args) -> None:
     bases[:gpus] = group.bases.to(dev)
     bases[gpus:] = int(group.bases[rank]) + (ghost.data_ptr() - scratch.data_ptr())
     attn_ops, moe_ops, h_next, a_out = _operands(
-        rank, args.length, args.rows, args.experts, dev
+        rank, args.length, args.rows, args.experts, KV_DTYPES[args.kv_dtype], dev
     )
     step = torch.full((1,), 100, dtype=torch.int32, device=dev)
     idx = [absent_index(plan, p, gpus).to(dev) for p in (0, 1)]
@@ -349,7 +351,7 @@ def worker(rank: int, port: int, args) -> None:
         kind = "full" if args.full else "sliding"
         print(
             f"{gpus} GPU {kind} layer, {args.rows} rows, {args.experts} experts, "
-            f"at {args.length} tokens: "
+            f"at {args.length} tokens, {args.kv_dtype} KV: "
             f"warm {us['warm'] - f:.1f} us, cold {us['cold'] - us['flush'] - f:.1f} us "
             f"per launch (graph; flush {us['flush']:.1f}, fill {f:.1f} us subtracted)"
         )
@@ -414,6 +416,9 @@ def main() -> None:
     )
     p.add_argument("--length", type=int, default=8700, help="tokens in the KV cache")
     p.add_argument("--full", action="store_true", help="a full-attention layer")
+    p.add_argument(
+        "--kv-dtype", choices=tuple(KV_DTYPES), required=True, help="KV cache dtype"
+    )
     p.add_argument(
         "--rows", type=int, default=1, help="chained rows (a verify of rows - 1 drafts)"
     )

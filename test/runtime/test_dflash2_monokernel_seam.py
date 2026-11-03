@@ -173,7 +173,18 @@ def test_other_drafts_keep_the_regular_path(overrides, reason) -> None:
     assert reason in model_reasons(_draft(_config(**overrides)))
 
 
-def test_an_fp8_kv_cache_keeps_the_regular_path(monkeypatch) -> None:
-    """The kernels read and write BF16 keys and values."""
+@pytest.mark.parametrize(
+    "drafter_attention_backend, reasons", [(None, []), ("trtllm", [NOT_BF16_KV])]
+)
+def test_an_fp8_server_keeps_the_drafts_cache_bf16_unless_trtllm_attends(
+    monkeypatch, drafter_attention_backend, reasons
+) -> None:
+    """The kernels read and write BF16 keys and values. Under an FP8
+    --kv-cache-dtype the DFLASH draft's own cache stays BF16, except when it
+    attends with trtllm."""
     monkeypatch.setitem(global_server_args_dict, "kv_cache_dtype", "fp8_e4m3")
-    assert model_reasons(_draft(_config())) == [NOT_BF16_KV]
+    monkeypatch.setitem(global_server_args_dict, "speculative_algorithm", "DFLASH")
+    monkeypatch.setitem(
+        global_server_args_dict, "drafter_attention_backend", drafter_attention_backend
+    )
+    assert model_reasons(_draft(_config())) == reasons
