@@ -45,8 +45,10 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
     "FusedDecodeLayer",
+    "muse_spark_draft_head_decode",
     "muse_spark_draft_layer_decode",
     "muse_spark_layer_decode",
+    "prepare_muse_spark_draft_head",
     "prepare_muse_spark_draft_layer",
     "prepare_muse_spark_experts",
     "prepare_muse_spark_layer",
@@ -459,6 +461,97 @@ def muse_spark_layer_decode(
     )
 
 
+def prepare_muse_spark_draft_head(
+    *,
+    tensors: dict[str, torch.Tensor],
+    rank: int,
+    max_rows: int,
+    scale: float,
+    softcap: float,
+    override: str | None = None,
+) -> FusedDecodeLayer | None:
+    """Pack one TP8 rank's DFlash2 draft head (the vocabulary-parallel top 16
+    of each draft step and the candidate selector's scores) for its
+    monokernel.
+
+    Args:
+        tensors: The rank's weights by role (see
+            ``tokenspeed_kernel_amd...muse_spark.draft_head.pack_draft_head``).
+        rank: The rank in the TP8 group.
+        max_rows: The draft steps of one request's block.
+        scale: The logits' multiplier.
+        softcap: The final logit softcap.
+        override: Optional registered kernel name to force.
+
+    Returns:
+        The packed head, or None when no monokernel serves ``max_rows`` here.
+    """
+    try:
+        prepare = _select("muse_spark_draft_head_prepare", max_rows, override)
+        decode = _select("muse_spark_draft_head_decode", max_rows, override)
+    except NoKernelFoundError:
+        if override is not None:
+            raise
+        return None
+    weights, scratch_pairs, late_weights = prepare(
+        tensors=tensors, rank=rank, max_rows=max_rows, scale=scale, softcap=softcap
+    )
+    return FusedDecodeLayer(
+        decode=decode,
+        weights=weights,
+        scratch_pairs=scratch_pairs,
+        late_weights=late_weights,
+    )
+
+
+def muse_spark_draft_head_decode(
+    head: FusedDecodeLayer,
+    *,
+    x: torch.Tensor,
+    anchor: torch.Tensor,
+    cand_ids: torch.Tensor,
+    unary: torch.Tensor,
+    scores: torch.Tensor,
+    scratch: torch.Tensor,
+    step: torch.Tensor,
+    peer_bases: torch.Tensor,
+    compile_only: bool,
+) -> None:
+    """The DFlash2 draft head of one request's draft steps, on every rank of
+    the TP8 group at once (the launches exchange candidates).
+
+    Args:
+        head: From :func:`prepare_muse_spark_draft_head`.
+        x: BF16 ``[steps, 8192]``: the draft's final-norm output of the
+            block's rows 1 .. 7.
+        anchor: int64 ``[1]``: the block's first token.
+        cand_ids: int64 ``[steps, 16]`` out: each step's candidates, by
+            descending unary score (the lower token id first on a tie).
+        unary: FP32 ``[steps, 16]`` out: their softcapped logits.
+        scores: FP32 ``[steps, 16, 16]`` out: the selector's edge scores
+            from the previous step's candidate ``p`` to this step's ``c``.
+        scratch: int64 mailbox scratch of at least ``head.scratch_pairs`` on
+            the Iris symmetric heap.
+        step: int32 ``[1]`` counter that changes once per launch (CUDA
+            graph safe).
+        peer_bases: int64 ``[8]`` Iris heap bases of the group's ranks.
+        compile_only: Only compile the launch for these operands (compile on
+            every rank, synchronize the ranks, then launch).
+    """
+    head.decode(
+        weights=head.weights,
+        x=x,
+        anchor=anchor,
+        cand_ids=cand_ids,
+        unary=unary,
+        scores=scores,
+        scratch=scratch,
+        step=step,
+        peer_bases=peer_bases,
+        compile_only=compile_only,
+    )
+
+
 def prepare_muse_spark_draft_layer(
     *,
     tensors: dict[str, torch.Tensor],
@@ -504,7 +597,9 @@ def muse_spark_draft_layer_decode(
     x: torch.Tensor,
     residual: torch.Tensor,
     residual_out: torch.Tensor,
-    out: torch.Tensor,
+    out: torch.Tensor | None,
+    final_gain: torch.Tensor | None,
+    normed: torch.Tensor | None,
     seq_len: torch.Tensor,
     positions: torch.Tensor,
     slots: torch.Tensor,
@@ -529,7 +624,13 @@ def muse_spark_draft_layer_decode(
         residual_out: BF16 ``[rows, 8192]``: the rank stores its owned
             columns (``1024 rank ..``) of the residual after the attention
             sublayer; the other columns are left as they are.
-        out: BF16 ``[rows, 8192]``: this rank's partial of the layer output.
+        out: BF16 ``[rows, 8192]``: this rank's partial of the layer
+            output; None for the draft's last layer, whose launch also runs
+            the draft's final norm.
+        final_gain: None, or (the last layer) FP32 ``[1024]``: the final
+            norm's gain of the rank's owned columns.
+        normed: None, or (the last layer) BF16 ``[rows, 8192]``: the final
+            norm's output, the whole rows on every rank.
         seq_len: int32 ``[1]``: the request's length after the block.
         positions: int32 ``[rows]``: the block rows' positions.
         slots: int32 or int64 ``[rows]``: the block rows' cache slots.
@@ -553,6 +654,8 @@ def muse_spark_draft_layer_decode(
         residual=residual,
         residual_out=residual_out,
         out=out,
+        final_gain=final_gain,
+        normed=normed,
         seq_len=seq_len,
         positions=positions,
         slots=slots,

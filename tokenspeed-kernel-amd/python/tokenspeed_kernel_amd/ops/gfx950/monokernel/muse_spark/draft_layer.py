@@ -53,16 +53,32 @@ DRAFT_LAYERS = gl.constexpr(5)  # launches a draft forward runs
 SPLITS = 16  # attention splits: 16 x 128 keys hold the 2041 cached
 MAX_ROWS = 8  # one request's block
 
-PEERS = draft_attn.PEERS + draft_mlp.PEERS
+# The last layer's launch also runs the draft's final norm: fin puts the MLP
+# partial into the owners' ``fred``, fsum and fnorm (on sum1's CTAs, with its
+# residual in registers) form the normed rows in every rank's ``fhin``, and
+# fout stores them. The regions come last, so the other regions sit where the
+# other layers' plan has them: both plans share one scratch.
+FINAL_PEERS = ("fred", "fss", "fhin")
+PEERS = draft_attn.PEERS + draft_mlp.PEERS + FINAL_PEERS
+FOUT_TASKS = gl.constexpr(8)  # per row: 1024 columns each
 
 
 def regions(splits: int) -> tuple[tuple[str, int], ...]:
-    return draft_attn.regions(splits) + draft_mlp.regions()
+    world, owned, tasks = int(WORLD), int(draft_mlp.OWNED), int(draft_mlp.SUM_TASKS)
+    final = (
+        ("fred", world * owned // 2),
+        ("fss", world * tasks),
+        ("fhin", int(draft_mlp.HIDDEN) // 2),
+    )
+    return draft_attn.regions(splits) + draft_mlp.regions() + final
 
 
-def stages(bases: dict[str, int], splits: int, rows: int) -> tuple[Stage, ...]:
+def stages(
+    bases: dict[str, int], splits: int, rows: int, last: bool
+) -> tuple[Stage, ...]:
     """The layer's stages of ``rows`` token rows (one block), placed by
-    ``bases`` (both halves' names; ``isum`` and ``sum`` must match)."""
+    ``bases`` (both halves' names; ``isum`` and ``sum`` must match). The
+    ``last`` layer's launch ends in the draft's final norm."""
     if bases["isum"] != bases["sum"]:
         raise ValueError(
             "isum and sum must share CTAs: sum takes isum's residual from registers"
@@ -79,7 +95,17 @@ def stages(bases: dict[str, int], splits: int, rows: int) -> tuple[Stage, ...]:
     ]
     mlp_bases = {"scat": 0, **{k: v for k, v in bases.items() if k in _MLP_NAMES}}
     mlp = [st for st in draft_mlp.stages(mlp_bases, rows) if st.name != "scat"]
-    return tuple(attn + mlp)
+    if not last:
+        return tuple(attn + mlp)
+    fin = mlp[-1]
+    tasks = int(draft_mlp.SUM_TASKS) * rows
+    final = [
+        Stage(fin.name, fin.tasks, fin.base, reads=fin.reads, writes=("fred",)),
+        Stage("fsum", tasks, bases["sum"], reads=("fred",), writes=("fss",)),
+        Stage("fnorm", tasks, bases["sum"], reads=("fss",), writes=("fhin",)),
+        Stage("fout", int(FOUT_TASKS) * rows, bases["fout"], reads=("fhin",)),
+    ]
+    return tuple(attn + mlp[:-1] + final)
 
 
 _ATTN_NAMES = (
@@ -117,15 +143,17 @@ BASES = {
     "act": 144,
     "down": 0,
     "fin": 0,
+    "fout": 192,
 }
 
 
 @functools.lru_cache(maxsize=None)
-def layer_plan(rows: int) -> Plan:
-    """The plan of a draft layer for ``rows`` token rows (one block)."""
+def layer_plan(rows: int, last: bool) -> Plan:
+    """The plan of a draft layer for ``rows`` token rows (one block); the
+    ``last`` layer's ends in the draft's final norm."""
     return Plan(
         grid=256,
-        stages=stages(BASES, SPLITS, rows),
+        stages=stages(BASES, SPLITS, rows, last),
         regions=regions(SPLITS),
         rows=rows,
         chain=rows,
@@ -239,10 +267,13 @@ def gluon_muse_spark_draft_layer_gfx950(
     gu_w,
     down_w,
     out,
+    final_gain,
+    normed,
     trace_buf,
     PLAN: gl.constexpr,
     RANK: gl.constexpr,
     SPLITS_: gl.constexpr,
+    LAST: gl.constexpr,
 ):
     """One step of draft layer ``layer`` on rank ``RANK`` (see the module
     docstring and :func:`launch_gluon_muse_spark_draft_layer_gfx950`)."""
@@ -339,7 +370,7 @@ def gluon_muse_spark_draft_layer_gfx950(
         )
     # The MLP half: sum1 on isum1's CTAs, with its residual.
     if has_sum:
-        draft_mlp.sum_norm_regs(
+        r_lo, r_hi = draft_mlp.sum_norm_regs(
             mb,
             sum_task,
             r_lo,
@@ -437,7 +468,43 @@ def gluon_muse_spark_draft_layer_gfx950(
             "down",
         )
     task, active = schedule.stage_task(PLAN, "fin")
-    if active:
+    if LAST:
+        # The draft's final norm: the MLP partial goes to its owners, and
+        # sum1's CTAs add their residual and norm it (as the next layer's
+        # input norm would).
+        if active:
+            draft_mlp.fin_to_owners(
+                mb,
+                task,
+                m_base,
+                "dpart",
+                draft_mlp.DOWN_KPARTS,
+                "cpart",
+                draft_mlp.FIN_COLS,
+                RANK,
+                "fred",
+                "fin",
+            )
+        if has_sum:
+            draft_mlp.sum_norm_regs(
+                mb,
+                sum_task,
+                r_lo,
+                r_hi,
+                residual_out,
+                final_gain,
+                RANK,
+                "fred",
+                "fss",
+                "fhin",
+                "fsum",
+                "fnorm",
+                False,
+            )
+        task, active = schedule.stage_task(PLAN, "fout")
+        if active:
+            fout_stage(mb, task, normed)
+    elif active:
         draft_mlp.fin_stage(
             mb,
             task,
@@ -452,13 +519,33 @@ def gluon_muse_spark_draft_layer_gfx950(
     trace.flush(table_, trace_buf)
 
 
+@gluon.jit
+def fout_stage(mb, task, normed):
+    """Fout task ``task``: columns ``1024 (task % 8) ..`` of row ``task // 8``
+    of the final norm's output, from ``fhin`` into ``normed`` (BF16 ``[rows,
+    8192]``, the whole rows on every rank)."""
+    mb.stamp("fout", trace.START)
+    row, t, _ = schedule.row_task(mb.plan, task, FOUT_TASKS)
+    H: gl.constexpr = draft_mlp.HIDDEN
+    W: gl.constexpr = H // FOUT_TASKS // 2  # pairs of a task
+    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
+    j = t * W + gl.arange(0, W, lanes)
+    (got,) = mb.row(row).poll_many(("fhin",), (j,))
+    mb.stamp("fout", trace.READY)
+    words = normed.to(gl.pointer_type(gl.int32), bitcast=True)
+    gl.store(words + row * (H // 2) + j, got)
+    mb.stamp("fout", trace.END)
+
+
 def launch_gluon_muse_spark_draft_layer_gfx950(
     weights: DraftLayerWeights,
     *,
     x: torch.Tensor,
     residual: torch.Tensor,
     residual_out: torch.Tensor,
-    out: torch.Tensor,
+    out: torch.Tensor | None,
+    final_gain: torch.Tensor | None,
+    normed: torch.Tensor | None,
     seq_len: torch.Tensor,
     positions: torch.Tensor,
     slots: torch.Tensor,
@@ -485,15 +572,22 @@ def launch_gluon_muse_spark_draft_layer_gfx950(
         residual_out: BF16 ``[rows, 8192]``: this rank stores its owned
             columns (``1024 rank ..``) of the residual after the attention
             sublayer.
-        out: BF16 ``[rows, 8192]``: this rank's partial of the layer output.
+        out: BF16 ``[rows, 8192]``: this rank's partial of the layer
+            output; None for the draft's last layer, whose launch runs the
+            final norm instead.
+        final_gain: None, or (the last layer) FP32 ``[1024]``: the final
+            norm's gain of the rank's owned columns.
+        normed: None, or (the last layer) BF16 ``[rows, 8192]``: the final
+            norm's output, the whole rows on every rank.
         seq_len: int32 ``[1]``: the request's length after the block.
         positions: int32 ``[rows]``: the block rows' positions.
         slots: int32 or int64 ``[rows]``: the block rows' cache slots.
         page_table: int32 page table of the request (64 tokens a page).
         k_cache, v_cache: BF16 ``[slots, 1, 128]``: this layer's cache.
         cos_sin: FP32 ``[positions, 128]`` rotary table, cos then sin.
-        scratch: int64 mailbox pairs of ``layer_plan(rows).scratch_pairs``
-            on the Iris symmetric heap.
+        scratch: int64 mailbox pairs of ``layer_plan(rows, last)
+            .scratch_pairs`` (the last layer's plan is the larger) on the Iris
+            symmetric heap.
         step: int32 ``[1]`` counter that changes once per draft forward.
         peer_bases: int64 ``[8]`` heap bases of the group's ranks.
         layer: The draft layer index, below ``DRAFT_LAYERS``.
@@ -505,11 +599,18 @@ def launch_gluon_muse_spark_draft_layer_gfx950(
     rows = x.shape[0]
     if not 1 <= rows <= MAX_ROWS or rows % 8:
         raise ValueError(f"a draft block of 8 rows, got {rows}")
+    last = normed is not None
+    if (out is None) != last or (final_gain is not None) != last:
+        raise ValueError("either out, or (the last layer) final_gain and normed")
+    if last and (
+        final_gain.dtype != torch.float32 or tuple(final_gain.shape) != (1024,)
+    ):
+        raise ValueError("final_gain: FP32 [1024]")
     for name, t in (
         ("x", x),
         ("residual", residual),
         ("residual_out", residual_out),
-        ("out", out),
+        ("out" if not last else "normed", normed if last else out),
     ):
         if (
             t.dtype != torch.bfloat16
@@ -518,11 +619,15 @@ def launch_gluon_muse_spark_draft_layer_gfx950(
         ):
             raise ValueError(f"{name}: contiguous BF16 [{rows}, 8192]")
     # The launch reads x and residual while other CTAs already write the outputs.
-    if {x.data_ptr(), residual.data_ptr()} & {residual_out.data_ptr(), out.data_ptr()}:
+    written = normed if last else out
+    if {x.data_ptr(), residual.data_ptr()} & {
+        residual_out.data_ptr(),
+        written.data_ptr(),
+    }:
         raise ValueError("the outputs must not alias the inputs")
     if not 0 <= layer < int(DRAFT_LAYERS):
         raise ValueError(f"layer {layer} out of range({int(DRAFT_LAYERS)})")
-    plan = layer_plan(rows)
+    plan = layer_plan(rows, last)
     w = weights
     args = (
         scratch,
@@ -551,11 +656,15 @@ def launch_gluon_muse_spark_draft_layer_gfx950(
         w.m_base,
         w.gu,
         w.down,
-        out,
+        # The pointers a launch does not use point at a written tensor.
+        written,
+        final_gain if last else w.post_gain,
+        written,
         trace_buf,
         plan.key,
         w.rank,
         SPLITS,
+        last,
     )
     if compile_only:
         gluon_muse_spark_draft_layer_gfx950.warmup(
