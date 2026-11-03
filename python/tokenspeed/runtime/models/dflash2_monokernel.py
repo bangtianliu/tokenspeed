@@ -203,6 +203,27 @@ def takes_monokernels(rows: int, ctx: ForwardContext) -> bool:
     return ctx.forward_mode.is_decode() and ctx.bs == 1 and rows == BLOCK_ROWS
 
 
+def mailbox_scratch(
+    group: dist.ProcessGroup, rank: int, scratch_pairs: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``scratch_pairs`` mailbox pairs on the Iris symmetric heap of
+    ``group`` (``rank`` this process's rank in it), and the group's heap
+    bases. Nothing clears the scratch: the tags make old pairs stale."""
+    from tokenspeed_kernel.ops.communication._iris import (
+        MIN_HEAP_BYTES,
+        IrisGroup,
+        get_or_create_context,
+    )
+
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    context = get_or_create_context(heap_size=MIN_HEAP_BYTES)
+    iris_group = IrisGroup(context, group, rank, device)
+    scratch = context.zeros((scratch_pairs,), dtype=torch.int64)
+    bases = iris_group.bases.to(device)
+    iris_group.finish_prepare()
+    return scratch, bases
+
+
 class DraftMonokernelSteps:
     """The draft launches' shared state: the mailbox scratch on the Iris
     symmetric heap, the heap bases of the TP8 group and the step counter.
@@ -212,21 +233,9 @@ class DraftMonokernelSteps:
     its own."""
 
     def __init__(self, group: dist.ProcessGroup, rank: int, scratch_pairs: int) -> None:
-        from tokenspeed_kernel.ops.communication._iris import (
-            MIN_HEAP_BYTES,
-            IrisGroup,
-            get_or_create_context,
-        )
-
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        context = get_or_create_context(heap_size=MIN_HEAP_BYTES)
-        iris_group = IrisGroup(context, group, rank, device)
-        # Nothing clears the scratch: the tags make old pairs stale.
-        self.scratch = context.zeros((scratch_pairs,), dtype=torch.int64)
-        self.bases = iris_group.bases.to(device)
+        self.scratch, self.bases = mailbox_scratch(group, rank, scratch_pairs)
         # The launches' tag base: it moves once per forward, inside the graph.
-        self.step = torch.zeros(1, dtype=torch.int32, device=device)
-        iris_group.finish_prepare()
+        self.step = torch.zeros(1, dtype=torch.int32, device=self.scratch.device)
 
     def advance(self) -> None:
         """Give the next forward's launches a new tag (graph safe)."""
@@ -249,6 +258,8 @@ class DFlash2Monokernels:
             it, from :meth:`prepare` (None before it).
         compiled: Which binaries every rank compiled: the last layer's
             (True) and the others' (False).
+        block_pending: Whether the layers' launches ran a block whose head
+            has not run yet (the head reads their step counter).
         head: The draft head's launch, from :meth:`enable_head` (None
             before it, or when the head keeps the regular path).
     """
@@ -264,6 +275,7 @@ class DFlash2Monokernels:
         self.cpu_group: dist.ProcessGroup | None = None
         self.rank: int | None = None
         self.compiled: set[bool] = set()
+        self.block_pending = False
         self.head: DraftHeadMonokernel | None = None
 
     def prepare(
@@ -351,7 +363,20 @@ class DFlash2Monokernels:
             muse_spark_draft_layer_decode(fused, compile_only=False, **operands)
             x, res = out, res_out
         steps.advance()
+        self.block_pending = True
         return x
+
+    def run_head(
+        self, hidden_states: torch.Tensor, first_token: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The draft head's launch (:class:`DraftHeadMonokernel`) after the
+        layers' launches of the same forward."""
+        if not self.block_pending:
+            raise RuntimeError(
+                "the draft head monokernel runs after the draft layers' launches"
+            )
+        self.block_pending = False
+        return self.head(hidden_states, first_token)
 
     def enable_head(
         self,
@@ -392,7 +417,7 @@ class DFlash2Monokernels:
             )
             return
         self.head = DraftHeadMonokernel(
-            fused, self.device_group, self.cpu_group, self.rank
+            fused, self.device_group, self.cpu_group, self.rank, self.steps.step
         )
         logger.info("Decode monokernel: the DFlash2 draft head (top 16 and selector)")
 
@@ -441,12 +466,20 @@ def takes_head(rows: int) -> bool:
 
 
 class DraftHeadMonokernel:
-    """The draft head's launch: its packed weights, its own mailbox scratch
-    and step counter, and the TP8 group's CPU group for the compile-ahead.
+    """The draft head's launch: its packed weights, its own mailbox scratch,
+    and the TP8 group's CPU group for the compile-ahead.
+
+    It keeps no step counter of its own: it reads the draft layers', which
+    their launches advance once a block forward, before the head runs (the
+    head has its own scratch, so its tags never meet the layers'). The head
+    therefore runs only after the layers' launches of the same forward
+    (:meth:`DFlash2Monokernels.forward` marks the block, the head takes the
+    mark); a head without them would repeat the last launch's tag.
 
     Attributes:
         fused: The packed head.
-        steps: Its mailbox scratch, heap bases and step counter.
+        scratch, bases: Its mailbox scratch and the group's heap bases.
+        step: The draft layers' step counter.
         cpu_group: The TP8 group's CPU (gloo) process group.
         compiled: Whether every rank compiled the launch.
     """
@@ -457,45 +490,48 @@ class DraftHeadMonokernel:
         group: dist.ProcessGroup,
         cpu_group: dist.ProcessGroup,
         rank: int,
+        step: torch.Tensor,
     ) -> None:
         self.fused = fused
-        self.steps = DraftMonokernelSteps(group, rank, fused.scratch_pairs)
+        self.scratch, self.bases = mailbox_scratch(group, rank, fused.scratch_pairs)
+        self.step = step
         self.cpu_group = cpu_group
         self.compiled = False
 
     def __call__(
-        self, hidden_states: torch.Tensor, anchor: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, hidden_states: torch.Tensor, first_token: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The candidates and edge scores of one request's draft steps.
 
         Args:
             hidden_states: BF16 ``[7, 8192]``: the draft's final-norm output
                 of the block's rows 1 .. 7.
-            anchor: int64 ``[1]``: the block's first token.
+            first_token: int32 ``[1]``: the block's first token.
 
         Returns:
-            ``(candidate_ids, scores)``: int64 ``[7, 16]`` and FP32
+            ``(candidate_ids, scores, anchor)``: int64 ``[7, 16]`` and FP32
             ``[7, 16, 16]``, as ``VocabParallelTopK`` and
-            ``CandidateSelector`` give them.
+            ``CandidateSelector`` give them, and the first token clamped to
+            the vocabulary (int64 ``[1]``).
         """
         device = hidden_states.device
         operands = dict(
             x=hidden_states.contiguous(),
-            anchor=anchor,
+            first_token=first_token,
+            anchor=torch.empty(1, dtype=torch.int64, device=device),
             cand_ids=torch.empty(STEPS, TOPK, dtype=torch.int64, device=device),
             unary=torch.empty(STEPS, TOPK, dtype=torch.float32, device=device),
             scores=torch.empty(STEPS, TOPK, TOPK, dtype=torch.float32, device=device),
-            scratch=self.steps.scratch,
-            step=self.steps.step,
-            peer_bases=self.steps.bases,
+            scratch=self.scratch,
+            step=self.step,
+            peer_bases=self.bases,
         )
         if not self.compiled:
             muse_spark_draft_head_decode(self.fused, compile_only=True, **operands)
             dist.barrier(group=self.cpu_group)
             self.compiled = True
         muse_spark_draft_head_decode(self.fused, compile_only=False, **operands)
-        self.steps.advance()
-        return operands["cand_ids"], operands["scores"]
+        return operands["cand_ids"], operands["scores"], operands["anchor"]
 
 
 def enable_draft_monokernels(model: torch.nn.Module) -> None:
@@ -534,6 +570,7 @@ __all__ = [
     "DraftMonokernelSteps",
     "enable_draft_monokernels",
     "head_reasons",
+    "mailbox_scratch",
     "layer_tensors",
     "model_reasons",
     "takes_head",

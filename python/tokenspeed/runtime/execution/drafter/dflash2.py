@@ -201,18 +201,22 @@ class DFlash2(DFlash):
         hidden_states = draft_hidden[:, 1:, :]
         batch_size, num_steps, _ = hidden_states.shape
         top_k = self.selector_top_k
-        anchor_token_ids = (
-            block_ids[:, 0].to(torch.int64).clamp(0, self.draft_vocab_size - 1)
-        )
         monokernels = self.model.monokernels
-        head = None if monokernels is None else monokernels.head
-        if head is not None and takes_head(batch_size * num_steps):
-            candidate_ids, scores = head(
-                hidden_states.reshape(-1, self.hidden_size), anchor_token_ids
+        if (
+            monokernels is not None
+            and monokernels.head is not None
+            and takes_head(batch_size * num_steps)
+        ):
+            # The launch also clamps the anchor token for the walk.
+            candidate_ids, scores, anchor_token_ids = monokernels.run_head(
+                hidden_states.reshape(-1, self.hidden_size), block_ids[0, :1]
             )
             candidate_ids = candidate_ids.view(batch_size, num_steps, top_k)
             scores = scores.view(batch_size, num_steps, top_k, top_k)
         else:
+            anchor_token_ids = (
+                block_ids[:, 0].to(torch.int64).clamp(0, self.draft_vocab_size - 1)
+            )
             candidate_ids, unary_logits = self._compute_candidates(
                 hidden_states.reshape(-1, self.hidden_size)
             )
