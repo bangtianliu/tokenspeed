@@ -163,12 +163,13 @@ def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
 
 
 @gluon.jit
-def scat_stage(mb, task, z, RANK: gl.constexpr, STAGE: gl.constexpr):
-    """Scat task ``task``: columns ``64 task ..`` of every row of ``z``.
+def scat_stage(mb, task, z, RANK: gl.constexpr, RED: gl.constexpr, STAGE: gl.constexpr):
+    """Scat task ``task``: columns ``64 task ..`` of every row of ``z``, into
+    the owner ranks' ``RED`` (the peer region of the sum).
 
     Args:
-        z: This rank's BF16 attention partial ``[rows, 8192]``, written by an
-            earlier launch.
+        z: This rank's BF16 partial ``[rows, 8192]``, written by an earlier
+            launch.
     """
     R: gl.constexpr = schedule.rows(mb.plan)
     RP: gl.constexpr = triton.next_power_of_2(R)
@@ -190,12 +191,24 @@ def scat_stage(mb, task, z, RANK: gl.constexpr, STAGE: gl.constexpr):
     owner = task // cols_per_rank
     at = RANK * (OWNED // 2) + (task % cols_per_rank) * (SCAT_COLS // 2) + p
     # One put serves every row; the padding rows past R are masked.
-    mb.put_peer("red", owner, mb.row_offset(r) + at, word, mask=(r < R) & (p >= 0))
+    mb.put_peer(RED, owner, mb.row_offset(r) + at, word, mask=(r < R) & (p >= 0))
     mb.stamp(STAGE, trace.END)
 
 
 @gluon.jit
-def sum_norm_stages(mb, task, residual, residual_out, gain, RANK: gl.constexpr):
+def sum_norm_stages(
+    mb,
+    task,
+    residual,
+    residual_out,
+    gain,
+    RANK: gl.constexpr,
+    RED: gl.constexpr,
+    SS: gl.constexpr,
+    HIN: gl.constexpr,
+    SUM: gl.constexpr,
+    NORM: gl.constexpr,
+):
     """Tasks ``task`` of sum1 and norm: owned columns ``128 (task % 8) ..``
     (of the rank's 1024) of row ``task // 8``.
 
@@ -206,7 +219,7 @@ def sum_norm_stages(mb, task, residual, residual_out, gain, RANK: gl.constexpr):
             columns of the residual after the attention sublayer.
         gain: FP32 ``[1024]`` post-attention norm gain, owned columns.
     """
-    mb.stamp("sum1", trace.START)
+    mb.stamp(SUM, trace.START)
     row, task, _ = schedule.row_task(mb.plan, task, SUM_TASKS)
     mb = mb.row(row)
     nw: gl.constexpr = gl.num_warps()
@@ -222,9 +235,9 @@ def sum_norm_stages(mb, task, residual, residual_out, gain, RANK: gl.constexpr):
     gain_lo = gl.load(gain + c)
     gain_hi = gl.load(gain + c + 1)
     (got,) = mb.poll_many(
-        ("red",), (src[:, None] * (OWNED // 2) + task * (SUM_COLS // 2) + j[None, :],)
+        (RED,), (src[:, None] * (OWNED // 2) + task * (SUM_COLS // 2) + j[None, :],)
     )
-    mb.stamp("sum1", trace.READY)
+    mb.stamp(SUM, trace.READY)
     lo_all = (got << 16).to(gl.float32, bitcast=True)
     hi_all = (got & -65536).to(gl.float32, bitcast=True)
     # The rank order of the regular path's reduction: 0, then 1, ...
@@ -243,12 +256,12 @@ def sum_norm_stages(mb, task, residual, residual_out, gain, RANK: gl.constexpr):
     total = gl.sum(lo * lo + hi * hi, axis=0)
     word = (gl.zeros([1], gl.float32, lanes) + total).to(gl.int32, bitcast=True)
     for p in gl.static_range(WORLD):
-        mb.put_peer("ss", p, RANK * SUM_TASKS + task + one, word)
-    mb.stamp("sum1", trace.END)
+        mb.put_peer(SS, p, RANK * SUM_TASKS + task + one, word)
+    mb.stamp(SUM, trace.END)
 
-    mb.stamp("norm", trace.START)
-    (got,) = mb.poll_many(("ss",), (gl.arange(0, WORLD * SUM_TASKS, lanes),))
-    mb.stamp("norm", trace.READY)
+    mb.stamp(NORM, trace.START)
+    (got,) = mb.poll_many((SS,), (gl.arange(0, WORLD * SUM_TASKS, lanes),))
+    mb.stamp(NORM, trace.READY)
     inv = gl.rsqrt(gl.sum(got.to(gl.float32, bitcast=True), axis=0) / HIDDEN + EPS)
     h_lo = (lo * inv * gain_lo).to(gl.bfloat16)
     h_hi = (hi * inv * gain_hi).to(gl.bfloat16)
@@ -256,8 +269,8 @@ def sum_norm_stages(mb, task, residual, residual_out, gain, RANK: gl.constexpr):
         h_hi.to(gl.int16, bitcast=True).to(gl.int32) << 16
     )
     for p in gl.static_range(WORLD):
-        mb.put_peer("hin", p, RANK * (OWNED // 2) + c // 2, word)
-    mb.stamp("norm", trace.END)
+        mb.put_peer(HIN, p, RANK * (OWNED // 2) + c // 2, word)
+    mb.stamp(NORM, trace.END)
 
 
 @gluon.jit
@@ -368,12 +381,12 @@ def kq_layout(KP, Q, num_warps):
 
 
 @gluon.jit
-def coefficient(mb, row, index):
+def coefficient(mb, row, index, CPART: gl.constexpr):
     """BF16-rounded convolution coefficient ``index`` (side x tap x group) of
     row ``row``: the sum of coef's two K parts, rounded as the regular path's
-    GEMV output is. Polls ``cpart``."""
+    GEMV output is. Polls ``CPART``."""
     lo, hi = mb.poll_many(
-        ("cpart", "cpart"),
+        (CPART, CPART),
         (mb.row_offset(row) + index, mb.row_offset(row) + COEFS + index),
     )
     total = lo.to(gl.float32, bitcast=True) + hi.to(gl.float32, bitcast=True)
@@ -381,7 +394,15 @@ def coefficient(mb, row, index):
 
 
 @gluon.jit
-def conv0_stage(mb, task, base, STAGE: gl.constexpr):
+def conv0_stage(
+    mb,
+    task,
+    base,
+    HIN: gl.constexpr,
+    CPART: gl.constexpr,
+    HC: gl.constexpr,
+    STAGE: gl.constexpr,
+):
     """Conv0 task ``task``: channels ``128 task ..`` of every row.
 
     Args:
@@ -402,11 +423,11 @@ def conv0_stage(mb, task, base, STAGE: gl.constexpr):
     rp = gl.maximum(rc - 1, 0)
     g = c // GROUP_SIZE  # both halves share a group
     h_w, hp_w = mb.poll_many(
-        ("hin", "hin"), (mb.row_offset(rc) + c // 2, mb.row_offset(rp) + c // 2)
+        (HIN, HIN), (mb.row_offset(rc) + c // 2, mb.row_offset(rp) + c // 2)
     )
     # Side 0's coefficients: tap 0 at g, tap 1 at GROUPS + g.
-    d0 = coefficient(mb, rc, g)
-    d1 = coefficient(mb, rc, GROUPS + g)
+    d0 = coefficient(mb, rc, g, CPART)
+    d1 = coefficient(mb, rc, GROUPS + g, CPART)
     mb.stamp(STAGE, trace.READY)
     live = (rc % BLOCK) >= 1  # tap 1 stays within the row's block
     h_lo = (h_w << 16).to(gl.float32, bitcast=True)
@@ -418,7 +439,7 @@ def conv0_stage(mb, task, base, STAGE: gl.constexpr):
     word = (y_lo.to(gl.bfloat16).to(gl.int16, bitcast=True).to(gl.int32) & 0xFFFF) | (
         y_hi.to(gl.bfloat16).to(gl.int16, bitcast=True).to(gl.int32) << 16
     )
-    mb.put("hc", mb.row_offset(r) + c // 2, word, mask=(r < R) & (j >= 0))
+    mb.put(HC, mb.row_offset(r) + c // 2, word, mask=(r < R) & (j >= 0))
     mb.stamp(STAGE, trace.END)
 
 
@@ -471,7 +492,16 @@ def act_stage(mb, task, STAGE: gl.constexpr):
 
 
 @gluon.jit
-def fin_stage(mb, task, base, out, STAGE: gl.constexpr):
+def fin_stage(
+    mb,
+    task,
+    base,
+    out,
+    SRC: gl.constexpr,
+    KP: gl.constexpr,
+    CPART: gl.constexpr,
+    STAGE: gl.constexpr,
+):
     """Fin task ``task``: columns ``32 task ..`` of every row.
 
     Args:
@@ -482,7 +512,7 @@ def fin_stage(mb, task, base, out, STAGE: gl.constexpr):
     RP: gl.constexpr = triton.next_power_of_2(R)
     mb.stamp(STAGE, trace.START)
     nw: gl.constexpr = gl.num_warps()
-    KQ: gl.constexpr = triton.next_power_of_2(DOWN_KPARTS)
+    KQ: gl.constexpr = triton.next_power_of_2(KP)
     ll: gl.constexpr = kq_layout(KQ, FIN_COLS, nw)
     r = gl.arange(0, RP, gl.SliceLayout(1, gl.SliceLayout(2, ll)))[:, None, None]
     k = gl.arange(0, KQ, gl.SliceLayout(0, gl.SliceLayout(2, ll)))[None, :, None]
@@ -494,17 +524,17 @@ def fin_stage(mb, task, base, out, STAGE: gl.constexpr):
     b1 = gl.load(base + 3 * HIDDEN + c2).to(gl.float32)  # side 1, tap 1
     rc = gl.minimum(r, R - 1)
     rp = gl.maximum(rc - 1, 0)
-    col = gl.minimum(k, DOWN_KPARTS - 1) * HIDDEN + task * FIN_COLS + n
+    col = gl.minimum(k, KP - 1) * HIDDEN + task * FIN_COLS + n
     rc2 = gl.minimum(r2, R - 1)
     g2 = c2 // GROUP_SIZE
     # Side 1's coefficients: tap 0 at 2 GROUPS + g, tap 1 at 3 GROUPS + g.
-    t0 = coefficient(mb, rc2, 2 * GROUPS + g2)
-    t1 = coefficient(mb, rc2, 3 * GROUPS + g2)
+    t0 = coefficient(mb, rc2, 2 * GROUPS + g2, CPART)
+    t1 = coefficient(mb, rc2, 3 * GROUPS + g2, CPART)
     cur_w, prev_w = mb.poll_many(
-        ("dpart", "dpart"), (mb.row_offset(rc) + col, mb.row_offset(rp) + col)
+        (SRC, SRC), (mb.row_offset(rc) + col, mb.row_offset(rp) + col)
     )
     mb.stamp(STAGE, trace.READY)
-    live_k = k < DOWN_KPARTS
+    live_k = k < KP
     # The regular path's GEMV rounds the down projection to BF16.
     d = gl.sum(gl.where(live_k, cur_w.to(gl.float32, bitcast=True), 0.0), axis=1)
     dp = gl.sum(gl.where(live_k, prev_w.to(gl.float32, bitcast=True), 0.0), axis=1)
