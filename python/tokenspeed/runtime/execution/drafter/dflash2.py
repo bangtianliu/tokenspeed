@@ -42,6 +42,7 @@ from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.layers.vocab_parallel_topk import VocabParallelTopK
+from tokenspeed.runtime.models.dflash2_monokernel import takes_head
 from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
 from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -160,6 +161,17 @@ class DFlash2(DFlash):
             dp_sampling_enabled=processor.dp_sampling_enabled,
             fp8_weight=self.model.fp8_head,
         )
+        monokernels = self.model.monokernels
+        if monokernels is not None and monokernels.steps is not None:
+            # --decode-monokernel: the top 16 and the selector of one
+            # request's block as one launch.
+            monokernels.enable_head(
+                self.lm_head,
+                self.candidate_selector,
+                top_k_exact=self.candidate_topk.enabled,
+                scale=self.output_multiplier,
+                softcap=self.final_logit_softcapping,
+            )
 
     def _compute_candidates(
         self, hidden_states: torch.Tensor
@@ -189,20 +201,30 @@ class DFlash2(DFlash):
     ) -> torch.Tensor:
         hidden_states = draft_hidden[:, 1:, :]
         batch_size, num_steps, _ = hidden_states.shape
-        candidate_ids, unary_logits = self._compute_candidates(
-            hidden_states.reshape(-1, self.hidden_size)
-        )
-        candidate_ids = candidate_ids.view(batch_size, num_steps, self.selector_top_k)
-        unary_logits = unary_logits.view_as(candidate_ids)
+        top_k = self.selector_top_k
         anchor_token_ids = (
             block_ids[:, 0].to(torch.int64).clamp(0, self.draft_vocab_size - 1)
         )
-        scores = self.candidate_selector(
-            candidate_ids,
-            unary_logits,
-            hidden_states,
-            anchor_token_ids,
-        )
+        monokernels = self.model.monokernels
+        head = None if monokernels is None else monokernels.head
+        if head is not None and takes_head(batch_size * num_steps):
+            candidate_ids, scores = head(
+                hidden_states.reshape(-1, self.hidden_size), anchor_token_ids
+            )
+            candidate_ids = candidate_ids.view(batch_size, num_steps, top_k)
+            scores = scores.view(batch_size, num_steps, top_k, top_k)
+        else:
+            candidate_ids, unary_logits = self._compute_candidates(
+                hidden_states.reshape(-1, self.hidden_size)
+            )
+            candidate_ids = candidate_ids.view(batch_size, num_steps, top_k)
+            unary_logits = unary_logits.view_as(candidate_ids)
+            scores = self.candidate_selector(
+                candidate_ids,
+                unary_logits,
+                hidden_states,
+                anchor_token_ids,
+            )
         self._walk(candidate_ids, scores, anchor_token_ids, next_tokens)
         return next_tokens
 
