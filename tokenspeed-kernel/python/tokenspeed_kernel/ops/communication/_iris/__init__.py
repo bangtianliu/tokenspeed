@@ -31,7 +31,7 @@ with redirect_triton_to_tokenspeed_triton():
 
 MIN_HEAP_BYTES = 256 << 20
 # Heap beyond the communication buffers. The decode monokernels' mailbox
-# scratch lives here: Muse Spark's target layers take 12.8 MiB (8 rows; 25.7
+# scratch lives here: Muse Spark's target layers take 16.9 MiB (8 rows; 34
 # MiB for 16) and its DFlash2 draft launches 22 MiB more.
 HEAP_HEADROOM_BYTES = 48 << 20
 _context = None
