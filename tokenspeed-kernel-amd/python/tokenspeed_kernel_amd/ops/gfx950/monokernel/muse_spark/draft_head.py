@@ -41,7 +41,9 @@ draft steps (the block's rows 1 .. 7), on every rank of the TP8 group:
 * score, on merge2's CTAs: the selector's edge scores
   ``unary[c] + bf16(sum_r bf16(pred[p, r] h[r]) succ[c, r])``, where ``pred``
   holds the codebook rows of the previous step's candidates (the anchor
-  token for step 0) and ``succ`` those of this step's.
+  token for step 0) and ``succ`` those of this step's. Step 0's task also
+  stores the anchor, the block's first token clamped to the vocabulary, for
+  the walk that follows.
 
 Every rank computes the same outputs, as the regular path does.
 """
@@ -80,6 +82,7 @@ HPROJ_KS = gl.constexpr(1024)
 HPROJ_KPARTS = gl.constexpr(8)
 HPROJ_TASKS = gl.constexpr(16)  # 2 groups of 128 rows x 8 K parts
 STEPS = 7  # draft steps a block: rows 1 .. 7
+VOCAB_IDS = gl.constexpr(VOCAB)
 ID_BITS = gl.constexpr(15)  # a shard row's index fits 15 bits
 GID_BITS = gl.constexpr(18)  # a token id fits 18 bits
 
@@ -302,31 +305,57 @@ def hproj_stage(mb, task, x, w):
 
 
 @gluon.jit
+def _best16(values, axis: gl.constexpr, layout: gl.constexpr):
+    """The 16 largest of ``values`` along ``axis``, largest first, as a new
+    last dimension of 16 (the values are distinct; -1 is below them all)."""
+    j = gl.arange(0, TOPK, layout)
+    if axis == 1:
+        j = j[None, :]
+    best = gl.full(
+        j.shape if axis == 0 else [values.shape[0], TOPK],
+        -1,
+        values.dtype,
+        j.type.layout,
+    )
+    for i in gl.static_range(TOPK):
+        m = gl.max(values, axis=axis)
+        if axis == 1:
+            m = m[:, None]
+        best = gl.where(j == i, m, best)
+        values = gl.where(values == m, -1, values)
+    return best
+
+
+@gluon.jit
 def merge_stages(mb, row, RANK: gl.constexpr, softcap, cand_ids, unary):
     """Merge1 and merge2 of step ``row``. Returns the step's sorted
-    candidate ids (int32) and unary scores (FP32), ``[16]`` in a lane
-    layout."""
-    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
+    candidate ids (int32) and unary scores (FP32), ``[16]`` in a layout every
+    warp holds whole."""
+    nw: gl.constexpr = gl.num_warps()
+    # A warp per row of 512 candidates: its best 16 with in-warp reductions.
+    wl: gl.constexpr = gl.BlockedLayout([1, 8], [1, 64], [nw, 1], [1, 0])
+    # 128 values that every warp holds whole: in-warp reductions again.
+    ww: gl.constexpr = gl.BlockedLayout([2], [64], [nw], [0])
     mr = mb.row(row)
     # merge1: the rank's best 16 of the lmh tasks' 16s.
     mb.stamp("merge1", trace.START)
     N1: gl.constexpr = LMH_TASKS * TOPK
-    i1 = gl.arange(0, triton.next_power_of_2(N1), lanes)
+    W1: gl.constexpr = triton.next_power_of_2(N1) // nw
+    w = gl.arange(0, nw, gl.SliceLayout(1, wl))[:, None]
+    c = gl.arange(0, W1, gl.SliceLayout(0, wl))[None, :]
+    i1 = w * W1 + c
     (got,) = mr.poll_many(("tk",), (gl.minimum(i1, N1 - 1),))
     mb.stamp("merge1", trace.READY)
-    vals = gl.where(i1 < N1, got, -1)
-    j = gl.arange(0, TOPK, lanes)
-    best = gl.full([TOPK], -1, gl.int32, lanes)
-    for i in gl.static_range(TOPK):
-        m = gl.max(vals, axis=0)
-        best = gl.where(j == i, m, best)
-        vals = gl.where(vals == m, -1, vals)
+    per_warp = _best16(gl.where(i1 < N1, got, -1), 1, gl.SliceLayout(0, wl))
+    flat = gl.convert_layout(gl.reshape(per_warp, [nw * TOPK]), ww)
+    best = _best16(flat, 0, ww)
+    j = gl.arange(0, TOPK, ww)
     for p in gl.static_range(WORLD):
         mr.put_peer("rk", p, RANK * TOPK + j, best)
     mb.stamp("merge1", trace.END)
     # merge2: the best 16 of every rank's 16, by value, then token id.
     mb.stamp("merge2", trace.START)
-    i2 = gl.arange(0, WORLD * TOPK, lanes)
+    i2 = gl.arange(0, WORLD * TOPK, ww)
     (got,) = mr.poll_many(("rk",), (i2,))
     mb.stamp("merge2", trace.READY)
     lid = (1 << ID_BITS) - 1 - (got & ((1 << ID_BITS) - 1))
@@ -334,11 +363,7 @@ def merge_stages(mb, row, RANK: gl.constexpr, softcap, cand_ids, unary):
     key = ((got >> ID_BITS).to(gl.int64) << GID_BITS) | ((1 << GID_BITS) - 1 - gid).to(
         gl.int64
     )
-    best = gl.full([TOPK], -1, gl.int64, lanes)
-    for i in gl.static_range(TOPK):
-        m = gl.max(key, axis=0)
-        best = gl.where(j == i, m, best)
-        key = gl.where(key == m, -1, key)
+    best = _best16(key, 0, ww)
     ids = ((1 << GID_BITS) - 1 - (best & ((1 << GID_BITS) - 1))).to(gl.int32)
     value = _unordered((best >> GID_BITS).to(gl.int32))
     # The regular path's softcap: c (2 sigmoid(2 x / c) - 1).
@@ -351,7 +376,7 @@ def merge_stages(mb, row, RANK: gl.constexpr, softcap, cand_ids, unary):
 
 
 @gluon.jit
-def score_stage(mb, row, ids, u, anchor, pred_cb, succ_cb, scores):
+def score_stage(mb, row, ids, u, first_token, anchor, pred_cb, succ_cb, scores):
     """Score task of step ``row``: the selector's 16 x 16 edge scores
     ``scores[row, p, c]`` from step ``row - 1``'s candidate ``p`` (the anchor
     token for step 0) to this step's candidate ``c``."""
@@ -372,7 +397,10 @@ def score_stage(mb, row, ids, u, anchor, pred_cb, succ_cb, scores):
     # The predecessors: the previous step's candidates (or the anchor).
     pj = gl.arange(0, TOPK, gl.SliceLayout(1, lp))
     if row == 0:
-        pid = gl.zeros([TOPK], gl.int64, gl.SliceLayout(1, lp)) + gl.load(anchor)
+        token = gl.load(first_token).to(gl.int64)
+        token = gl.minimum(gl.maximum(token, 0), VOCAB_IDS - 1)
+        gl.store(anchor, token)
+        pid = gl.zeros([TOPK], gl.int64, gl.SliceLayout(1, lp)) + token
     else:
         (prev,) = mb.row(row - 1).poll_many(("cid",), (pj,))
         pid = prev.to(gl.int64)
@@ -402,6 +430,7 @@ def gluon_muse_spark_draft_head_gfx950(
     hproj_w,
     pred_cb,
     succ_cb,
+    first_token,
     anchor,
     cand_ids,
     unary,
@@ -426,7 +455,7 @@ def gluon_muse_spark_draft_head_gfx950(
     row, active = schedule.stage_task(PLAN, "merge1")
     if active:
         ids, u = merge_stages(mb, row, RANK, softcap, cand_ids, unary)
-        score_stage(mb, row, ids, u, anchor, pred_cb, succ_cb, scores)
+        score_stage(mb, row, ids, u, first_token, anchor, pred_cb, succ_cb, scores)
     trace.flush(table_, trace_buf)
 
 
@@ -434,6 +463,7 @@ def launch_gluon_muse_spark_draft_head_gfx950(
     weights: DraftHeadWeights,
     *,
     x: torch.Tensor,
+    first_token: torch.Tensor,
     anchor: torch.Tensor,
     cand_ids: torch.Tensor,
     unary: torch.Tensor,
@@ -451,8 +481,9 @@ def launch_gluon_muse_spark_draft_head_gfx950(
         weights: From :func:`pack_draft_head`.
         x: BF16 ``[steps, 8192]`` contiguous: the draft's final-norm output
             of the block's rows 1 .. 7 (the same on every rank).
-        anchor: int64 ``[1]``: the block's first token (step 0's
+        first_token: int32 ``[1]``: the block's first token (step 0's
             predecessor).
+        anchor: int64 ``[1]`` out: that token clamped to the vocabulary.
         cand_ids: int64 ``[steps, 16]`` out: each step's candidate token ids,
             by descending unary score.
         unary: FP32 ``[steps, 16]`` out: their softcapped logits.
@@ -460,7 +491,7 @@ def launch_gluon_muse_spark_draft_head_gfx950(
             the previous step's candidate ``p`` to this step's ``c``.
         scratch: int64 mailbox pairs of ``head_plan(steps).scratch_pairs`` on
             the Iris symmetric heap.
-        step: int32 ``[1]`` counter that changes once per draft forward.
+        step: int32 ``[1]`` counter that changes from launch to launch.
         peer_bases: int64 ``[8]`` heap bases of the group's ranks.
         trace_buf: None, or a trace buffer (``trace.py``).
         compile_only: Only compile the launch for these operands.
@@ -475,6 +506,7 @@ def launch_gluon_muse_spark_draft_head_gfx950(
     ):
         raise ValueError(f"x: contiguous BF16 [{rows}, 8192]")
     for name, t, dtype, shape in (
+        ("first_token", first_token, torch.int32, (1,)),
         ("anchor", anchor, torch.int64, (1,)),
         ("cand_ids", cand_ids, torch.int64, (rows, 16)),
         ("unary", unary, torch.float32, (rows, 16)),
@@ -493,6 +525,7 @@ def launch_gluon_muse_spark_draft_head_gfx950(
         w.hproj,
         w.pred,
         w.succ,
+        first_token,
         anchor,
         cand_ids,
         unary,

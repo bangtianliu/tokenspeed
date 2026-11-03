@@ -508,6 +508,7 @@ def muse_spark_draft_head_decode(
     head: FusedDecodeLayer,
     *,
     x: torch.Tensor,
+    first_token: torch.Tensor,
     anchor: torch.Tensor,
     cand_ids: torch.Tensor,
     unary: torch.Tensor,
@@ -524,7 +525,9 @@ def muse_spark_draft_head_decode(
         head: From :func:`prepare_muse_spark_draft_head`.
         x: BF16 ``[steps, 8192]``: the draft's final-norm output of the
             block's rows 1 .. 7.
-        anchor: int64 ``[1]``: the block's first token.
+        first_token: int32 ``[1]``: the block's first token.
+        anchor: int64 ``[1]`` out: that token clamped to the vocabulary
+            (step 0's predecessor, for the walk).
         cand_ids: int64 ``[steps, 16]`` out: each step's candidates, by
             descending unary score (the lower token id first on a tie).
         unary: FP32 ``[steps, 16]`` out: their softcapped logits.
@@ -532,8 +535,8 @@ def muse_spark_draft_head_decode(
             from the previous step's candidate ``p`` to this step's ``c``.
         scratch: int64 mailbox scratch of at least ``head.scratch_pairs`` on
             the Iris symmetric heap.
-        step: int32 ``[1]`` counter that changes once per launch (CUDA
-            graph safe).
+        step: int32 ``[1]`` counter that changes from launch to launch
+            (CUDA graph safe).
         peer_bases: int64 ``[8]`` Iris heap bases of the group's ranks.
         compile_only: Only compile the launch for these operands (compile on
             every rank, synchronize the ranks, then launch).
@@ -541,6 +544,7 @@ def muse_spark_draft_head_decode(
     head.decode(
         weights=head.weights,
         x=x,
+        first_token=first_token,
         anchor=anchor,
         cand_ids=cand_ids,
         unary=unary,
