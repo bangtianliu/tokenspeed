@@ -76,11 +76,12 @@ def attention_kernel(
         attention.head_stage(
             mb, task, seq_len, slot, k_cache, v_cache, cos_sin, ROPE, "head"
         )
-    task, active = schedule.stage_task(PLAN, "attn")
-    if active:
+    G: gl.constexpr = schedule.grid(PLAN)
+    attn_task, attn_rounds = schedule.stage_rounds(PLAN, "attn")
+    for i in range(attn_rounds):
         attention.attn_stage(
             mb,
-            task,
+            attn_task + i * G,
             seq_len,
             table,
             table_stride,
@@ -212,11 +213,12 @@ def test_attention_matches_the_regular_path_math(
         for t in range(rows):
             row = b * rows + t
             got = payloads(scratch, plan, "z", HEADS * HEAD // 2, tag, row=row)
-            # FP32 sums in another order: within about one BF16 rounding step.
+            # FP32 sums in another order, then two BF16 roundings (the
+            # merge's output and the gated head norm): within two steps.
             torch.testing.assert_close(
                 got.view(torch.bfloat16).cpu().float(),
                 z[t].float(),
-                rtol=2**-7,
+                rtol=2**-6,
                 atol=1e-3,
             )
             # The cache gets the rotated k and the raw v of each row's token.

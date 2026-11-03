@@ -453,12 +453,14 @@ def _two_requests_worker(rank: int, port: int, full: bool) -> None:
         # request in a launch of its own. A row's FP32 sums reduce across
         # lanes in a tree that the launch's row count shapes, so the FP32
         # residual may differ by a rounding step of a row factor (an
-        # absolute error at the row's scale); everything rounded to BF16
-        # (the next input, the caches) is the same bits.
+        # absolute error at the row's scale), and the next input, its BF16
+        # norm, may then round a value the other way; the caches are the
+        # same bits.
         want = torch.cat([o[0] for o in one])
         scale = want.abs().amax(dim=1, keepdim=True)
+        want_a = torch.cat([o[1] for o in one]).float()
         assert torch.all((h2 - want).abs() <= 2**-21 * scale)
-        assert torch.equal(a2, torch.cat([o[1] for o in one]))
+        assert torch.all((a2.float() - want_a).abs() <= 2**-7 * want_a.abs())
         assert torch.equal(together[0], apart[0])
         assert torch.equal(together[1], apart[1])
     finally:

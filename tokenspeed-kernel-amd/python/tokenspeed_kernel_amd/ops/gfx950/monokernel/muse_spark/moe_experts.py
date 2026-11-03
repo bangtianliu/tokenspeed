@@ -150,15 +150,28 @@ def slots(ids):
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     owner = gl.convert_layout(1 - gl.max(seen.to(gl.int32), axis=1), lanes)
     slot = gl.cumsum(owner, axis=0) - owner
+    # Each pick's row picks: for row r, the pick of r that chose the same
+    # expert (or -1). A slot then reads its rows' picks in one reduction
+    # (:func:`_row_picks`), not one a row.
+    RP: gl.constexpr = NP // TOP_K
+    same = ids[None, :] == mine
+    k = gl.where(same, q % TOP_K, -1)
+    table = gl.max(gl.reshape(k, [NP, RP, TOP_K]), axis=2)
     # The ids stay a lane each, not a copy in every thread: the expert steps
     # run at the register limit past one row, and the copies spill.
-    return gl.convert_layout(ids, lanes), owner, slot, gl.sum(owner, axis=0)
+    return (
+        gl.convert_layout(ids, lanes),
+        owner,
+        slot,
+        gl.sum(owner, axis=0),
+        table,
+    )
 
 
 @gluon.jit
 def _slot_expert(union, i):
     """The expert of slot ``i``, or -1 past the last slot."""
-    ids, owner, slot, _ = union
+    ids, owner, slot, _, _ = union
     mine = gl.convert_layout(ids, owner.type.layout)
     return gl.max(gl.where((owner > 0) & (slot == i), mine, -1), axis=0)
 
@@ -166,13 +179,19 @@ def _slot_expert(union, i):
 @gluon.jit
 def _row_picks(union, expert, R: gl.constexpr):
     """The pick of each row that chose ``expert``, or -1: a tuple of ``R``
-    scalars (reduced across the lanes of a wave)."""
-    ids = union[0]
-    at = gl.arange(0, ids.shape[0], ids.type.layout)
+    scalars. One reduction across the waves gives every thread the whole
+    row of the table (:func:`slots`) of the expert's owner pick; the scalars
+    then come from the thread's own registers."""
+    ids, owner, _, _, table = union
+    tl: gl.constexpr = table.type.layout
+    mine = gl.convert_layout(ids, gl.SliceLayout(1, tl))
+    own = gl.convert_layout(owner, gl.SliceLayout(1, tl))
+    hit = ((own > 0) & (mine == expert))[:, None]
+    row = gl.max(gl.where(hit, table, -1), axis=0)  # [RP], in every thread
+    r = gl.arange(0, table.shape[1], row.type.layout)
     picks = ()
-    for r in gl.static_range(R):
-        hit = (at // TOP_K == r) & (ids == expert)
-        picks += (gl.max(gl.where(hit, at % TOP_K, -1), axis=0),)
+    for i in gl.static_range(R):
+        picks += (gl.max(gl.where(r == i, row, -1), axis=0),)
     return picks
 
 
