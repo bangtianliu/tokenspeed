@@ -503,7 +503,8 @@ def _max_unique_key(keys):
 
 
 @gluon.jit
-def gluon_sigmoid_bias_topk_gfx950(
+def sigmoid_bias_topk_row_gfx950(
+    token,
     logits_ptr,
     bias_ptr,
     topk_ids_ptr,
@@ -524,7 +525,7 @@ def gluon_sigmoid_bias_topk_gfx950(
     X_DTYPE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    """Select one token's experts as a tournament over per-lane candidates.
+    """Select row ``token``'s experts as a tournament over per-lane candidates.
 
     Each lane owns a column of experts and keeps its six best as sorted
     heads, so a selection round is a single cross-lane max over one key per
@@ -534,8 +535,10 @@ def gluon_sigmoid_bias_topk_gfx950(
     to slow a 64-row batch down to its slowest token. Routers of at most
     320 experts hold at most five per lane, so they extract only as many
     heads as a lane holds and never repeat the selection.
+
+    The body of :func:`gluon_sigmoid_bias_topk_gfx950` for one row, so a
+    kernel that runs other work in its other programs can route rows too.
     """
-    token = gl.program_id(0)
     LANES: gl.constexpr = 64 * NUM_WARPS
     ROWS: gl.constexpr = (EP + LANES - 1) // LANES
     expert_layout: gl.constexpr = gl.BlockedLayout(
@@ -656,6 +659,54 @@ def gluon_sigmoid_bias_topk_gfx950(
     )
 
 
+@gluon.jit
+def gluon_sigmoid_bias_topk_gfx950(
+    logits_ptr,
+    bias_ptr,
+    topk_ids_ptr,
+    topk_weights_ptr,
+    stride_lm,
+    stride_le,
+    stride_be,
+    stride_tim,
+    stride_tik,
+    stride_twm,
+    stride_twk,
+    E: gl.constexpr,
+    TOPK: gl.constexpr,
+    EP: gl.constexpr,
+    TKP: gl.constexpr,
+    NORMALIZE_TOPK_WEIGHTS: gl.constexpr,
+    ROUTED_SCALING_FACTOR: gl.constexpr,
+    X_DTYPE: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """One program a token: :func:`sigmoid_bias_topk_row_gfx950` for row
+    ``program_id(0)``."""
+    sigmoid_bias_topk_row_gfx950(
+        gl.program_id(0),
+        logits_ptr,
+        bias_ptr,
+        topk_ids_ptr,
+        topk_weights_ptr,
+        stride_lm,
+        stride_le,
+        stride_be,
+        stride_tim,
+        stride_tik,
+        stride_twm,
+        stride_twk,
+        E,
+        TOPK,
+        EP,
+        TKP,
+        NORMALIZE_TOPK_WEIGHTS,
+        ROUTED_SCALING_FACTOR,
+        X_DTYPE,
+        NUM_WARPS,
+    )
+
+
 def invoke_sigmoid_bias_topk_route_prefill_gluon(
     router_logits: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -717,5 +768,6 @@ __all__ = [
     "gluon_topk_route_supported",
     "invoke_sigmoid_bias_topk_route_gluon",
     "invoke_sigmoid_bias_topk_route_prefill_gluon",
+    "sigmoid_bias_topk_row_gfx950",
     "invoke_softmax_topk_route_gluon",
 ]
