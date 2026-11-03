@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
-from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox, schedule, trace
+from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox, schedule, trace, warm
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
     attention,
     attn_tail,
@@ -50,7 +50,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
     qkvg,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import HIDDEN, WORLD
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Plan
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Plan, Stage
 
 SLIDING_SPLITS = 16
 # A full layer's attention splits: one request's tasks (2 KV heads x splits)
@@ -100,10 +100,19 @@ MAX_ROWS = 16
 KV_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
 
 
-def layer_plan(full: bool, rows: int, chain: int) -> Plan:
+# With warm_next, CTAs 0 .. WARM_TASKS - 1 read the next launch's QKVG and
+# gate weights into the memory-side cache (warm.py) after their expert tasks:
+# the next launch then starts its projections from the MALL. Earlier, the
+# expert weights streaming after them would evict them. The comb tasks start
+# at CTA 64.
+WARM_TASKS = 64
+
+
+def layer_plan(full: bool, rows: int, chain: int, warm_next: bool) -> Plan:
     """The plan of a full-attention (``full``) or sliding-window layer for
     ``rows`` token rows: requests of ``chain`` tokens each, 1 for decode,
-    ``k + 1`` for a speculative verify of ``k`` draft tokens."""
+    ``k + 1`` for a speculative verify of ``k`` draft tokens. With
+    ``warm_next`` the launch also warms the next launch's QKVG weights."""
     if not 1 <= rows <= MAX_ROWS or rows % chain:
         raise ValueError(
             f"a launch serves 1 to {MAX_ROWS} rows of requests of {chain}, got {rows}"
@@ -131,6 +140,7 @@ def layer_plan(full: bool, rows: int, chain: int) -> Plan:
         + moe_route.stages(_bases(rows, "router", "topk"), rows)
         + moe_pool.stages(_bases(rows, "pool"))
         + moe_experts.stages(_bases(rows, "ex1", "ex2"))
+        + ((Stage("warm", WARM_TASKS, 0),) if warm_next else ())
         + moe_tail.stages(_bases(rows, "comb", "unpool", "out"), rows)
     )
     peers = (
@@ -152,8 +162,9 @@ def layer_plan(full: bool, rows: int, chain: int) -> Plan:
 
 
 # The layer index changes every launch: a specialization on it (1, or a
-# multiple of 16) would compile new binaries while serving.
-@gluon.jit(do_not_specialize=("layer",))
+# multiple of 16) would compile new binaries while serving. The warm word
+# count is the next layer's, a runtime value too.
+@gluon.jit(do_not_specialize=("layer", "warm_quads"))
 def gluon_muse_spark_layer_gfx950(
     scratch,
     step,
@@ -164,6 +175,8 @@ def gluon_muse_spark_layer_gfx950(
     tap,
     tap_col,
     tap_row,
+    warm_ptr,
+    warm_quads,
     trace_buf,
     PLAN: gl.constexpr,
     RANK: gl.constexpr,
@@ -184,6 +197,8 @@ def gluon_muse_spark_layer_gfx950(
     columns), residual output, next attention input).
     ``tap``, ``tap_col``, ``tap_row``: with ``TAP``, where the residual
     after the layer also goes, BF16 on every rank (``moe_tail.unpool_stages``).
+    ``warm_ptr``, ``warm_quads``: the next launch's packed QKVG weights, read
+    (``4 * warm_quads`` int32 words) only when ``PLAN`` has the warm stage.
     """
     table = trace.allocate(trace_buf)
     peers = mailbox.load_peers(bases, RANK, layer & 1, WORLD)
@@ -329,6 +344,17 @@ def gluon_muse_spark_layer_gfx950(
             RANK,
             "ex2",
         )
+    if schedule.has_stage(PLAN, "warm"):
+        task, active = schedule.stage_task(PLAN, "warm")
+        if active:
+            warm.warm_stage(
+                mb,
+                task,
+                warm_ptr,
+                warm_quads,
+                schedule.stage_tasks(PLAN, "warm"),
+                "warm",
+            )
     task, active = schedule.stage_task(PLAN, "comb1")
     if active:
         moe_tail.comb_stages(mb, task, pen_gain, RANK)
@@ -363,6 +389,7 @@ def launch_layer(
     moe_ops,
     tap,
     tap_slot,
+    warm_next,
     trace_buf,
     rank: int,
     full: bool,
@@ -375,12 +402,20 @@ def launch_layer(
     full-attention, NoPE layer), or with ``compile_only`` only compile the
     launch. ``tap`` (None, or a BF16 ``[rows+, slots, 8192]`` buffer on the
     Iris heap) gets the residual after the layer in slot ``tap_slot`` on
-    every rank."""
-    plan = layer_plan(full, rows, chain)
+    every rank. ``warm_next`` (None, or the next launch's packed QKVG
+    weights) is warmed into the memory-side cache after the experts."""
+    plan = layer_plan(full, rows, chain, warm_next is not None)
     if tap is None:
         tap_args = (attn_ops[0], 0, 0)
     else:
         tap_args = (tap, tap_slot * tap.shape[2], tap.stride(0))
+    if warm_next is None:
+        warm_args = (attn_ops[0], 0)
+    else:
+        if not warm_next.is_contiguous() or warm_next.nbytes % 16:
+            raise ValueError("warm_next: contiguous, a whole number of 16-byte quads")
+        # The warm stage reads int32 words: the same bytes, viewed.
+        warm_args = (warm_next.view(-1).view(torch.int32), warm_next.nbytes // 16)
     args = (
         scratch,
         step,
@@ -389,6 +424,7 @@ def launch_layer(
         attn_ops,
         moe_ops,
         *tap_args,
+        *warm_args,
         trace_buf,
         plan.key,
         rank,
@@ -423,6 +459,7 @@ def launch_gluon_muse_spark_layer_gfx950(
     chain: int,
     tap,
     tap_slot,
+    warm_next,
     trace_buf,
     compile_only: bool,
 ):
@@ -456,6 +493,9 @@ def launch_gluon_muse_spark_layer_gfx950(
             the residual after the layer, rounded to BF16, into slot
             ``tap_slot`` of every rank's copy (a draft's tap).
         tap_slot: The tap's slot, or None without ``tap``.
+        warm_next: None, or the next launch's ``weights.LayerWeights``: this
+            launch reads its QKVG weights into the memory-side cache after
+            the experts, so the next launch's projections read the MALL.
         trace_buf: None, or a trace buffer (``trace.py``).
         compile_only: Only compile the launch for these operands. A rank's
             launch polls its peers' values for a few seconds before it traps,
@@ -527,6 +567,7 @@ def launch_gluon_muse_spark_layer_gfx950(
         moe_ops,
         tap,
         tap_slot,
+        None if warm_next is None else warm_next.qkvg,
         trace_buf,
         weights.rank,
         weights.full,

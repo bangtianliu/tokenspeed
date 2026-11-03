@@ -240,7 +240,7 @@ def worker(rank: int, port: int, args) -> None:
     dev = torch.device(f"cuda:{rank}")
     ctx = get_or_create_context(heap_size=256 << 20)
     group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
-    plan = layer.layer_plan(args.full, args.rows, args.rows)
+    plan = layer.layer_plan(args.full, args.rows, args.rows, False)
     scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
     ghost = torch.zeros_like(scratch)
     bases = torch.empty(TP, dtype=torch.int64, device=dev)
@@ -291,6 +291,7 @@ def worker(rank: int, port: int, args) -> None:
             bases,
             attn_ops,
             moe_ops,
+            None,
             None,
             None,
             trace_buf,
