@@ -12,7 +12,8 @@ The users are on gfx950, behind `--decode-monokernel`:
 Qwen3.8-Flash-Next (`qwen4_exp`), whose Gated DeltaNet and QSA attention
 layers each have one monokernel, and Muse Spark Open (`muse_spark`), whose
 decoder layers 1 to 60 have one monokernel per rank of a TP8 group (MoE TP8
-/ EP1 or MoE TP1 / EP8).
+/ EP1 or MoE TP1 / EP8). Muse Spark's DFlash2 draft (`dflash2`) has one
+monokernel per draft layer for one request's block of 8 rows.
 
 ## Where the pieces live
 
@@ -21,7 +22,7 @@ decoder layers 1 to 60 have one monokernel per rank of a TP8 group (MoE TP8
 | Runtime building blocks | `tokenspeed_kernel_amd/ops/gfx950/monokernel/` | `plan.py`: stages, placement, regions, the deadlock check. `schedule.py`: a kernel's view of its plan (which tasks this CTA runs). `mailbox.py`: tagged put / poll, throttling. `mx.py`: MXFP4 x MXFP4 split-K GEMV, MXFP4 and BF16 publishing. `bf16.py`: BF16 x BF16 GEMV. `trace.py`: per-stage timestamps. `warm.py`: warm tasks that read the next launch's weights into the memory-side cache. `weights.py`: tile and scale layouts. |
 | Model stages | `.../monokernel/<model>/` (`qwen4_exp/`, `muse_spark/`) | One module per block (for `qwen4_exp`: `hc.py`, `ple.py`, `gdn.py`, `qsa.py`, `out_proj.py`, `moe.py`) with its regions, stages and operand bundles. `dims.py`: shared dimensions. `layer.py`: the layer plans, kernels and launchers. `weights.py`: weight packing. |
 | Kernel boundary | `tokenspeed_kernel/ops/monokernel/` | `prepare_*` and `*_decode`, through `select_kernel`. `prepare_*` packs once after loading and returns `None` when no kernel serves the layer. `README.md` is the guide for adding a model. |
-| Runtime seam | `runtime/models/<model>_monokernel.py` | `Qwen4ExpMonokernels`, `MuseSparkMonokernels`: eligibility with reasons, packing from the model's modules, the step counter, and `plan()` once per forward. `MonokernelStep.layer(i)`: the launch that replaces layer `i`. `decode_monokernel.py`: the shared startup report. |
+| Runtime seam | `runtime/models/<model>_monokernel.py` | `Qwen4ExpMonokernels`, `MuseSparkMonokernels`: eligibility with reasons, packing from the model's modules, the step counter, and `plan()` once per forward. `MonokernelStep.layer(i)`: the launch that replaces layer `i`. `DFlash2Monokernels` (`dflash2_monokernel.py`): the draft's launches, which replace its whole layer loop. `decode_monokernel.py`: the shared startup report. |
 
 ## Invariants
 
@@ -48,6 +49,14 @@ stay on their ranks, and every rank writes the whole next attention input.
 The first launch of a run of fused layers reads its slice of the row. After
 the last one the seam gathers the 8 slices into a row (32 KiB) for the
 regular layer that follows.
+
+The DFlash2 draft's regular layers pass this rank's partial of the layer
+output (its reduction moves into the next norm) and the BF16 residual. A
+draft launch also takes and returns the partial, but keeps only the rank's
+1024 residual columns, so the seam serves all draft layers or none. After
+the last launch it gathers the residual rows for the regular final norm.
+The draft has a mailbox scratch and step counter of its own: its tags would
+repeat the target's.
 
 **Same caches, same layouts.** A monokernel reads and writes the KV cache,
 the GDN state pages and the QSA indexer caches exactly as the regular decode

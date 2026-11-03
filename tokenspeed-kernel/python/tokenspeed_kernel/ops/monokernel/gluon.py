@@ -49,6 +49,13 @@ try:
 except ImportError:
     _muse_spark_layer = None
 
+try:
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
+        draft_layer as _muse_spark_draft_layer,
+    )
+except ImportError:
+    _muse_spark_draft_layer = None
+
 
 if _qwen4_exp_layer is not None:
     _GFX950 = CapabilityRequirement(
@@ -290,3 +297,60 @@ if _muse_spark_layer is not None:
         *, tensors: dict[str, Any]
     ) -> tuple[torch.Tensor, ...]:
         return _muse_spark_weights.prepare_experts(**tensors)
+
+
+if _muse_spark_draft_layer is not None:
+    _DRAFT_GFX950 = CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    )
+    # One request's block of 8 rows per launch.
+    _DRAFT_TRAITS = {"rows": frozenset({_muse_spark_draft_layer.MAX_ROWS})}
+
+    @register_kernel(
+        "monokernel",
+        "muse_spark_draft_layer_prepare",
+        name="gluon_muse_spark_draft_layer_prepare_gfx950",
+        solution="gluon",
+        capability=_DRAFT_GFX950,
+        signatures=format_signatures("h", "dense", {torch.bfloat16}),
+        priority=Priority.SPECIALIZED,
+        traits=_DRAFT_TRAITS,
+    )
+    def gluon_muse_spark_draft_layer_prepare_gfx950(
+        *, tensors: dict[str, torch.Tensor], rank: int, max_rows: int
+    ) -> tuple[Any, int, None]:
+        weights = _muse_spark_draft_layer.pack_draft_layer(tensors, rank)
+        return weights, _muse_spark_draft_layer.layer_plan(max_rows).scratch_pairs, None
+
+    @register_kernel(
+        "monokernel",
+        "muse_spark_draft_layer_decode",
+        name="gluon_muse_spark_draft_layer_gfx950",
+        solution="gluon",
+        capability=_DRAFT_GFX950,
+        signatures=format_signatures("h", "dense", {torch.bfloat16}),
+        priority=Priority.SPECIALIZED,
+        traits=_DRAFT_TRAITS,
+    )
+    def gluon_muse_spark_draft_layer_gfx950(
+        *,
+        weights: Any,
+        scratch: torch.Tensor,
+        step: torch.Tensor,
+        peer_bases: torch.Tensor,
+        layer_index: int,
+        compile_only: bool,
+        **operands: torch.Tensor,
+    ) -> None:
+        _muse_spark_draft_layer.launch_gluon_muse_spark_draft_layer_gfx950(
+            weights,
+            scratch=scratch,
+            step=step,
+            peer_bases=peer_bases,
+            layer=layer_index,
+            trace_buf=None,
+            compile_only=compile_only,
+            **operands,
+        )
