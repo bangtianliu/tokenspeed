@@ -80,9 +80,15 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
 
-# Token rows of one launch: a decode row, or a verify of up to 7 draft tokens
-# (the DFlash2 drafters' block of 8).
-MAX_ROWS = 8
+# Token rows of one launch: a decode row a request, or a verify of up to 7
+# draft tokens (the DFlash2 drafters' block of 8) a request, for up to
+# MAX_REQUESTS requests. The kernels serve two requests' rows (16), but a
+# launch of 16 rows takes 231 us against 107 us for 8 (the expert stages
+# walk every row for each expert slot), slower than the regular path at
+# concurrency 2: one request's rows only, until the expert stages scale.
+MAX_REQUESTS = 1
+CHAIN_ROWS = 8  # a request's rows at most
+MAX_ROWS = MAX_REQUESTS * CHAIN_ROWS
 WORLD = 8
 # The served MoE splits, as (MoE TP size, EP size).
 MOE_SPLITS = frozenset({(WORLD, 1), (1, WORLD)})
@@ -122,6 +128,7 @@ OTHER_CONSTANTS = "model constants other than the kernel's"
 NOT_BF16 = "a dense projection or norm gain is not BF16"
 NOT_SUPPORTED_EXPERTS = "the routed experts do not run a gluon MXFP4 kernel"
 NO_KERNEL = "no monokernel for this platform"
+NOT_BF16_KV = "the KV cache is not BF16 (--kv-cache-dtype): the kernels read BF16 keys"
 
 
 def _gain(norm: torch.nn.Module) -> torch.Tensor | None:
@@ -194,6 +201,9 @@ def model_reasons(config, mapping) -> list[str]:
         for name, value in KERNEL_CONSTANTS.items()
     ):
         reasons.append(OTHER_CONSTANTS)
+    # "auto" keeps the model's BF16.
+    if global_server_args_dict["kv_cache_dtype"] not in ("auto", "bfloat16", "bf16"):
+        reasons.append(NOT_BF16_KV)
     return reasons
 
 
@@ -348,7 +358,12 @@ def takes_monokernels(rows: int, ctx: ForwardContext) -> bool:
     decode step of one request, with one token or a speculative verify of at
     most ``MAX_ROWS`` tokens. Prefill and several requests keep the regular
     path."""
-    return ctx.forward_mode.is_decode() and ctx.bs == 1 and 1 <= rows <= MAX_ROWS
+    return (
+        ctx.forward_mode.is_decode()
+        and 1 <= ctx.bs <= MAX_REQUESTS
+        and 1 <= rows <= MAX_ROWS
+        and rows % ctx.bs == 0
+    )
 
 
 class MonokernelSteps:
@@ -467,7 +482,7 @@ class MuseSparkMonokernels:
         # collectives that order the launches' stores: it keeps the regular
         # capture.
         store_taps = bool(self.tap_slots) and ctx.target_capture_sink is None
-        return MonokernelStep(self, rows, taps, store_taps)
+        return MonokernelStep(self, rows, ctx.bs, taps, store_taps)
 
 
 class MonokernelStep:
@@ -477,11 +492,15 @@ class MonokernelStep:
         self,
         monokernels: MuseSparkMonokernels,
         rows: int,
+        requests: int,
         taps: list[int],
         store_taps: bool,
     ) -> None:
         self._monokernels = monokernels
         self._rows = rows
+        self._requests = requests
+        # Each request's consecutive token rows.
+        self._chain = rows // requests
         self._taps = frozenset(taps)
         self._store_taps = store_taps
         # The owned residual columns that the last launch wrote, while the
@@ -564,7 +583,7 @@ class MonokernelStep:
             a_out=a_out,
             seq_len=self._row_lengths(group_id, leaf.forward_decode_metadata.seq_lens),
             slot=slot[:rows],
-            page_table=view.page_table[0],
+            page_table=view.page_table[: self._requests],
             k_cache=k_cache.view(-1, 2, 64),
             v_cache=v_cache.view(-1, 2, 64),
             cos_sin=cos_sin,
@@ -572,6 +591,7 @@ class MonokernelStep:
             step=steps.step,
             peer_bases=steps.bases,
             layer_index=index,
+            chain=self._chain,
             tap=None,
             tap_slot=None,
         )
@@ -597,16 +617,19 @@ class MonokernelStep:
         return all_gather(h_out, monokernels.group, dim=-1), a_out
 
     def _row_lengths(self, group_id: int, seq_lens: torch.Tensor) -> torch.Tensor:
-        """Each row's length from the step's ``seq_lens`` (the request's
-        length after the step): ``seq - rows + t + 1`` for row ``t``."""
+        """Each row's length from the step's ``seq_lens`` (each request's
+        length after the step): ``seq - chain + t + 1`` for row ``t`` of a
+        request."""
         lengths = self._seq_lens.get(group_id)
         if lengths is None:
-            if self._rows == 1:
-                lengths = seq_lens[:1]
+            n = self._requests
+            if self._chain == 1:
+                lengths = seq_lens[:n]
             else:
-                lengths = seq_lens[:1] + torch.arange(
-                    1 - self._rows, 1, dtype=seq_lens.dtype, device=seq_lens.device
+                steps = torch.arange(
+                    1 - self._chain, 1, dtype=seq_lens.dtype, device=seq_lens.device
                 )
+                lengths = (seq_lens[:n, None] + steps[None, :]).reshape(-1)
             self._seq_lens[group_id] = lengths
         return lengths
 

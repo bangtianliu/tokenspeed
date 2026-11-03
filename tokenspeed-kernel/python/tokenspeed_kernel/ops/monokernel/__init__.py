@@ -410,13 +410,15 @@ def muse_spark_layer_decode(
     step: torch.Tensor,
     peer_bases: torch.Tensor,
     layer_index: int,
+    chain: int,
     tap: torch.Tensor | None,
     tap_slot: int | None,
     compile_only: bool,
 ) -> None:
-    """One step of a packed Muse Spark layer for the rows of one request (a
-    decode row, or a speculative verify's consecutive tokens), on every rank
-    of the TP8 group at once (the launches exchange values).
+    """One step of a packed Muse Spark layer for the rows of one or more
+    requests (a decode row each, or a speculative verify's consecutive
+    tokens), on every rank of the TP8 group at once (the launches exchange
+    values).
 
     Args:
         layer: From :func:`prepare_muse_spark_layer`.
@@ -426,10 +428,11 @@ def muse_spark_layer_decode(
             with its input norm) and the next layer's. Outputs alias no
             input.
         seq_len, slot: int32 ``[rows]``: each row's length including its
-            token, and the token's KV cache slot. Row ``t`` is the token at
-            position ``seq_len[0] - 1 + t``.
-        page_table: int32 ``[pages]``: the request's page table of the
-            layer's cache group (64 tokens a page, absolute positions).
+            token, and the token's KV cache slot. Row ``t`` of request ``b``
+            is the token at position ``seq_len[b chain] - 1 + t``.
+        page_table: int32 ``[requests, pages]`` (or ``[pages]`` for one
+            request): each request's page table of the layer's cache group
+            (64 tokens a page, absolute positions).
         k_cache, v_cache: The layer's BF16 ``[slots, 2, 64]`` caches.
         cos_sin: FP32 ``[positions, 64]`` rotary table (cos, then sin).
         scratch: int64 mailbox scratch of at least ``layer.scratch_pairs``,
@@ -439,6 +442,8 @@ def muse_spark_layer_decode(
         peer_bases: int64 ``[8]`` Iris heap bases of the group's ranks.
         layer_index: Decoder layer index, below 64. The launches of one
             forward alternate its parity.
+        chain: Tokens a request: 1 for decode, ``k + 1`` for a verify of
+            ``k`` draft tokens. The rows are whole requests.
         tap: None, or a BF16 ``[rows+, slots, 8192]`` buffer on the Iris
             symmetric heap: the launch also stores the residual after the
             layer (BF16) into slot ``tap_slot`` of every rank's copy, the
@@ -466,6 +471,7 @@ def muse_spark_layer_decode(
         step=step,
         peer_bases=peer_bases,
         layer_index=layer_index,
+        chain=chain,
         tap=tap,
         tap_slot=tap_slot,
         compile_only=compile_only,

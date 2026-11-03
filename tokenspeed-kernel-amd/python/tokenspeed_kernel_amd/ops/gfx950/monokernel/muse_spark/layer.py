@@ -88,17 +88,19 @@ def _bases(rows: int, *names: str) -> dict[str, int]:
     return {name: table[name] for name in names}
 
 
-# The most rows of one launch: a verify of 7 draft tokens (the drafters'
-# block of 8).
-MAX_ROWS = 8
+# The most rows of one launch: two requests' verifies of 7 draft tokens
+# (the drafters' block of 8). The GEMVs' MFMAs hold 16 rows.
+MAX_ROWS = 16
 
 
-def layer_plan(full: bool, rows: int) -> Plan:
+def layer_plan(full: bool, rows: int, chain: int) -> Plan:
     """The plan of a full-attention (``full``) or sliding-window layer for
-    ``rows`` token rows of one request: 1 for decode, ``k + 1`` for a
-    speculative verify of ``k`` draft tokens."""
-    if not 1 <= rows <= MAX_ROWS:
-        raise ValueError(f"a launch serves 1 to {MAX_ROWS} rows, got {rows}")
+    ``rows`` token rows: requests of ``chain`` tokens each, 1 for decode,
+    ``k + 1`` for a speculative verify of ``k`` draft tokens."""
+    if not 1 <= rows <= MAX_ROWS or rows % chain:
+        raise ValueError(
+            f"a launch serves 1 to {MAX_ROWS} rows of requests of {chain}, got {rows}"
+        )
     splits = FULL_SPLITS if full else SLIDING_SPLITS
     # Both kinds of layer lay their regions out alike: the attention
     # regions are sized for the full layer's splits. Consecutive launches
@@ -117,7 +119,7 @@ def layer_plan(full: bool, rows: int) -> Plan:
     )
     stages = (
         qkvg.stages(_bases(rows, "qkvg", "gate"))
-        + attention.stages(_bases(rows, "head", "attn", "merge"), splits, rows)
+        + attention.stages(_bases(rows, "head", "attn", "merge"), splits, rows, chain)
         + attn_tail.stages(_bases(rows, "oproj", "tail"), rows)
         + moe_route.stages(_bases(rows, "router", "topk"), rows)
         + moe_pool.stages(_bases(rows, "pool"))
@@ -136,7 +138,7 @@ def layer_plan(full: bool, rows: int) -> Plan:
         stages=stages,
         regions=regions,
         rows=rows,
-        chain=rows,
+        chain=chain,
         world=int(WORLD),
         peers=peers,
     )
@@ -185,6 +187,7 @@ def gluon_muse_spark_layer_gfx950(
         seq_len,
         slot,
         page_table,
+        table_stride,
         k_cache,
         v_cache,
         cos_sin,
@@ -239,6 +242,7 @@ def gluon_muse_spark_layer_gfx950(
             task,
             seq_len,
             page_table,
+            table_stride,
             k_cache,
             v_cache,
             cos_sin,
@@ -354,14 +358,16 @@ def launch_layer(
     rank: int,
     full: bool,
     rows: int,
+    chain: int,
     compile_only: bool,
 ):
-    """Launch one layer step of ``rows`` token rows (``full``: a
+    """Launch one layer step of ``rows`` token rows, requests of ``chain``
+    tokens (``full``: a
     full-attention, NoPE layer), or with ``compile_only`` only compile the
     launch. ``tap`` (None, or a BF16 ``[rows+, slots, 8192]`` buffer on the
     Iris heap) gets the residual after the layer in slot ``tap_slot`` on
     every rank."""
-    plan = layer_plan(full, rows)
+    plan = layer_plan(full, rows, chain)
     if tap is None:
         tap_args = (attn_ops[0], 0, 0)
     else:
@@ -405,15 +411,17 @@ def launch_gluon_muse_spark_layer_gfx950(
     step,
     peer_bases,
     layer: int,
+    chain: int,
     tap,
     tap_slot,
     trace_buf,
     compile_only: bool,
 ):
     """One step of a packed layer (``weights.LayerWeights``) for the rows of
-    one request: one decode row, or a speculative verify's consecutive
-    tokens (row ``t`` at position ``seq_len[0] - 1 + t``). The row count
-    ``rows`` comes from ``h`` and selects the plan.
+    one or more requests of ``chain`` tokens each: a decode row each, or a
+    speculative verify's consecutive tokens (row ``t`` of request ``b`` at
+    position ``seq_len[b chain] - 1 + t``). The row count ``rows`` comes
+    from ``h``; ``rows`` and ``chain`` select the plan.
 
     Args:
         weights: From ``weights.pack_layer``.
@@ -422,8 +430,9 @@ def launch_gluon_muse_spark_layer_gfx950(
             the next one (normed with the next layer's input gain).
         seq_len, slot: int32 ``[rows]``: each row's length including its
             token, and the KV cache slot of the token.
-        page_table: int32 ``[pages]`` of the request (64 tokens a page,
-            indexed by absolute position).
+        page_table: int32 ``[requests, pages]`` (or ``[pages]`` for one
+            request): each request's page table (64 tokens a page, indexed
+            by absolute position).
         k_cache, v_cache: BF16 ``[slots, 2, 64]``.
         cos_sin: FP32 ``[positions, 64]`` rotary table (unused by a full,
             NoPE layer).
@@ -431,6 +440,7 @@ def launch_gluon_muse_spark_layer_gfx950(
         step: int32 ``[1]`` step counter.
         peer_bases: int64 ``[8]`` heap bases of the group's ranks.
         layer: The decoder layer index (the tag and the peer copy).
+        chain: Tokens a request: 1 for decode, ``k + 1`` for a verify.
         tap: None, or a BF16 ``[rows+, slots, 8192]`` buffer on the Iris
             symmetric heap (the same on every rank): the launch also stores
             the residual after the layer, rounded to BF16, into slot
@@ -460,6 +470,20 @@ def launch_gluon_muse_spark_layer_gfx950(
     for name, t in (("seq_len", seq_len), ("slot", slot)):
         if t.dtype != torch.int32 or t.numel() != rows:
             raise ValueError(f"{name}: int32 [{rows}], one per row")
+    if k_cache.dtype != torch.bfloat16 or v_cache.dtype != torch.bfloat16:
+        raise ValueError("k_cache, v_cache: BF16 (the kernel reads BF16 keys)")
+    if page_table.dim() == 1:
+        page_table = page_table[None]
+    if (
+        rows % chain
+        or page_table.dim() != 2
+        or page_table.shape[0] != rows // chain
+        or page_table.stride(1) != 1
+    ):
+        raise ValueError(
+            f"page_table: int32 [{rows // chain if chain else '?'}, pages], one "
+            f"row a request of {chain} tokens"
+        )
     if (tap is None) != (tap_slot is None):
         raise ValueError("tap and tap_slot come together")
     if tap is not None and (
@@ -496,6 +520,7 @@ def launch_gluon_muse_spark_layer_gfx950(
         weights.rank,
         weights.full,
         rows,
+        chain,
         compile_only,
     )
 
