@@ -152,12 +152,16 @@ def gluon_muse_spark_layer_gfx950(
     bases,
     attn_ops,
     moe_ops,
+    tap,
+    tap_col,
+    tap_row,
     trace_buf,
     PLAN: gl.constexpr,
     RANK: gl.constexpr,
     SPLITS: gl.constexpr,
     WIN: gl.constexpr,
     ROPE: gl.constexpr,
+    TAP: gl.constexpr,
 ):
     """One decode step of one layer on rank ``RANK``.
 
@@ -169,6 +173,8 @@ def gluon_muse_spark_layer_gfx950(
     post-expert gain, post-expert projection rows, post-FFN gain, FFN gate
     ``alpha``, ``beta`` (all 8192 columns), next input gain (all 8192
     columns), residual output, next attention input).
+    ``tap``, ``tap_col``, ``tap_row``: with ``TAP``, where the residual
+    after the layer also goes, BF16 on every rank (``moe_tail.unpool_stages``).
     """
     table = trace.allocate(trace_buf)
     peers = mailbox.load_peers(bases, RANK, layer & 1, WORLD)
@@ -315,7 +321,20 @@ def gluon_muse_spark_layer_gfx950(
         moe_tail.comb_stages(mb, task, pen_gain, RANK)
     task, active = schedule.stage_task(PLAN, "unpool")
     if active:
-        moe_tail.unpool_stages(mb, task, w_post, post_gain, alpha2, beta2, h_next, RANK)
+        moe_tail.unpool_stages(
+            mb,
+            task,
+            w_post,
+            post_gain,
+            alpha2,
+            beta2,
+            h_next,
+            tap,
+            tap_col,
+            tap_row,
+            RANK,
+            TAP,
+        )
     task, active = schedule.stage_task(PLAN, "out")
     if active:
         moe_tail.out_stage(mb, task, beta2, in_gain, a_out, "out")
@@ -329,6 +348,8 @@ def launch_layer(
     bases,
     attn_ops,
     moe_ops,
+    tap,
+    tap_slot,
     trace_buf,
     rank: int,
     full: bool,
@@ -337,8 +358,14 @@ def launch_layer(
 ):
     """Launch one layer step of ``rows`` token rows (``full``: a
     full-attention, NoPE layer), or with ``compile_only`` only compile the
-    launch."""
+    launch. ``tap`` (None, or a BF16 ``[rows+, slots, 8192]`` buffer on the
+    Iris heap) gets the residual after the layer in slot ``tap_slot`` on
+    every rank."""
     plan = layer_plan(full, rows)
+    if tap is None:
+        tap_args = (attn_ops[0], 0, 0)
+    else:
+        tap_args = (tap, tap_slot * tap.shape[2], tap.stride(0))
     args = (
         scratch,
         step,
@@ -346,12 +373,14 @@ def launch_layer(
         bases,
         attn_ops,
         moe_ops,
+        *tap_args,
         trace_buf,
         plan.key,
         rank,
         FULL_SPLITS if full else SLIDING_SPLITS,
         0 if full else WINDOW,
         not full,
+        tap is not None,
     )
     if compile_only:
         gluon_muse_spark_layer_gfx950.warmup(*args, num_warps=8, grid=(plan.grid,))
@@ -376,6 +405,8 @@ def launch_gluon_muse_spark_layer_gfx950(
     step,
     peer_bases,
     layer: int,
+    tap,
+    tap_slot,
     trace_buf,
     compile_only: bool,
 ):
@@ -400,6 +431,11 @@ def launch_gluon_muse_spark_layer_gfx950(
         step: int32 ``[1]`` step counter.
         peer_bases: int64 ``[8]`` heap bases of the group's ranks.
         layer: The decoder layer index (the tag and the peer copy).
+        tap: None, or a BF16 ``[rows+, slots, 8192]`` buffer on the Iris
+            symmetric heap (the same on every rank): the launch also stores
+            the residual after the layer, rounded to BF16, into slot
+            ``tap_slot`` of every rank's copy (a draft's tap).
+        tap_slot: The tap's slot, or None without ``tap``.
         trace_buf: None, or a trace buffer (``trace.py``).
         compile_only: Only compile the launch for these operands. A rank's
             launch polls its peers' values for a few seconds before it traps,
@@ -424,6 +460,17 @@ def launch_gluon_muse_spark_layer_gfx950(
     for name, t in (("seq_len", seq_len), ("slot", slot)):
         if t.dtype != torch.int32 or t.numel() != rows:
             raise ValueError(f"{name}: int32 [{rows}], one per row")
+    if (tap is None) != (tap_slot is None):
+        raise ValueError("tap and tap_slot come together")
+    if tap is not None and (
+        tap.dtype != torch.bfloat16
+        or tap.dim() != 3
+        or tap.shape[0] < rows
+        or tap.shape[2] != 8192
+        or not tap.is_contiguous()
+        or not 0 <= tap_slot < tap.shape[1]
+    ):
+        raise ValueError(f"tap: contiguous BF16 [>={rows}, slots, 8192], a slot in it")
     attn_ops, moe_ops = weights.kernel_args(
         h=h,
         a=a,
@@ -443,6 +490,8 @@ def launch_gluon_muse_spark_layer_gfx950(
         peer_bases,
         attn_ops,
         moe_ops,
+        tap,
+        tap_slot,
         trace_buf,
         weights.rank,
         weights.full,

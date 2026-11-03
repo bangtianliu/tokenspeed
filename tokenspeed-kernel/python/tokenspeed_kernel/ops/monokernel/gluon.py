@@ -277,6 +277,8 @@ if _muse_spark_layer is not None:
         step: torch.Tensor,
         peer_bases: torch.Tensor,
         layer_index: int,
+        tap: torch.Tensor | None,
+        tap_slot: int | None,
         compile_only: bool,
         **operands: torch.Tensor,
     ) -> None:
@@ -286,6 +288,8 @@ if _muse_spark_layer is not None:
             step=step,
             peer_bases=peer_bases,
             layer=layer_index,
+            tap=tap,
+            tap_slot=tap_slot,
             trace_buf=None,
             compile_only=compile_only,
             **operands,

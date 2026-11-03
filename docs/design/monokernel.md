@@ -50,7 +50,13 @@ next layer's normed BF16 attention input. A TP8 launch keeps only its rank's
 stay on their ranks, and every rank writes the whole next attention input.
 The first launch of a run of fused layers reads its slice of the row. After
 the last one the seam gathers the 8 slices into a row (32 KiB) for the
-regular layer that follows.
+regular layer that follows. A draft's taps (the residual entering a
+captured layer) need no gather either: the launch of the layer before each
+stores its slice, rounded to BF16, into every rank's tap buffer on the Iris
+heap, laid out as the concatenated captures, and the model hands that buffer
+to the draft as its one capture. Its readers run after later collectives of
+the forward, which order the stores before them; a capture sink, which reads
+each tap during the forward, keeps the regular capture.
 
 The DFlash2 draft's regular layers pass this rank's partial of the layer
 output (its reduction moves into the next norm) and the BF16 residual. A

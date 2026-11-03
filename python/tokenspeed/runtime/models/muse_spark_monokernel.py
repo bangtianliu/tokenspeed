@@ -355,7 +355,13 @@ class MonokernelSteps:
     """Model-wide monokernel state: the mailbox scratch on the Iris symmetric
     heap, the heap bases of the TP8 group and the step counter."""
 
-    def __init__(self, group: dist.ProcessGroup, rank: int, scratch_pairs: int) -> None:
+    def __init__(
+        self,
+        group: dist.ProcessGroup,
+        rank: int,
+        scratch_pairs: int,
+        tap_slots: int,
+    ) -> None:
         from tokenspeed_kernel.ops.communication._iris import (
             MIN_HEAP_BYTES,
             IrisGroup,
@@ -369,6 +375,14 @@ class MonokernelSteps:
         # layer's plan lays the regions out alike (layer.layer_plan), so one
         # scratch serves both kinds of layer.
         self.scratch = context.zeros((scratch_pairs,), dtype=torch.int64)
+        # A draft's taps: the residual entering each captured layer, BF16, in
+        # the layout of the concatenated captures (row, tap, column). The
+        # launch before a captured layer stores it on every rank.
+        self.taps: torch.Tensor | None = (
+            context.zeros((MAX_ROWS, tap_slots, HIDDEN), dtype=torch.bfloat16)
+            if tap_slots
+            else None
+        )
         self.bases = iris_group.bases.to(device)
         # The launches' tag base: it moves once per forward, inside the graph.
         self.step = torch.zeros(1, dtype=torch.int32, device=device)
@@ -392,6 +406,9 @@ class MuseSparkMonokernels:
         cpu_group: The TP8 group's CPU (gloo) process group, from
             :meth:`prepare` (None before it).
         compiled: The ``(layer index, rows)`` launches compiled on every rank.
+        tap_slots: The draft taps the launches store, by captured layer: its
+            slot in ``steps.taps``. Empty when some captured layer follows a
+            layer without a launch (the regular capture then serves them all).
     """
 
     def __init__(self, model: torch.nn.Module) -> None:
@@ -411,16 +428,30 @@ class MuseSparkMonokernels:
         self.steps: MonokernelSteps | None = None
         self.cpu_group: dist.ProcessGroup | None = None
         self.compiled: set[tuple[int, int]] = set()
+        self.tap_slots: dict[int, int] = {}
 
     def prepare(
-        self, group: dist.ProcessGroup, cpu_group: dist.ProcessGroup, rank: int
+        self,
+        group: dist.ProcessGroup,
+        cpu_group: dist.ProcessGroup,
+        rank: int,
+        taps: list[int],
     ) -> None:
         """Allocate the shared state on the Iris heap of ``group`` (the TP8
         device process group; ``cpu_group`` its CPU twin, ``rank`` this
-        process's rank in it). Call once, before graph capture."""
+        process's rank in it). ``taps`` are the layers whose entering
+        residual a draft reads (the model's ``layers_to_capture``): when the
+        layer before each is fused, the launches store them (see
+        :meth:`MonokernelStep.serves_taps`). Call once, before graph
+        capture."""
         if self.steps is None:
             scratch_pairs = max(f.scratch_pairs for f in self.fused.values())
-            self.steps = MonokernelSteps(group, rank, scratch_pairs)
+            ordered = sorted(taps)
+            if ordered and all(t - 1 in self.fused for t in ordered):
+                self.tap_slots = {t: i for i, t in enumerate(ordered)}
+            self.steps = MonokernelSteps(
+                group, rank, scratch_pairs, len(self.tap_slots)
+            )
             self.cpu_group = cpu_group
 
     def plan(
@@ -432,18 +463,27 @@ class MuseSparkMonokernels:
         residual a draft reads (the model's ``layers_to_capture``)."""
         if self.steps is None or not takes_monokernels(rows, ctx):
             return None
-        return MonokernelStep(self, rows, taps)
+        # A capture sink reads each tap during the forward, before the
+        # collectives that order the launches' stores: it keeps the regular
+        # capture.
+        store_taps = bool(self.tap_slots) and ctx.target_capture_sink is None
+        return MonokernelStep(self, rows, taps, store_taps)
 
 
 class MonokernelStep:
     """One forward that the monokernels serve."""
 
     def __init__(
-        self, monokernels: MuseSparkMonokernels, rows: int, taps: list[int]
+        self,
+        monokernels: MuseSparkMonokernels,
+        rows: int,
+        taps: list[int],
+        store_taps: bool,
     ) -> None:
         self._monokernels = monokernels
         self._rows = rows
         self._taps = frozenset(taps)
+        self._store_taps = store_taps
         # The owned residual columns that the last launch wrote, while the
         # next layer is fused too.
         self._owned: torch.Tensor | None = None
@@ -456,6 +496,17 @@ class MonokernelStep:
         if index not in self._monokernels.fused:
             return None
         return functools.partial(self._run, index)
+
+    def serves_taps(self) -> bool:
+        """Whether the launches store every tap of this forward: the model
+        then skips its captures and hands the draft :meth:`tap_rows`."""
+        return self._store_taps
+
+    def tap_rows(self) -> torch.Tensor:
+        """The taps the launches stored: BF16 ``[rows, taps * 8192]``, the
+        concatenated captures."""
+        taps = self._monokernels.steps.taps
+        return taps[: self._rows].view(self._rows, -1)
 
     def finish(self) -> None:
         """End the forward: give the next forward's launches a new tag."""
@@ -521,7 +572,13 @@ class MonokernelStep:
             step=steps.step,
             peer_bases=steps.bases,
             layer_index=index,
+            tap=None,
+            tap_slot=None,
         )
+        slot_of_next = monokernels.tap_slots.get(index + 1)
+        if self._store_taps and slot_of_next is not None:
+            operands["tap"] = steps.taps
+            operands["tap_slot"] = slot_of_next
         if (index, rows) not in monokernels.compiled:
             # A launch traps when its peers' values do not come within a few
             # seconds, and a first launch compiles for longer on some ranks
@@ -530,11 +587,12 @@ class MonokernelStep:
             dist.barrier(group=monokernels.cpu_group)
             monokernels.compiled.add((index, rows))
         muse_spark_layer_decode(fused, compile_only=False, **operands)
-        if index + 1 in monokernels.fused and index + 1 not in self._taps:
+        tapped = index + 1 in self._taps and not self._store_taps
+        if index + 1 in monokernels.fused and not tapped:
             self._owned = h_out
             return hidden_states, a_out
-        # The next layer keeps the regular path, or a draft taps the residual
-        # entering it: it reads the whole rows.
+        # The next layer keeps the regular path, or a regular capture of a
+        # draft's tap reads the whole rows entering it.
         self._owned = None
         return all_gather(h_out, monokernels.group, dim=-1), a_out
 

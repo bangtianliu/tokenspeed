@@ -410,6 +410,8 @@ def muse_spark_layer_decode(
     step: torch.Tensor,
     peer_bases: torch.Tensor,
     layer_index: int,
+    tap: torch.Tensor | None,
+    tap_slot: int | None,
     compile_only: bool,
 ) -> None:
     """One step of a packed Muse Spark layer for the rows of one request (a
@@ -437,6 +439,11 @@ def muse_spark_layer_decode(
         peer_bases: int64 ``[8]`` Iris heap bases of the group's ranks.
         layer_index: Decoder layer index, below 64. The launches of one
             forward alternate its parity.
+        tap: None, or a BF16 ``[rows+, slots, 8192]`` buffer on the Iris
+            symmetric heap: the launch also stores the residual after the
+            layer (BF16) into slot ``tap_slot`` of every rank's copy, the
+            tap a draft reads.
+        tap_slot: The tap's slot, or None without ``tap``.
         compile_only: Only compile the launch for these operands, without
             running it. A launch polls its peers' values for a few seconds
             before it traps, so a rank that compiles much longer than its
@@ -459,6 +466,8 @@ def muse_spark_layer_decode(
         step=step,
         peer_bases=peer_bases,
         layer_index=layer_index,
+        tap=tap,
+        tap_slot=tap_slot,
         compile_only=compile_only,
     )
 
