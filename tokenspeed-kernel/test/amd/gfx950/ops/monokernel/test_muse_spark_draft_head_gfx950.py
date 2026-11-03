@@ -133,6 +133,7 @@ def _worker(rank: int, port: int, seed: int) -> None:
             SOFTCAP,
         )
         outs = dict(
+            anchor=torch.empty(1, dtype=torch.int64, device=device),
             cand_ids=torch.empty(STEPS, TOPK, dtype=torch.int64, device=device),
             unary=torch.empty(STEPS, TOPK, dtype=torch.float32, device=device),
             scores=torch.empty(STEPS, TOPK, TOPK, dtype=torch.float32, device=device),
@@ -147,7 +148,7 @@ def _worker(rank: int, port: int, seed: int) -> None:
                 draft_head.launch_gluon_muse_spark_draft_head_gfx950(
                     weights,
                     x=x,
-                    anchor=anchor,
+                    first_token=anchor.to(torch.int32),
                     **outs,
                     scratch=scratch,
                     step=torch.full((1,), step, dtype=torch.int32, device=device),
@@ -174,6 +175,7 @@ def _exact(x, shard, rank, ids):
 
 
 def _check(x, shard, rank, hidden_proj, pred, succ, anchor, outs) -> None:
+    assert torch.equal(outs["anchor"].cpu(), anchor.cpu())
     want_ids, want_values = _reference_candidates(x, shard, rank)
     got_ids, got_unary = outs["cand_ids"].cpu(), outs["unary"].cpu()
     # Every rank holds the same candidates, 16 distinct tokens a step.
