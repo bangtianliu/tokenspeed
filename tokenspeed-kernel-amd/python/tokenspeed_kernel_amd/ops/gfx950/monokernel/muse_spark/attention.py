@@ -224,8 +224,20 @@ def _layouts(nw):
 
 
 @gluon.jit
+def _load_pages(table, c0, hi, k_layout: gl.constexpr, v_load: gl.constexpr):
+    """The pages of chunk ``c0 ..``'s keys, in the key and value layouts.
+    They load a chunk ahead of the keys they locate, so a chunk's cache loads
+    do not wait for a page table load."""
+    jk = c0 + gl.arange(0, BN, gl.SliceLayout(0, k_layout))
+    jv = c0 + gl.arange(0, BN, gl.SliceLayout(1, v_load))
+    page_k = gl.load(table + jk // PAGE, mask=jk < hi, other=0)
+    page_v = gl.load(table + jv // PAGE, mask=jv < hi, other=0)
+    return page_k, page_v
+
+
+@gluon.jit
 def _load_kv(
-    table,
+    pages,
     k_cache,
     v_cache,
     g,
@@ -237,13 +249,13 @@ def _load_kv(
     v_load: gl.constexpr,
 ):
     """Keys ``[64, BN]`` and values ``[BN, 64]`` of chunk ``c0 ..`` from the
-    cache (zero from ``hi``), in BF16 (an FP8 cache's widen exactly)."""
+    cache (zero from ``hi``), in BF16 (an FP8 cache's widen exactly), at the
+    chunk's ``pages`` (:func:`_load_pages`)."""
+    page_k, page_v = pages
     jk = c0 + gl.arange(0, BN, gl.SliceLayout(0, k_layout))
     jv = c0 + gl.arange(0, BN, gl.SliceLayout(1, v_load))
     old_k = jk < hi
     old_v = jv < hi
-    page_k = gl.load(table + jk // PAGE, mask=old_k, other=0)
-    page_v = gl.load(table + jv // PAGE, mask=old_v, other=0)
     slot_k = page_k.to(gl.int64) * PAGE + jk % PAGE
     slot_v = page_v.to(gl.int64) * PAGE + jv % PAGE
     keys = gl.load(
@@ -340,8 +352,18 @@ def attn_stage(
     dk = gl.arange(0, HEAD, gl.SliceLayout(1, k_layout))
     dv = gl.arange(0, HEAD, gl.SliceLayout(0, v_load))
     keys, values = _load_kv(
-        table, k_cache, v_cache, g, lo, hi, dk, dv, k_layout, v_load
+        _load_pages(table, lo, hi, k_layout, v_load),
+        k_cache,
+        v_cache,
+        g,
+        lo,
+        hi,
+        dk,
+        dv,
+        k_layout,
+        v_load,
     )
+    pages = _load_pages(table, lo + BN, hi, k_layout, v_load)
 
     # q of the 8 heads of every row, and the launch's k and v. A thread
     # holds one pair, 32 lanes a head: the norm sums in head_stage's order.
@@ -423,10 +445,12 @@ def attn_stage(
     for c0 in range(lo, hi, BN):
         js = c0 + gl.arange(0, BN, gl.SliceLayout(0, qk_mma))
         valid = (js[None, :] < hi) & (js[None, :] >= row_first[:, None])
-        # The next chunk's loads go before this chunk's math.
+        # The next chunk's loads (at pages already loaded) and the pages of
+        # the one after go before this chunk's math.
         next_keys, next_values = _load_kv(
-            table, k_cache, v_cache, g, c0 + BN, hi, dk, dv, k_layout, v_load
+            pages, k_cache, v_cache, g, c0 + BN, hi, dk, dv, k_layout, v_load
         )
+        pages = _load_pages(table, c0 + 2 * BN, hi, k_layout, v_load)
         gl.barrier()
         v_smem.store(values)
         gl.barrier()
