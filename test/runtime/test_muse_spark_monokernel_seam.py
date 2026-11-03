@@ -48,15 +48,18 @@ from tokenspeed.runtime.layers.moe.weights.loaders import (  # noqa: E402
     load_w2,
     load_w13,
 )
+from tokenspeed.runtime.layers.paged_attention import PagedAttention  # noqa: E402
 from tokenspeed.runtime.models.muse_spark_monokernel import (  # noqa: E402
     MAX_REQUESTS,
     MAX_ROWS,
-    NOT_BF16_KV,
     NOT_TP8,
     OTHER_CONSTANTS,
+    OTHER_KV,
     OTHER_SHAPES,
+    SCALED_KV,
     MonokernelStep,
     _rank_slices,
+    kv_reasons,
     model_reasons,
     takes_monokernels,
 )
@@ -206,10 +209,34 @@ def test_other_moe_splits_keep_the_regular_path(moe_tp, moe_ep) -> None:
     assert model_reasons(_config(), _mapping(moe_tp, moe_ep)) == [NOT_TP8]
 
 
-def test_an_fp8_kv_cache_keeps_the_regular_path(monkeypatch) -> None:
-    """The kernels read and write BF16 keys and values."""
+def test_an_fp8_kv_cache_takes_the_kernels(monkeypatch) -> None:
+    """The kernels read and write the regular path's unit-scale FP8 e4m3."""
     monkeypatch.setitem(global_server_args_dict, "kv_cache_dtype", "fp8_e4m3")
-    assert model_reasons(_config(), _mapping(8, 1)) == [NOT_BF16_KV]
+    assert model_reasons(_config(), _mapping(8, 1)) == []
+
+
+def test_an_mxfp8_kv_cache_keeps_the_regular_path(monkeypatch) -> None:
+    monkeypatch.setitem(global_server_args_dict, "kv_cache_dtype", "mxfp8")
+    assert model_reasons(_config(), _mapping(8, 1)) == [OTHER_KV]
+
+
+def _attention() -> PagedAttention:
+    """One Muse Spark rank's attention: 16 q heads, 2 KV heads of 64."""
+    return PagedAttention(16, 64, 0.125, 2, 1, rotary_emb=None, qk_norm=None)
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["fp8_e4m3", "auto"])
+def test_a_layer_with_fp8_kv_scales_keeps_the_regular_path_on_an_fp8_cache(
+    monkeypatch, kv_cache_dtype
+) -> None:
+    """A checkpoint's k_scale applies to an FP8 cache, and the kernels apply
+    none; a BF16 cache ignores the scales."""
+    monkeypatch.setitem(global_server_args_dict, "kv_cache_dtype", kv_cache_dtype)
+    attention = _attention()
+    assert kv_reasons(attention) == []
+    attention.load_kv_cache_scale("model.layers.1.self_attn.k_scale", torch.tensor(2.0))
+    want = [SCALED_KV] if kv_cache_dtype == "fp8_e4m3" else []
+    assert kv_reasons(attention) == want
 
 
 def _loaded(

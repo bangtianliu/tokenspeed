@@ -96,6 +96,8 @@ def _bases(rows: int, *names: str) -> dict[str, int]:
 # The most rows of one launch: two requests' verifies of 7 draft tokens
 # (the drafters' block of 8). The GEMVs' MFMAs hold 16 rows.
 MAX_ROWS = 16
+# KV cache dtypes the attention reads and writes (FP8 at unit scale).
+KV_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
 
 
 def layer_plan(full: bool, rows: int, chain: int) -> Plan:
@@ -440,7 +442,8 @@ def launch_gluon_muse_spark_layer_gfx950(
         page_table: int32 ``[requests, pages]`` (or ``[pages]`` for one
             request): each request's page table (64 tokens a page, indexed
             by absolute position).
-        k_cache, v_cache: BF16 ``[slots, 2, 64]``.
+        k_cache, v_cache: BF16, or FP8 e4m3 holding unit-scale values,
+            ``[slots, 2, 64]``.
         cos_sin: FP32 ``[positions, 64]`` rotary table (unused by a full,
             NoPE layer).
         scratch: int64 mailbox pairs on the Iris symmetric heap.
@@ -477,8 +480,9 @@ def launch_gluon_muse_spark_layer_gfx950(
     for name, t in (("seq_len", seq_len), ("slot", slot)):
         if t.dtype != torch.int32 or t.numel() != rows:
             raise ValueError(f"{name}: int32 [{rows}], one per row")
-    if k_cache.dtype != torch.bfloat16 or v_cache.dtype != torch.bfloat16:
-        raise ValueError("k_cache, v_cache: BF16 (the kernel reads BF16 keys)")
+    # FP8 caches hold unit-scale e4m3 values (the kernel applies no scale).
+    if k_cache.dtype not in KV_DTYPES or v_cache.dtype != k_cache.dtype:
+        raise ValueError("k_cache, v_cache: both BF16, or both FP8 e4m3 at unit scale")
     if page_table.dim() == 1:
         page_table = page_table[None]
     if (
@@ -537,6 +541,7 @@ __all__ = [
     "MAX_ROWS",
     "launch_gluon_muse_spark_layer_gfx950",
     "FULL_SPLITS",
+    "KV_DTYPES",
     "SLIDING_SPLITS",
     "gluon_muse_spark_layer_gfx950",
     "launch_layer",

@@ -128,7 +128,11 @@ OTHER_CONSTANTS = "model constants other than the kernel's"
 NOT_BF16 = "a dense projection or norm gain is not BF16"
 NOT_SUPPORTED_EXPERTS = "the routed experts do not run a gluon MXFP4 kernel"
 NO_KERNEL = "no monokernel for this platform"
-NOT_BF16_KV = "the KV cache is not BF16 (--kv-cache-dtype): the kernels read BF16 keys"
+OTHER_KV = (
+    "the KV cache is neither BF16 nor FP8 e4m3 (--kv-cache-dtype): the kernels "
+    "read those"
+)
+SCALED_KV = "the layer has FP8 KV-cache scales: the kernels read unit-scale FP8"
 
 
 def _gain(norm: torch.nn.Module) -> torch.Tensor | None:
@@ -201,10 +205,25 @@ def model_reasons(config, mapping) -> list[str]:
         for name, value in KERNEL_CONSTANTS.items()
     ):
         reasons.append(OTHER_CONSTANTS)
-    # "auto" keeps the model's BF16.
-    if global_server_args_dict["kv_cache_dtype"] not in ("auto", "bfloat16", "bf16"):
-        reasons.append(NOT_BF16_KV)
+    # "auto" keeps the model's BF16; FP8 e4m3 is the regular path's
+    # unit-scale cast (per-layer scales are refused in prepare_layer).
+    if global_server_args_dict["kv_cache_dtype"] not in (
+        "auto",
+        "bfloat16",
+        "bf16",
+        "fp8",
+        "fp8_e4m3",
+    ):
+        reasons.append(OTHER_KV)
     return reasons
+
+
+def kv_reasons(attention: torch.nn.Module) -> list[str]:
+    """Why the cache of a layer's ``PagedAttention`` (after loading) keeps the
+    regular path: loaded per-tensor scales apply to an FP8 cache, and the
+    kernels apply none."""
+    fp8 = global_server_args_dict["kv_cache_dtype"] in ("fp8", "fp8_e4m3")
+    return [SCALED_KV] if fp8 and attention.fp8_kv_scales is not None else []
 
 
 def prepare_layer(model: torch.nn.Module, index: int) -> FusedDecodeLayer | list[str]:
@@ -234,6 +253,8 @@ def prepare_layer(model: torch.nn.Module, index: int) -> FusedDecodeLayer | list
     ]
     if any(t is None for t in dense + gains):
         return [NOT_BF16]
+    if kv_reasons(attn.attn):
+        return kv_reasons(attn.attn)
     if not _gluon_experts(mlp):
         return [NOT_SUPPORTED_EXPERTS]
     if mlp.ep_size == 1:

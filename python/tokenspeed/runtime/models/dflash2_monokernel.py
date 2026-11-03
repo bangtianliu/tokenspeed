@@ -68,6 +68,7 @@ from tokenspeed_kernel.ops.monokernel import (
 )
 
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.layers.attention.configs.mha import mha_kv_cache_dtype
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.logits_processor import (
     should_apply_lm_head_quant_method,
@@ -118,7 +119,7 @@ TOPK = 16
 STEPS = BLOCK_ROWS - 1  # the block's rows 1 .. 7 draft a token each
 CONTEXT_ROWS = 8  # one request's verify rows
 NO_KERNEL = "no draft monokernel for this platform"
-NOT_BF16_KV = "the KV cache is not BF16 (--kv-cache-dtype): the kernels read BF16 keys"
+NOT_BF16_KV = "the draft's KV cache is not BF16: the kernels read BF16 keys"
 
 
 def _config_value(config, key: str):
@@ -151,8 +152,15 @@ def model_reasons(model: torch.nn.Module) -> list[str]:
         reasons.append(OTHER_ATTENTION)
     if any(not _bf16(layer) for layer in model.layers):
         reasons.append(NOT_BF16)
-    # "auto" keeps the model's BF16.
-    if global_server_args_dict["kv_cache_dtype"] not in ("auto", "bfloat16", "bf16"):
+    # The draft's own cache ("auto" keeps the model's BF16): a block drafter
+    # keeps BF16 under an FP8 --kv-cache-dtype unless it attends with trtllm.
+    draft_kv = mha_kv_cache_dtype(
+        global_server_args_dict["kv_cache_dtype"],
+        global_server_args_dict["speculative_algorithm"],
+        global_server_args_dict["drafter_attention_backend"],
+        is_draft=True,
+    )
+    if draft_kv not in ("auto", "bfloat16", "bf16"):
         reasons.append(NOT_BF16_KV)
     return reasons
 
