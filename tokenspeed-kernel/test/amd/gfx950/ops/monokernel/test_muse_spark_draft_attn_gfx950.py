@@ -56,7 +56,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import (  # noqa: E402
 
 HEAD, HALF, Q_HEADS, QKV, KPARTS = 128, 64, 8, 1280, 16
 EPS, THETA = 1e-5, 500000.0
-SPLITS, PAGE, WINDOW_KEYS = 16, 64, 2049
+SPLITS, PAGE, WINDOW_KEYS = 16, 64, 2048
 
 
 @gluon.jit
@@ -276,7 +276,7 @@ def test_attention_takes_the_window_and_the_whole_block_for_every_row(prefix: in
         num_warps=8,
     )
     torch.cuda.synchronize()
-    # Every row sees the same keys: [max(end - 2049, 0), end), the block last.
+    # Every row sees the same keys: [max(end - 2048, 0), end), the block last.
     first = max(end - WINDOW_KEYS, 0)
     keys = torch.cat([ctx_k[first:prefix], kb]).float()
     values = torch.cat([ctx_v[first:prefix], vb]).float()

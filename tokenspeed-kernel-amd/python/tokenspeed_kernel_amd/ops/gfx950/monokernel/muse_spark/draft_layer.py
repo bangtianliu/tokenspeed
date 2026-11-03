@@ -35,11 +35,23 @@ the same launch:
 
 from __future__ import annotations
 
+import functools
+from dataclasses import dataclass
+
+import torch
+from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox, schedule, trace
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
     draft_attn,
     draft_mlp,
 )
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Stage
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Plan, Stage
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import bf16_tiles
+
+WORLD = gl.constexpr(8)
+DRAFT_LAYERS = gl.constexpr(5)  # launches a draft forward runs
+SPLITS = 16  # attention splits: 16 x 128 keys hold the 2041 cached
+MAX_ROWS = 8  # one request's block
 
 PEERS = draft_attn.PEERS + draft_mlp.PEERS
 
@@ -83,3 +95,485 @@ _ATTN_NAMES = (
     "afin",
 )
 _MLP_NAMES = ("sum", "coef", "conv0", "gu", "act", "down", "fin")
+
+
+# Placement: the attention half (draft_attn) then the MLP half (draft_mlp).
+# isum and sum share CTAs, so sum takes isum's residual from registers.
+BASES = {
+    "iscat": 0,
+    "isum": 128,
+    "acoef": 0,
+    "aconv0": 128,
+    "qkv": 0,
+    "head": 160,
+    "attn": 240,
+    "merge": 0,
+    "oproj": 64,
+    "afin": 0,
+    "sum": 128,
+    "coef": 0,
+    "conv0": 128,
+    "gu": 0,
+    "act": 144,
+    "down": 0,
+    "fin": 0,
+}
+
+
+@functools.lru_cache(maxsize=None)
+def layer_plan(rows: int) -> Plan:
+    """The plan of a draft layer for ``rows`` token rows (one block)."""
+    return Plan(
+        grid=256,
+        stages=stages(BASES, SPLITS, rows),
+        regions=regions(SPLITS),
+        rows=rows,
+        chain=rows,
+        world=int(WORLD),
+        peers=PEERS,
+    )
+
+
+@dataclass(frozen=True)
+class DraftLayerWeights:
+    """One TP8 rank's DFlash2 draft layer, packed for the launch.
+
+    The BF16 projections are in ``weights.bf16_tiles`` order; the norm gains
+    are FP32 of the rank's owned columns (``1024 rank ..``).
+    """
+
+    rank: int
+    in_gain: torch.Tensor
+    a_coef: torch.Tensor
+    a_base: torch.Tensor
+    qkv: torch.Tensor
+    q_norm: torch.Tensor
+    k_norm: torch.Tensor
+    o: torch.Tensor
+    post_gain: torch.Tensor
+    m_coef: torch.Tensor
+    m_base: torch.Tensor
+    gu: torch.Tensor
+    down: torch.Tensor
+
+
+def pack_draft_layer(tensors: dict[str, torch.Tensor], rank: int) -> DraftLayerWeights:
+    """Pack one rank's draft layer weights.
+
+    Args:
+        tensors: BF16 by role: ``input_norm`` and ``post_norm`` ``[8192]``;
+            ``attn_coef`` and ``mlp_coef`` ``[2048, 8192]`` (the replicated
+            convolution coefficient projections); ``attn_base`` and
+            ``mlp_base`` ``[2, 2, 8192]`` (``base_kernel``); ``qkv``
+            ``[1280, 8192]`` (the rank's q, k, v rows); ``q_norm`` and
+            ``k_norm`` ``[128]``; ``o_proj`` ``[8192, 1024]`` (the rank's
+            columns); ``gate_up`` ``[7168, 8192]`` (the rank's gate rows,
+            then its up rows); ``down`` ``[8192, 3584]`` (the rank's
+            columns).
+        rank: The rank in the TP8 group.
+    """
+    shapes = {
+        "input_norm": (8192,),
+        "post_norm": (8192,),
+        "attn_coef": (2048, 8192),
+        "mlp_coef": (2048, 8192),
+        "attn_base": (2, 2, 8192),
+        "mlp_base": (2, 2, 8192),
+        "qkv": (1280, 8192),
+        "q_norm": (128,),
+        "k_norm": (128,),
+        "o_proj": (8192, 1024),
+        "gate_up": (7168, 8192),
+        "down": (8192, 3584),
+    }
+    for name, shape in shapes.items():
+        t = tensors[name]
+        if t.dtype != torch.bfloat16 or tuple(t.shape) != shape:
+            raise ValueError(f"{name}: BF16 {shape}, got {t.dtype} {tuple(t.shape)}")
+    own = slice(rank * 1024, (rank + 1) * 1024)
+    return DraftLayerWeights(
+        rank=rank,
+        in_gain=tensors["input_norm"][own].float().contiguous(),
+        a_coef=bf16_tiles(tensors["attn_coef"]),
+        a_base=tensors["attn_base"].contiguous(),
+        qkv=bf16_tiles(tensors["qkv"]),
+        q_norm=tensors["q_norm"].contiguous(),
+        k_norm=tensors["k_norm"].contiguous(),
+        o=bf16_tiles(tensors["o_proj"].contiguous()),
+        post_gain=tensors["post_norm"][own].float().contiguous(),
+        m_coef=bf16_tiles(tensors["mlp_coef"]),
+        m_base=tensors["mlp_base"].contiguous(),
+        gu=bf16_tiles(tensors["gate_up"]),
+        down=bf16_tiles(tensors["down"].contiguous()),
+    )
+
+
+# The layer index changes every launch: a specialization on it would compile
+# new binaries while serving.
+@gluon.jit(do_not_specialize=("layer",))
+def gluon_muse_spark_draft_layer_gfx950(
+    scratch,
+    step,
+    layer,
+    bases,
+    x,
+    residual,
+    residual_out,
+    in_gain,
+    a_coef,
+    a_base,
+    qkv_w,
+    q_norm,
+    k_norm,
+    cos_sin,
+    positions,
+    slots,
+    table,
+    seq_len,
+    k_cache,
+    v_cache,
+    o_w,
+    post_gain,
+    m_coef,
+    m_base,
+    gu_w,
+    down_w,
+    out,
+    trace_buf,
+    PLAN: gl.constexpr,
+    RANK: gl.constexpr,
+    SPLITS_: gl.constexpr,
+):
+    """One step of draft layer ``layer`` on rank ``RANK`` (see the module
+    docstring and :func:`launch_gluon_muse_spark_draft_layer_gfx950`)."""
+    table_ = trace.allocate(trace_buf)
+    # The peer copies alternate from launch to launch, across forwards too:
+    # a forward runs DRAFT_LAYERS launches.
+    parity = (gl.load(step) * DRAFT_LAYERS + layer) & 1
+    peers = mailbox.load_peers(bases, RANK, parity, WORLD)
+    mb = mailbox.Mailbox(scratch, mailbox.launch_tag(step, layer), PLAN, table_, peers)
+    H: gl.constexpr = draft_mlp.HIDDEN
+    G: gl.constexpr = schedule.grid(PLAN)
+    # The attention half.
+    task, active = schedule.stage_task(PLAN, "iscat")
+    if active:
+        draft_mlp.scat_stage(mb, task, x, RANK, "ared", "iscat")
+    r_lo = draft_mlp.residual_zeros()
+    r_hi = draft_mlp.residual_zeros()
+    sum_task, has_sum = schedule.stage_task(PLAN, "isum1")
+    if has_sum:
+        r_lo, r_hi = draft_mlp.sum_norm_stages(
+            mb,
+            sum_task,
+            residual,
+            residual_out,
+            in_gain,
+            RANK,
+            "ared",
+            "ass",
+            "ahin",
+            "isum1",
+            "inorm",
+            False,
+        )
+    task, active = schedule.stage_task(PLAN, "acoef")
+    if active:
+        draft_mlp.proj_task(
+            mb,
+            task,
+            a_coef,
+            "ahin",
+            "acpart",
+            draft_mlp.COEFS,
+            H,
+            draft_mlp.COEF_ROWS,
+            draft_mlp.COEF_KS,
+            "acoef",
+        )
+    task, active = schedule.stage_task(PLAN, "aconv0")
+    if active:
+        draft_mlp.conv0_stage(mb, task, a_base, "ahin", "acpart", "ahc", "aconv0")
+    task, active = schedule.stage_task(PLAN, "qkv")
+    if active:
+        draft_mlp.proj_task(
+            mb, task, qkv_w, "ahc", "qpart", draft_attn.QKV, H, 128, 512, "qkv"
+        )
+    task, active = schedule.stage_task(PLAN, "head")
+    if active:
+        draft_attn.head_stage(
+            mb,
+            task,
+            q_norm,
+            k_norm,
+            cos_sin,
+            positions,
+            slots,
+            k_cache,
+            v_cache,
+            "head",
+        )
+    task, active = schedule.stage_task(PLAN, "attn")
+    if active:
+        draft_attn.attn_stage(
+            mb, task, table, seq_len, k_cache, v_cache, SPLITS_, "attn"
+        )
+    task, active = schedule.stage_task(PLAN, "merge")
+    if active:
+        draft_attn.merge_stage(mb, task, SPLITS_, "merge")
+    task, active = schedule.stage_task(PLAN, "oproj")
+    if active:
+        draft_mlp.proj_task(mb, task, o_w, "ao", "opart", H, 1024, 128, 512, "oproj")
+    task, active = schedule.stage_task(PLAN, "afin")
+    if active:
+        draft_mlp.fin_to_owners(
+            mb,
+            task,
+            a_base,
+            "opart",
+            draft_attn.OPROJ_KPARTS,
+            "acpart",
+            draft_attn.AFIN_COLS,
+            RANK,
+            "red",
+            "afin",
+        )
+    # The MLP half: sum1 on isum1's CTAs, with its residual.
+    if has_sum:
+        draft_mlp.sum_norm_regs(
+            mb,
+            sum_task,
+            r_lo,
+            r_hi,
+            residual_out,
+            post_gain,
+            RANK,
+            "red",
+            "ss",
+            "hin",
+            "sum1",
+            "norm",
+            True,
+        )
+    task, active = schedule.stage_task(PLAN, "coef")
+    if active:
+        draft_mlp.proj_task(
+            mb,
+            task,
+            m_coef,
+            "hin",
+            "cpart",
+            draft_mlp.COEFS,
+            H,
+            draft_mlp.COEF_ROWS,
+            draft_mlp.COEF_KS,
+            "coef",
+        )
+    # The CTAs that host no conv0 task start their first gate/up task right
+    # after coef (see draft_mlp).
+    gu_task, rounds = schedule.stage_rounds(PLAN, "gu")
+    _, has_conv0 = schedule.stage_task(PLAN, "conv0")
+    free = not has_conv0
+    if free:
+        draft_mlp.proj_task(
+            mb,
+            gu_task,
+            gu_w,
+            "hc",
+            "gpart",
+            draft_mlp.GU,
+            H,
+            draft_mlp.GU_ROWS,
+            draft_mlp.GU_KS,
+            "gu",
+        )
+    task, active = schedule.stage_task(PLAN, "conv0")
+    if active:
+        draft_mlp.conv0_stage(mb, task, m_base, "hin", "cpart", "hc", "conv0")
+    for i in range(gl.where(free, 1, 0), rounds):
+        draft_mlp.proj_task(
+            mb,
+            gu_task + i * G,
+            gu_w,
+            "hc",
+            "gpart",
+            draft_mlp.GU,
+            H,
+            draft_mlp.GU_ROWS,
+            draft_mlp.GU_KS,
+            "gu",
+        )
+    d_task, d_rounds = schedule.stage_rounds(PLAN, "down")
+    a_task, has_act = schedule.stage_task(PLAN, "act")
+    I: gl.constexpr = draft_mlp.INTER
+    if has_act:
+        tiles = draft_mlp.proj_issue(
+            d_task, down_w, H, I, draft_mlp.DOWN_ROWS, draft_mlp.DOWN_KS
+        )
+        draft_mlp.act_stage(mb, a_task, "act")
+        xs = draft_mlp.proj_poll(mb, d_task, "act", I, draft_mlp.DOWN_KS, "down")
+        draft_mlp.proj_compute(
+            mb,
+            d_task,
+            tiles,
+            xs,
+            "dpart",
+            H,
+            I,
+            draft_mlp.DOWN_ROWS,
+            draft_mlp.DOWN_KS,
+            "down",
+        )
+    for i in range(gl.where(has_act, 1, 0), d_rounds):
+        draft_mlp.proj_task(
+            mb,
+            d_task + i * G,
+            down_w,
+            "act",
+            "dpart",
+            H,
+            I,
+            draft_mlp.DOWN_ROWS,
+            draft_mlp.DOWN_KS,
+            "down",
+        )
+    task, active = schedule.stage_task(PLAN, "fin")
+    if active:
+        draft_mlp.fin_stage(
+            mb,
+            task,
+            m_base,
+            out,
+            "dpart",
+            draft_mlp.DOWN_KPARTS,
+            "cpart",
+            draft_mlp.FIN_COLS,
+            "fin",
+        )
+    trace.flush(table_, trace_buf)
+
+
+def launch_gluon_muse_spark_draft_layer_gfx950(
+    weights: DraftLayerWeights,
+    *,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    residual_out: torch.Tensor,
+    out: torch.Tensor,
+    seq_len: torch.Tensor,
+    positions: torch.Tensor,
+    slots: torch.Tensor,
+    page_table: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cos_sin: torch.Tensor,
+    scratch: torch.Tensor,
+    step: torch.Tensor,
+    peer_bases: torch.Tensor,
+    layer: int,
+    trace_buf,
+    compile_only: bool,
+) -> None:
+    """One step of a packed draft layer for one request's block of rows, on
+    every rank of the TP8 group at once (the launches exchange values).
+
+    Args:
+        weights: From :func:`pack_draft_layer`.
+        x: BF16 ``[rows, 8192]``: this rank's partial of the layer input
+            (the previous layer's MLP partial, or the embedding's).
+        residual: BF16 ``[rows, 8192]``: the residual before the layer (the
+            same on every rank).
+        residual_out: BF16 ``[rows, 8192]``: this rank stores its owned
+            columns (``1024 rank ..``) of the residual after the attention
+            sublayer.
+        out: BF16 ``[rows, 8192]``: this rank's partial of the layer output.
+        seq_len: int32 ``[1]``: the request's length after the block.
+        positions: int32 ``[rows]``: the block rows' positions.
+        slots: int32 or int64 ``[rows]``: the block rows' cache slots.
+        page_table: int32 page table of the request (64 tokens a page).
+        k_cache, v_cache: BF16 ``[slots, 1, 128]``: this layer's cache.
+        cos_sin: FP32 ``[positions, 128]`` rotary table, cos then sin.
+        scratch: int64 mailbox pairs of ``layer_plan(rows).scratch_pairs``
+            on the Iris symmetric heap.
+        step: int32 ``[1]`` counter that changes once per draft forward.
+        peer_bases: int64 ``[8]`` heap bases of the group's ranks.
+        layer: The draft layer index, below ``DRAFT_LAYERS``.
+        trace_buf: None, or a trace buffer (``trace.py``).
+        compile_only: Only compile the launch for these operands: a rank's
+            launch polls its peers for a few seconds before it traps, so the
+            ranks compile before any of them launches.
+    """
+    rows = x.shape[0]
+    if not 1 <= rows <= MAX_ROWS or rows % 8:
+        raise ValueError(f"a draft block of 8 rows, got {rows}")
+    for name, t in (
+        ("x", x),
+        ("residual", residual),
+        ("residual_out", residual_out),
+        ("out", out),
+    ):
+        if (
+            t.dtype != torch.bfloat16
+            or tuple(t.shape) != (rows, 8192)
+            or not t.is_contiguous()
+        ):
+            raise ValueError(f"{name}: contiguous BF16 [{rows}, 8192]")
+    # The launch reads x and residual while other CTAs already write the outputs.
+    if {x.data_ptr(), residual.data_ptr()} & {residual_out.data_ptr(), out.data_ptr()}:
+        raise ValueError("the outputs must not alias the inputs")
+    if not 0 <= layer < int(DRAFT_LAYERS):
+        raise ValueError(f"layer {layer} out of range({int(DRAFT_LAYERS)})")
+    plan = layer_plan(rows)
+    w = weights
+    args = (
+        scratch,
+        step,
+        layer,
+        peer_bases,
+        x,
+        residual,
+        residual_out,
+        w.in_gain,
+        w.a_coef,
+        w.a_base,
+        w.qkv,
+        w.q_norm,
+        w.k_norm,
+        cos_sin,
+        positions,
+        slots,
+        page_table,
+        seq_len,
+        k_cache,
+        v_cache,
+        w.o,
+        w.post_gain,
+        w.m_coef,
+        w.m_base,
+        w.gu,
+        w.down,
+        out,
+        trace_buf,
+        plan.key,
+        w.rank,
+        SPLITS,
+    )
+    if compile_only:
+        gluon_muse_spark_draft_layer_gfx950.warmup(
+            *args, num_warps=8, grid=(plan.grid,)
+        )
+    else:
+        gluon_muse_spark_draft_layer_gfx950[(plan.grid,)](*args, num_warps=8)
+
+
+__all__ = [
+    "BASES",
+    "DraftLayerWeights",
+    "MAX_ROWS",
+    "SPLITS",
+    "gluon_muse_spark_draft_layer_gfx950",
+    "launch_gluon_muse_spark_draft_layer_gfx950",
+    "layer_plan",
+    "pack_draft_layer",
+    "regions",
+    "stages",
+]
