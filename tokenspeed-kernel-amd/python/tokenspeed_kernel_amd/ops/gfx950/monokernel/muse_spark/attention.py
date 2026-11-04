@@ -210,13 +210,27 @@ def head_stage(
 
 
 @gluon.constexpr_function
-def _layouts(nw):
-    """(qk MFMA, pv MFMA, K operand, V load) layouts."""
+def _layouts(nw, QM):
+    """(qk MFMA, pv MFMA, K operand, V load) layouts for ``QM`` MFMA rows.
+
+    With 32 rows or more (3+ token rows) the warps split the rows in two and
+    the chunk's keys in ``nw / 2``: the softmax's row max and sum then cross
+    half the warps, for keys loaded by two warps each. At 8 rows and 340k
+    keys this takes a full layer from 167.5 to 156.2 us (8 GPUs); splitting
+    the rows in four loses (172.6 us) to the duplicated key loads. One
+    or two token rows are 16 MFMA rows, a single row tile."""
+    rw = 2 if QM >= 32 else 1
     qk_mma = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[1, nw]
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[rw, nw // rw],
     )
     pv_mma = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 16], transposed=True, warps_per_cta=[1, nw]
+        version=4,
+        instr_shape=[16, 16, 16],
+        transposed=True,
+        warps_per_cta=[rw, nw // rw],
     )
     k_layout = gl.DotOperandLayout(1, qk_mma, 8)
     v_load = gl.BlockedLayout([1, 8], [8, 8], [nw, 1], [1, 0])
@@ -329,10 +343,10 @@ def attn_stage(
     base = req * C
     table = table + req.to(gl.int64) * table_stride
     nw: gl.constexpr = gl.num_warps()
-    qk_mma: gl.constexpr = _layouts(nw)[0]
-    pv_mma: gl.constexpr = _layouts(nw)[1]
-    k_layout: gl.constexpr = _layouts(nw)[2]
-    v_load: gl.constexpr = _layouts(nw)[3]
+    qk_mma: gl.constexpr = _layouts(nw, QM)[0]
+    pv_mma: gl.constexpr = _layouts(nw, QM)[1]
+    k_layout: gl.constexpr = _layouts(nw, QM)[2]
+    v_load: gl.constexpr = _layouts(nw, QM)[3]
     q_layout: gl.constexpr = gl.DotOperandLayout(0, qk_mma, 8)
     p_layout: gl.constexpr = gl.DotOperandLayout(0, pv_mma, 4)
     v_layout: gl.constexpr = gl.DotOperandLayout(1, pv_mma, 4)
