@@ -119,10 +119,15 @@ def _plan(splits: int, rows: int, chain: int) -> Plan:
     [
         (6, 2048, SLIDING_SPLITS),
         (3000, 2048, SLIDING_SPLITS),
+        # Fewer keys than one chunk: only split 0 has cached keys, and the
+        # last split, which takes the launch's tokens, has none.
+        (6, 0, FULL_SPLITS),
         (3000, 0, FULL_SPLITS),
         (9000, 0, FULL_SPLITS),
         # Several key chunks a split.
         (50000, 0, FULL_SPLITS),
+        # An agentic context (AgentX averages ~185k): ~14 chunks a split.
+        (230000, 0, FULL_SPLITS),
     ],
 )
 def test_attention_matches_the_regular_path_math(
