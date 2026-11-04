@@ -41,14 +41,20 @@ each row's 8 picks as for one row.
   row to MXFP4 (the regular path's "even" rule) in LDS, one MFMA row each.
   It publishes the FP32 partial sums of the rows that picked the slot's
   expert.
+* exr, 64 tasks: lane ``l``, one ex1 column block. For each slot, a task
+  polls the 4 K quarters of every row that picked the slot's expert, sums
+  them in K order, applies SwiGLU (``silu(gate) up``) and publishes the
+  block's 64 intermediate values a row (``h1``). Summed once here, an ex2
+  task reads 512 values a row instead of 4096 partials: polled by all 256
+  CTAs at once, the partials took one 0.7 us round trip a row (the
+  memory-side bandwidth, not the latency), so a slot that many rows
+  picked held its lane up.
 * ex2, 256 tasks: lane ``l``, 128 of the 4096 output columns over the rank's
-  512 intermediate values (32 KiB a slot). For each row that picked the
-  slot's expert, a task polls its ex1 partials, sums the 4 in K order,
-  applies SwiGLU (``silu(gate) up``) and the regular path's MXFP4
-  requantization (groups of 32) itself: the 32 tasks of a slot repeat this
-  small step, so no stage hands the intermediate over. The BF16 partials go
-  to the rank that owns those columns (``rr``), which sums the 8 ranks'
-  partials.
+  512 intermediate values (32 KiB a slot). A task polls the intermediates of
+  the rows that picked the slot's expert (up to 8 rows a poll) and applies
+  the regular path's MXFP4 requantization (groups of 32) itself. The BF16
+  partials go to the rank that owns those columns (``rr``), which sums the
+  8 ranks' partials.
 
 Expert weights cannot load before routing picks the experts. So a CTA runs
 the first slot of its ex1 and ex2 tasks in parts: :func:`ex1_poll` (one
@@ -96,6 +102,7 @@ K_SLICE = gl.constexpr(1024)  # POOLED // KSPLIT
 NB1 = gl.constexpr(8)  # W13_N // BLOCK_N
 NB2 = gl.constexpr(32)  # POOLED // BLOCK_N
 EX1_TASKS = gl.constexpr(256)  # LANES * NB1 * KSPLIT
+EXR_TASKS = gl.constexpr(64)  # LANES * NB1
 EX2_BLOCKS = gl.constexpr(1)  # 128-column blocks of an ex2 task
 EX2_TASKS = gl.constexpr(256)  # LANES * NB2 // EX2_BLOCKS
 OWNED_OUT = gl.constexpr(512)  # output columns a rank reduces: POOLED / WORLD
@@ -108,6 +115,7 @@ def regions() -> tuple[tuple[str, int], ...]:
     k, nb1, ks, bn = int(TOP_K), int(NB1), int(KSPLIT), int(BLOCK_N)
     return (
         ("p1", k * nb1 * ks * bn),  # FP32 [pick][block][K quarter][column] a row
+        ("h1", k * int(INTER)),  # FP32 SwiGLU intermediate [pick][value] a row
         (
             "rr",
             int(WORLD) * k * int(OWNED_OUT) // 2,
@@ -116,10 +124,11 @@ def regions() -> tuple[tuple[str, int], ...]:
 
 
 def stages(bases: dict[str, int]) -> tuple[Stage, ...]:
-    ex1, ex2 = placement(bases, ("ex1", "ex2"))
+    ex1, exr, ex2 = placement(bases, ("ex1", "exr", "ex2"))
     return (
         Stage("ex1", int(EX1_TASKS), ex1, reads=("route", "cg"), writes=("p1",)),
-        Stage("ex2", int(EX2_TASKS), ex2, reads=("route", "p1"), writes=("rr",)),
+        Stage("exr", int(EXR_TASKS), exr, reads=("route", "p1"), writes=("h1",)),
+        Stage("ex2", int(EX2_TASKS), ex2, reads=("route", "h1"), writes=("rr",)),
     )
 
 
@@ -561,38 +570,87 @@ def _ex2_loads(
 
 
 @gluon.jit
-def _ex1_sum(mb, row, pick):
-    """Row ``row``'s SwiGLU intermediate ``[512]`` of the expert of pick
-    ``pick``: the ex1 partials summed in K order."""
+def _slot_rows(mb, picks, RP: gl.constexpr, layout: gl.constexpr):
+    """``(row, pick, routed)`` ``[RP]`` in ``layout``: each row that picked
+    the slot's expert with its pick; the other rows (and the rows past the
+    launch's) stand in for the first routed row, so a poll of them reads
+    pairs that are published."""
+    R: gl.constexpr = schedule.rows(mb.plan)
+    i = gl.arange(0, RP, layout)
+    pick = gl.full([RP], -1, gl.int32, layout)
+    first = gl.to_tensor(-1)
+    first_pick = gl.to_tensor(-1)
+    for r in gl.static_range(R - 1, -1, -1):
+        pick = gl.where(i == r, picks[r], pick)
+        first = gl.where(picks[r] >= 0, r, first)
+        first_pick = gl.where(picks[r] >= 0, picks[r], first_pick)
+    routed = pick >= 0
+    return gl.where(routed, i, first), gl.where(routed, pick, first_pick), routed
+
+
+@gluon.jit
+def exr_stage(mb, task, union, STAGE: gl.constexpr):
+    """Exr task ``task`` (slot lane, ex1 column block): for each slot of the
+    lane, sum the 4 K quarters of the ex1 partials of every row that picked
+    the slot's expert, apply SwiGLU (``silu(gate) up``) and publish the
+    block's 64 intermediate values a row. The 32 ex2 tasks of the lane then
+    read 512 values a row, not 4 partials of 1024 columns each."""
+    mb.stamp(STAGE, trace.START)
+    R: gl.constexpr = schedule.rows(mb.plan)
+    RP: gl.constexpr = triton.next_power_of_2(R)
     nw: gl.constexpr = gl.num_warps()
-    gl.static_assert(nw == NB1, "ex2 sums one ex1 column block a wave")
-    # [ex1 block, K quarter, column]: a wave per block, the K quarters in a
-    # lane's registers.
+    lane = task // NB1
+    blk = task % NB1
+    count = union[3]
+    # [row, K quarter, column]: the K quarters in a lane's registers.
     pl: gl.constexpr = gl.BlockedLayout(
         [1, KSPLIT, 2], [1, 1, 64], [nw, 1, 1], [2, 1, 0]
     )
-    b1 = gl.arange(0, NB1, gl.SliceLayout(1, gl.SliceLayout(2, pl)))[:, None, None]
+    rl: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, pl))
     ks = gl.arange(0, KSPLIT, gl.SliceLayout(0, gl.SliceLayout(2, pl)))[None, :, None]
     n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, gl.SliceLayout(1, pl)))[None, None, :]
-    (got,) = mb.poll_many(
-        ("p1",),
-        (mb.row_offset(row) + ((pick * NB1 + b1) * KSPLIT + ks) * BLOCK_N + n,),
+    hl: gl.constexpr = gl.SliceLayout(
+        2, gl.BlockedLayout([1, 1, 2], [1, 64, 1], [nw, 1, 1], [2, 1, 0])
     )
-    parts = got.to(gl.float32, bitcast=True)
-    # The regular path's order: K quarter 0, then 1, ...
-    acc = gl.zeros([NB1, BLOCK_N], gl.float32, gl.SliceLayout(1, pl))
-    for k in gl.static_range(KSPLIT):
-        acc += gl.sum(gl.where(ks == k, parts, 0.0), axis=1)
-    gate, up = gl.split(gl.reshape(acc, [NB1, BLOCK_N // 2, 2]))
-    return gl.reshape(gate / (1.0 + gl.exp(-gate)) * up, [INTER])
+    for i in range(lane, count, LANES):
+        expert = _slot_expert(union, i)
+        picks = _row_picks(union, expert, R)
+        row, pick, _ = _slot_rows(mb, picks, RP, rl)
+        at = ((pick[:, None, None] * NB1 + blk) * KSPLIT + ks) * BLOCK_N + n
+        (got,) = mb.poll_many(("p1",), (mb.row_offset(row[:, None, None]) + at,))
+        if i == lane:
+            mb.stamp(STAGE, trace.READY)
+        parts = got.to(gl.float32, bitcast=True)
+        # The regular path's order: K quarter 0, then 1, ...
+        acc = gl.zeros([RP, BLOCK_N], gl.float32, gl.SliceLayout(1, pl))
+        for k in gl.static_range(KSPLIT):
+            acc += gl.sum(gl.where(ks == k, parts, 0.0), axis=1)
+        gate, up = gl.split(gl.reshape(acc, [RP, BLOCK_N // 2, 2]))
+        h = gl.convert_layout(gate / (1.0 + gl.exp(-gate)) * up, hl)
+        row, pick, routed = _slot_rows(mb, picks, RP, gl.SliceLayout(1, hl))
+        j = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, hl))[None, :]
+        mb.put(
+            "h1",
+            mb.row_offset(row[:, None])
+            + pick[:, None] * INTER
+            + blk * (BLOCK_N // 2)
+            + j,
+            h,
+            mask=routed[:, None] & (j >= 0),
+        )
+    mb.stamp(STAGE, trace.COMPUTED)
+    mb.stamp(STAGE, trace.END)
 
 
 @gluon.jit
 def _ex2_gather(mb, union, expert):
-    """The polls of one ex2 slot: for each row that picked ``expert`` (MFMA
-    row ``m`` is the ``m``-th of them), its SwiGLU intermediate. Returns
-    ``(h16 [16, 512], picks, order)`` for :func:`_ex2_compute`."""
+    """The polls of one ex2 slot: the SwiGLU intermediates (:func:`exr_stage`)
+    of the rows that picked ``expert``, MFMA row ``m`` the ``m``-th of them,
+    in one poll a group of up to 8 rows. Returns ``(h16 [16, 512], picks,
+    order)`` for :func:`_ex2_compute`."""
     R: gl.constexpr = schedule.rows(mb.plan)
+    RP: gl.constexpr = triton.next_power_of_2(R)
+    G: gl.constexpr = min(RP, 8)
     nw: gl.constexpr = gl.num_warps()
     picks = _row_picks(union, expert, R)
     # The MFMA row of each routed row: the routed rows before it.
@@ -601,21 +659,41 @@ def _ex2_gather(mb, union, expert):
     for r in gl.static_range(R):
         order += (count,)
         count += (picks[r] >= 0).to(gl.int32)
+    # MFMA row m's (row, pick): the routed row whose order is m. The others
+    # poll MFMA row 0's pairs, then hold zeros.
     ql: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [1, nw], [1, 0])
-    m = gl.arange(0, M_DUP, gl.SliceLayout(1, ql))[:, None]
-    h16 = gl.zeros([M_DUP, INTER], gl.float32, ql)
-    for i in range(count):
-        row = gl.to_tensor(-1)
-        pick = gl.to_tensor(-1)
+    ml: gl.constexpr = gl.SliceLayout(1, ql)
+    plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    h_smem = gl.allocate_shared_memory(gl.float32, [M_DUP, INTER], plain)
+    v = gl.arange(0, INTER, gl.SliceLayout(0, ql))[None, :]
+    for g in gl.static_range(RP // G):
+        m = g * G + gl.arange(0, G, ml)
+        row = gl.full([G], -1, gl.int32, ml)
+        pick = gl.full([G], -1, gl.int32, ml)
+        row0 = gl.to_tensor(-1)
+        pick0 = gl.to_tensor(-1)
         for r in gl.static_range(R):
-            hit = (picks[r] >= 0) & (order[r] == i)
+            hit = (picks[r] >= 0) & (m == order[r])
             row = gl.where(hit, r, row)
             pick = gl.where(hit, picks[r], pick)
-        h = _ex1_sum(mb, row, pick)
-        h16 = gl.where(
-            m == i, gl.convert_layout(h, gl.SliceLayout(0, ql))[None, :], h16
+            first = (picks[r] >= 0) & (order[r] == 0)
+            row0 = gl.where(first, r, row0)
+            pick0 = gl.where(first, picks[r], pick0)
+        routed = m < count
+        row = gl.where(routed, row, row0)
+        pick = gl.where(routed, pick, pick0)
+        (got,) = mb.poll_many(
+            ("h1",), (mb.row_offset(row[:, None]) + pick[:, None] * INTER + v,)
         )
-    return h16, picks, order
+        h = gl.where(routed[:, None], got.to(gl.float32, bitcast=True), 0.0)
+        h_smem.slice(g * G, G, dim=0).store(h)
+    for b in gl.static_range(4):  # M_DUP = 16 rows
+        if (RP << b) < M_DUP:
+            h_smem.slice(RP << b, RP << b, dim=0).store(
+                gl.zeros([RP << b, INTER], gl.float32, ql)
+            )
+    gl.barrier()
+    return h_smem.load(ql), picks, order
 
 
 @gluon.jit

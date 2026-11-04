@@ -123,6 +123,9 @@ def experts_kernel(
             s13_nb,
             "ex1",
         )
+    task, active = schedule.stage_task(PLAN, "exr")
+    if active:
+        moe_experts.exr_stage(mb, task, union, "exr")
     if active2:
         moe_experts.ex2_finish(
             mb,
@@ -227,7 +230,7 @@ def _worker(rank: int, port: int, rows: int) -> None:
         group = IrisGroup(ctx, dist.group.WORLD, rank, device)
         plan = Plan(
             grid=256,
-            stages=moe_experts.stages({"ex1": 0, "ex2": 0}),
+            stages=moe_experts.stages({"ex1": 0, "exr": 192, "ex2": 0}),
             regions=(("route", 2 * TOP_K), ("cg", POOLED // 2)) + moe_experts.regions(),
             rows=rows,
             chain=rows,
