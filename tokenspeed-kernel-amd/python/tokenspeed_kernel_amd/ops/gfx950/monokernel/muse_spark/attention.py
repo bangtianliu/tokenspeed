@@ -211,14 +211,13 @@ def head_stage(
 
 @gluon.constexpr_function
 def _layouts(nw, QM):
-    """(qk MFMA, pv MFMA, K operand, V load) layouts for ``QM`` MFMA rows.
+    """(qk MFMA, pv MFMA, K operand, V load) layouts for ``QM`` MFMA rows:
+    the launch's own keys, a sliding layer's cached keys and the output (a
+    full layer's cached keys use :func:`_warp_layouts`).
 
     With 32 rows or more (3+ token rows) the warps split the rows in two and
-    the chunk's keys in ``nw / 2``: the softmax's row max and sum then cross
-    half the warps, for keys loaded by two warps each. At 8 rows and 340k
-    keys this takes a full layer from 167.5 to 156.2 us (8 GPUs); splitting
-    the rows in four loses (172.6 us) to the duplicated key loads. One
-    or two token rows are 16 MFMA rows, a single row tile."""
+    the keys in ``nw / 2``; one or two token rows are 16 MFMA rows, a single
+    row tile. Splitting the rows in four lost to the duplicated key loads."""
     rw = 2 if QM >= 32 else 1
     qk_mma = gl.amd.AMDMFMALayout(
         version=4,
@@ -238,8 +237,9 @@ def _layouts(nw, QM):
 
 
 @gluon.jit
-def _load_pages(table, c0, hi, k_layout: gl.constexpr, v_load: gl.constexpr):
-    """The pages of chunk ``c0 ..``'s keys, in the key and value layouts.
+def _load_row_pages(table, c0, hi, k_layout: gl.constexpr, v_load: gl.constexpr):
+    """:func:`_load_pages` for the layouts of :func:`_layouts` (a sliding
+    layer's chunk): the pages of chunk ``c0 ..``'s keys, in the key and value layouts.
     They load a chunk ahead of the keys they locate, so a chunk's cache loads
     do not wait for a page table load."""
     jk = c0 + gl.arange(0, BN, gl.SliceLayout(0, k_layout))
@@ -250,7 +250,7 @@ def _load_pages(table, c0, hi, k_layout: gl.constexpr, v_load: gl.constexpr):
 
 
 @gluon.jit
-def _load_kv(
+def _load_row_kv(
     pages,
     k_cache,
     v_cache,
@@ -264,7 +264,7 @@ def _load_kv(
 ):
     """Keys ``[64, BN]`` and values ``[BN, 64]`` of chunk ``c0 ..`` from the
     cache (zero from ``hi``), in BF16 (an FP8 cache's widen exactly), at the
-    chunk's ``pages`` (:func:`_load_pages`)."""
+    chunk's ``pages`` (:func:`_load_row_pages`)."""
     page_k, page_v = pages
     jk = c0 + gl.arange(0, BN, gl.SliceLayout(0, k_layout))
     jv = c0 + gl.arange(0, BN, gl.SliceLayout(1, v_load))
@@ -288,20 +288,131 @@ def _load_kv(
 @gluon.jit
 def _softmax_step(q, keys, values, valid, m, l, acc, p_layout: gl.constexpr):
     """One chunk of the online base-2 softmax: ``keys [64, N]`` and
-    ``values [N, 64]`` (an operand layout and LDS), where ``valid [QM, N]``."""
+    ``values [N, 64]`` (an operand layout and LDS), where ``valid [QM, N]``;
+    or the same with a leading batch dimension (the per-warp key groups)."""
     pv_mma: gl.constexpr = acc.type.layout
-    scores = gl.zeros([q.shape[0], keys.shape[1]], gl.float32, valid.type.layout)
+    K: gl.constexpr = len(q.shape) - 1  # the key axis of the scores
+    if K == 1:
+        scores = gl.zeros([q.shape[0], keys.shape[1]], gl.float32, valid.type.layout)
+    else:
+        scores = gl.zeros(
+            [q.shape[0], q.shape[1], keys.shape[2]], gl.float32, valid.type.layout
+        )
     scores = gl.amd.cdna4.mfma(q, keys, scores)
     scores = gl.where(valid, scores * QK_SCALE, float("-inf"))
-    m_new = gl.maximum(m, gl.max(scores, axis=1))
+    m_new = gl.maximum(m, gl.max(scores, axis=K))
     m_safe = gl.where(m_new == float("-inf"), 0.0, m_new)
     alpha = gl.exp2(m - m_safe)
-    p = gl.exp2(scores - m_safe[:, None])
-    l = l * alpha + gl.sum(p, axis=1)
+    p = gl.exp2(scores - gl.expand_dims(m_safe, K))
+    l = l * alpha + gl.sum(p, axis=K)
     pv = gl.zeros(acc.shape, gl.float32, pv_mma)
     pv = gl.amd.cdna4.mfma(gl.convert_layout(p.to(gl.bfloat16), p_layout), values, pv)
-    acc = acc * gl.convert_layout(alpha, gl.SliceLayout(1, pv_mma))[:, None] + pv
+    acc = (
+        acc * gl.expand_dims(gl.convert_layout(alpha, gl.SliceLayout(K, pv_mma)), K)
+        + pv
+    )
     return m_new, l, acc
+
+
+@gluon.constexpr_function
+def _warp_layouts(nw, QM):
+    """(qk MFMA, pv MFMA, K operand) layouts of a full layer's cached keys:
+    the warps split each chunk's keys in ``W = nw / rw`` groups (a batch
+    dimension) and the rows in ``rw`` as :func:`_layouts`. A group keeps its
+    own running max, sum and output (flash-decoding within the CTA), so a
+    chunk's softmax and P x V stay inside its warps: the only barriers of a
+    chunk stage V. The groups combine once (:func:`_combine`): at 340k keys
+    and 8 rows a full layer takes 170.8 us instead of 182.7 (FP8 KV, 8 GPUs).
+    A sliding split is a single chunk, where the combine costs more than it
+    saves, so sliding layers keep :func:`_layouts`."""
+    rw = 2 if QM >= 32 else 1
+    qk_mma = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[nw // rw, rw, 1],
+    )
+    pv_mma = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 16],
+        transposed=True,
+        warps_per_cta=[nw // rw, rw, 1],
+    )
+    return qk_mma, pv_mma, gl.DotOperandLayout(1, qk_mma, 8)
+
+
+@gluon.constexpr_function
+def _groups(layout):
+    """The key groups ``W`` of a :func:`_warp_layouts` layout (or its operand)."""
+    mma = layout.parent if isinstance(layout, gl.DotOperandLayout) else layout
+    return mma.warps_per_cta[0]
+
+
+@gluon.jit
+def _group_keys(c0, layout: gl.constexpr):
+    """Key positions ``[W, BN / W]`` of chunk ``c0 ..`` (axis 1 of the 3-D
+    ``layout`` sliced away): group ``w`` holds keys ``c0 + w BN / W ..``."""
+    W: gl.constexpr = _groups(layout)
+    pl: gl.constexpr = gl.SliceLayout(1, layout)
+    w = gl.arange(0, W, gl.SliceLayout(1, pl))[:, None]
+    n = gl.arange(0, BN // W, gl.SliceLayout(0, pl))[None, :]
+    return c0 + w * (BN // W) + n
+
+
+@gluon.jit
+def _load_pages(table, c0, hi, k_layout: gl.constexpr, v_load: gl.constexpr):
+    """The pages of chunk ``c0 ..``'s keys, in the key (:func:`_group_keys`)
+    and value layouts. They load a chunk ahead of the keys they locate, so a
+    chunk's cache loads do not wait for a page table load."""
+    jk = _group_keys(c0, k_layout)
+    jv = c0 + gl.arange(0, BN, gl.SliceLayout(1, v_load))
+    page_k = gl.load(table + jk // PAGE, mask=jk < hi, other=0)
+    page_v = gl.load(table + jv // PAGE, mask=jv < hi, other=0)
+    return page_k, page_v
+
+
+@gluon.jit
+def _load_kv(
+    pages, k_cache, v_cache, g, c0, hi, dv, k_layout: gl.constexpr, v_load: gl.constexpr
+):
+    """Keys ``[W, 64, BN / W]`` of the per-warp groups (in the operand
+    layout) and values ``[BN, 64]`` of chunk ``c0 ..`` from the cache (zero
+    from ``hi``), in BF16 (an FP8 cache's widen exactly), at the chunk's
+    ``pages`` (:func:`_load_pages`)."""
+    page_k, page_v = pages
+    jk = _group_keys(c0, k_layout)
+    jv = c0 + gl.arange(0, BN, gl.SliceLayout(1, v_load))
+    dk = gl.arange(0, HEAD, gl.SliceLayout(0, gl.SliceLayout(2, k_layout)))
+    slot_k = page_k.to(gl.int64) * PAGE + jk % PAGE
+    slot_v = page_v.to(gl.int64) * PAGE + jv % PAGE
+    keys = gl.load(
+        k_cache + g * HEAD + slot_k[:, None, :] * KV_STRIDE + dk[None, :, None],
+        mask=(jk < hi)[:, None, :],
+        other=0.0,
+    )
+    values = gl.load(
+        v_cache + g * HEAD + slot_v[:, None] * KV_STRIDE + dv[None, :],
+        mask=(jv < hi)[:, None],
+        other=0.0,
+    )
+    return keys.to(gl.bfloat16), values.to(gl.bfloat16)
+
+
+@gluon.jit
+def _combine(m, l, acc, qk2: gl.constexpr, pv2: gl.constexpr):
+    """The per-warp groups' softmax states ``m, l [W, QM]``, ``acc [W, QM,
+    64]`` as one state in the layouts of :func:`_layouts` (``qk2``, ``pv2``)."""
+    pv3: gl.constexpr = acc.type.layout
+    top = gl.max(m, axis=0)
+    safe = gl.where(top == float("-inf"), 0.0, top)
+    f = gl.exp2(m - safe[None, :])
+    l = gl.sum(l * f, axis=0)
+    acc = gl.sum(acc * gl.convert_layout(f, gl.SliceLayout(2, pv3))[:, :, None], axis=0)
+    return (
+        gl.convert_layout(top, gl.SliceLayout(1, qk2)),
+        gl.convert_layout(l, gl.SliceLayout(1, qk2)),
+        gl.convert_layout(acc, pv2),
+    )
 
 
 @gluon.jit
@@ -345,11 +456,15 @@ def attn_stage(
     nw: gl.constexpr = gl.num_warps()
     qk_mma: gl.constexpr = _layouts(nw, QM)[0]
     pv_mma: gl.constexpr = _layouts(nw, QM)[1]
-    k_layout: gl.constexpr = _layouts(nw, QM)[2]
     v_load: gl.constexpr = _layouts(nw, QM)[3]
     q_layout: gl.constexpr = gl.DotOperandLayout(0, qk_mma, 8)
     p_layout: gl.constexpr = gl.DotOperandLayout(0, pv_mma, 4)
     v_layout: gl.constexpr = gl.DotOperandLayout(1, pv_mma, 4)
+    # The cached keys' per-warp softmax (_warp_layouts).
+    qk3: gl.constexpr = _warp_layouts(nw, QM)[0]
+    pv3: gl.constexpr = _warp_layouts(nw, QM)[1]
+    k3: gl.constexpr = _warp_layouts(nw, QM)[2]
+    W: gl.constexpr = qk3.warps_per_cta[0]
 
     L0 = gl.load(seq_len + base) - 1
     # The cached keys of the splits: from row 0's first key, before L0.
@@ -363,21 +478,38 @@ def attn_stage(
 
     # The first chunk's cache loads go before the poll: they do not depend
     # on this launch, and they arrive while the projections run.
-    dk = gl.arange(0, HEAD, gl.SliceLayout(1, k_layout))
     dv = gl.arange(0, HEAD, gl.SliceLayout(0, v_load))
-    keys, values = _load_kv(
-        _load_pages(table, lo, hi, k_layout, v_load),
-        k_cache,
-        v_cache,
-        g,
-        lo,
-        hi,
-        dk,
-        dv,
-        k_layout,
-        v_load,
-    )
-    pages = _load_pages(table, lo + BN, hi, k_layout, v_load)
+    if WINDOW == 0:
+        keys, values = _load_kv(
+            _load_pages(table, lo, hi, k3, v_load),
+            k_cache,
+            v_cache,
+            g,
+            lo,
+            hi,
+            dv,
+            k3,
+            v_load,
+        )
+        pages = _load_pages(table, lo + BN, hi, k3, v_load)
+    else:
+        # A sliding split is one chunk: the per-warp groups' combine would
+        # cost more than the chunk's reductions it saves (+4 us a layer).
+        k_layout: gl.constexpr = _layouts(nw, QM)[2]
+        dk = gl.arange(0, HEAD, gl.SliceLayout(1, k_layout))
+        keys, values = _load_row_kv(
+            _load_row_pages(table, lo, hi, k_layout, v_load),
+            k_cache,
+            v_cache,
+            g,
+            lo,
+            hi,
+            dk,
+            dv,
+            k_layout,
+            v_load,
+        )
+        pages = _load_row_pages(table, lo + BN, hi, k_layout, v_load)
 
     # q of the 8 heads of every row, and the launch's k and v. A thread
     # holds one pair, 32 lanes a head: the norm sums in head_stage's order.
@@ -431,7 +563,16 @@ def attn_stage(
         q,
         0.0,
     )
-    q = gl.convert_layout(q.to(gl.bfloat16), q_layout)
+    q = q.to(gl.bfloat16)
+    if WINDOW == 0:
+        # Every key group multiplies all of q (each group's warps hold a copy).
+        qb: gl.constexpr = gl.BlockedLayout([1, 1, 8], [1, 8, 8], [1, nw, 1], [2, 1, 0])
+        q_groups = gl.convert_layout(
+            gl.convert_layout(q, gl.SliceLayout(0, qb))[None, :, :]
+            + gl.zeros([W, QM, HEAD], gl.bfloat16, qb),
+            gl.DotOperandLayout(0, qk3, 8),
+        )
+    q = gl.convert_layout(q, q_layout)
     v_lo, v_hi = _pair_values(got_v, eq, 2)
     # The launch's k and v as the cache holds them: rounded once to its dtype.
     kv_dtype: gl.constexpr = k_cache.dtype.element_ty
@@ -444,7 +585,6 @@ def attn_stage(
     cur_v.store(
         gl.reshape(gl.join(v_lo, v_hi), [KT, HEAD]).to(kv_dtype).to(gl.bfloat16)
     )
-    v_smem = gl.allocate_shared_memory(gl.bfloat16, [BN, HEAD], plain)
 
     # Row t's first attended key (a sliding layer's window).
     qi = gl.arange(0, QM, gl.SliceLayout(1, qk_mma))
@@ -453,26 +593,58 @@ def attn_stage(
         row_first = gl.zeros_like(qi_tok)
     else:
         row_first = L0 + qi_tok - WINDOW + 1
-    m = gl.full([QM], float("-inf"), gl.float32, gl.SliceLayout(1, qk_mma))
-    l = gl.zeros([QM], gl.float32, gl.SliceLayout(1, qk_mma))
-    acc = gl.zeros([QM, HEAD], gl.float32, pv_mma)
-    for c0 in range(lo, hi, BN):
-        js = c0 + gl.arange(0, BN, gl.SliceLayout(0, qk_mma))
-        valid = (js[None, :] < hi) & (js[None, :] >= row_first[:, None])
-        # The next chunk's loads (at pages already loaded) and the pages of
-        # the one after go before this chunk's math.
-        next_keys, next_values = _load_kv(
-            pages, k_cache, v_cache, g, c0 + BN, hi, dk, dv, k_layout, v_load
-        )
-        pages = _load_pages(table, c0 + 2 * BN, hi, k_layout, v_load)
-        gl.barrier()
-        v_smem.store(values)
-        gl.barrier()
-        m, l, acc = _softmax_step(
-            q, keys, v_smem.load(v_layout), valid, m, l, acc, p_layout
-        )
-        keys = next_keys
-        values = next_values
+    if WINDOW == 0:
+        m = gl.full([W, QM], float("-inf"), gl.float32, gl.SliceLayout(2, qk3))
+        l = gl.zeros([W, QM], gl.float32, gl.SliceLayout(2, qk3))
+        acc = gl.zeros([W, QM, HEAD], gl.float32, pv3)
+        first3 = gl.convert_layout(row_first, gl.SliceLayout(0, gl.SliceLayout(2, qk3)))
+        v_smem = gl.allocate_shared_memory(gl.bfloat16, [BN, HEAD], plain)
+        v_groups = v_smem.reshape([W, BN // W, HEAD])
+        for c0 in range(lo, hi, BN):
+            js = _group_keys(c0, qk3)[:, None, :]
+            valid = (js < hi) & (js >= first3[None, :, None])
+            # The next chunk's loads (at pages already loaded) and the pages of
+            # the one after go before this chunk's math.
+            next_keys, next_values = _load_kv(
+                pages, k_cache, v_cache, g, c0 + BN, hi, dv, k3, v_load
+            )
+            pages = _load_pages(table, c0 + 2 * BN, hi, k3, v_load)
+            gl.barrier()
+            v_smem.store(values)
+            gl.barrier()
+            m, l, acc = _softmax_step(
+                q_groups,
+                keys,
+                v_groups.load(gl.DotOperandLayout(1, pv3, 4)),
+                valid,
+                m,
+                l,
+                acc,
+                gl.DotOperandLayout(0, pv3, 4),
+            )
+            keys = next_keys
+            values = next_values
+        m, l, acc = _combine(m, l, acc, qk_mma, pv_mma)
+    else:
+        m = gl.full([QM], float("-inf"), gl.float32, gl.SliceLayout(1, qk_mma))
+        l = gl.zeros([QM], gl.float32, gl.SliceLayout(1, qk_mma))
+        acc = gl.zeros([QM, HEAD], gl.float32, pv_mma)
+        v_smem = gl.allocate_shared_memory(gl.bfloat16, [BN, HEAD], plain)
+        for c0 in range(lo, hi, BN):
+            js = c0 + gl.arange(0, BN, gl.SliceLayout(0, qk_mma))
+            valid = (js[None, :] < hi) & (js[None, :] >= row_first[:, None])
+            next_keys, next_values = _load_row_kv(
+                pages, k_cache, v_cache, g, c0 + BN, hi, dk, dv, k_layout, v_load
+            )
+            pages = _load_row_pages(table, c0 + 2 * BN, hi, k_layout, v_load)
+            gl.barrier()
+            v_smem.store(values)
+            gl.barrier()
+            m, l, acc = _softmax_step(
+                q, keys, v_smem.load(v_layout), valid, m, l, acc, p_layout
+            )
+            keys = next_keys
+            values = next_values
     # The launch's tokens: token u is the key at L0 + u; row t attends u <= t.
     gl.barrier()
     u = gl.arange(0, KT, gl.SliceLayout(0, qk_mma))
