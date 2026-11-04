@@ -75,6 +75,8 @@ BASES = {
     "topk": 152,
     "pool": 192,
     "ex1": 0,
+    # The K sums on the CTAs of ex1's last lanes, which run the fewest slots.
+    "exr": 192,
     "ex2": 0,
     "comb": 64,
     "unpool": 128,
@@ -139,7 +141,7 @@ def layer_plan(full: bool, rows: int, chain: int, warm_next: bool) -> Plan:
         + attn_tail.stages(_bases(rows, "oproj", "tail"), rows)
         + moe_route.stages(_bases(rows, "router", "topk"), rows)
         + moe_pool.stages(_bases(rows, "pool"))
-        + moe_experts.stages(_bases(rows, "ex1", "ex2"))
+        + moe_experts.stages(_bases(rows, "ex1", "exr", "ex2"))
         + ((Stage("warm", WARM_TASKS, 0),) if warm_next else ())
         + moe_tail.stages(_bases(rows, "comb", "unpool", "out"), rows)
     )
@@ -297,7 +299,7 @@ def gluon_muse_spark_layer_gfx950(
         moe_pool.pool_stage(mb, task, w_pool, RANK, "pool")
     # A CTA's ex1 and ex2 tasks run in parts (see moe_experts): ex1's weights
     # once routing names the experts, the A operand meanwhile, ex1's products,
-    # then ex2's weights ahead of ex2's poll.
+    # the K sums (exr), then ex2's weights ahead of ex2's poll.
     task1, active1 = schedule.stage_task(PLAN, "ex1")
     task1 = gl.where(active1, task1, 0)
     task2, active2 = schedule.stage_task(PLAN, "ex2")
@@ -326,6 +328,9 @@ def gluon_muse_spark_layer_gfx950(
             s13_nb,
             "ex1",
         )
+    task, active = schedule.stage_task(PLAN, "exr")
+    if active:
+        moe_experts.exr_stage(mb, task, union, "exr")
     loads2 = moe_experts.ex2_issue(
         mb, task2, active2, e2, w2, w2s, s2_we, s2_se, s2_lin, s2_nb, "ex2"
     )
