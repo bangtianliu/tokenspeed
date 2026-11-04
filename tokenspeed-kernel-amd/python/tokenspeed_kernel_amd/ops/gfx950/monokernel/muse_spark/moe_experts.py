@@ -75,6 +75,8 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_common import (
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (
     _mxfp4_quantize_tile,
+    _mxfp4_quantize_tile_in_layout,
+    scaled_downcast_layout,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import mx, schedule, trace
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import WORLD
@@ -346,19 +348,19 @@ def ex1_operand(task, rows, gain_lo, gain_hi):
     quarter of every row to MXFP4 in LDS (MFMA row ``r`` is row ``r``; the
     rows past the launch's are zero). Returns the LDS (values, scales).
 
-    It issues no global load, and its LDS barrier waits only for LDS, so it
+    It issues no global load, and its LDS barriers wait only for LDS, so it
     runs while the weight loads that :func:`ex1_issue` and :func:`ex2_issue`
-    issued before it are in flight.
+    issued before it are in flight. The normed rows go through LDS once, in
+    BF16 (the quantizer's input precision), into the quantizer's layout: a
+    register relayout a row costs two barriers of all the CTA's waves.
     """
     ks = task % KSPLIT
     nw: gl.constexpr = gl.num_warps()
     cl: gl.constexpr = _cg_layout(nw)
     G: gl.constexpr = rows[0].shape[0]
     q = gl.arange(0, KSPLIT, gl.SliceLayout(0, gl.SliceLayout(2, cl)))[None, :, None]
-    gr = gl.arange(0, G, gl.SliceLayout(1, gl.SliceLayout(1, cl)))[:, None]
-    ql: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [1, nw], [1, 0])
-    m = gl.arange(0, M_DUP, gl.SliceLayout(1, ql))[:, None]
-    x16 = gl.zeros([M_DUP, K_SLICE], gl.float32, ql)
+    plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    x_smem = gl.allocate_shared_memory(gl.bfloat16, [M_DUP, K_SLICE], plain)
     for g in gl.static_range(len(rows)):
         got = rows[g]
         lo = (got << 16).to(gl.float32, bitcast=True)
@@ -369,16 +371,20 @@ def ex1_operand(task, rows, gain_lo, gain_hi):
         mine = q == ks
         lo = gl.sum(gl.where(mine, lo, 0.0), axis=1) * inv * gain_lo[None, :]
         hi = gl.sum(gl.where(mine, hi, 0.0), axis=1) * inv * gain_hi[None, :]
-        for r in gl.static_range(G):
-            x_lo = gl.sum(gl.where(gr == r, lo, 0.0), axis=0)
-            x_hi = gl.sum(gl.where(gr == r, hi, 0.0), axis=0)
-            x = gl.reshape(gl.join(x_lo, x_hi), [K_SLICE])
-            x16 = gl.where(
-                m == g * G + r,
-                gl.convert_layout(x, gl.SliceLayout(0, ql))[None, :],
-                x16,
+        x = gl.reshape(gl.join(lo, hi), [G, K_SLICE])
+        x_smem.slice(g * G, G, dim=0).store(x.to(gl.bfloat16))
+    # Zero the rows past the launch's in power-of-two blocks: [RP, 2 RP),
+    # [2 RP, 4 RP), ... up to M_DUP.
+    zl: gl.constexpr = gl.BlockedLayout([1, 8], [1, 64], [1, nw], [1, 0])
+    RP: gl.constexpr = G * len(rows)
+    for b in gl.static_range(4):  # M_DUP = 16 rows
+        if (RP << b) < M_DUP:
+            x_smem.slice(RP << b, RP << b, dim=0).store(
+                gl.zeros([RP << b, K_SLICE], gl.bfloat16, zl)
             )
-    packed, scales = _mxfp4_quantize_tile(x16)
+    gl.barrier()
+    dl: gl.constexpr = scaled_downcast_layout(M_DUP, K_SLICE, nw)
+    packed, scales = _mxfp4_quantize_tile_in_layout(x_smem.load(dl))
     return _stage_a(packed, scales)
 
 
