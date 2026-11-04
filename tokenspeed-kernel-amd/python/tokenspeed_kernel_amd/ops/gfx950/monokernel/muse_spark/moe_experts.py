@@ -50,18 +50,19 @@ each row's 8 picks as for one row.
   to the rank that owns those columns (``rr``), which sums the 8 ranks'
   partials.
 
-Expert weights cannot load before routing picks the experts. So that both
-weight streams start then, and every CTA reads the same 96 KiB, a CTA runs
+Expert weights cannot load before routing picks the experts. So a CTA runs
 the first slot of its ex1 and ex2 tasks in parts: :func:`ex1_poll` (one
 poll for the pooled rows, the first slots' experts and every row's picks),
-:func:`ex1_issue` and :func:`ex2_issue`, then :func:`slots` and
-:func:`ex1_operand` (the slots of the other picks, and the norm and
-quantization of the A operand, while the weights stream),
-:func:`ex1_finish`, and :func:`ex2_finish` at ex2's place in the plan. The polls come before the
-loads: a poll waits for every earlier load of its wave (``vmcnt`` counts in
-order), so a poll between the two weight streams would start the second
-only when the first has arrived. The finish steps then run the lane's
-other slots, one after another.
+:func:`ex1_issue`, then :func:`slots` and :func:`ex1_operand` (the slots of
+the other picks, and the norm and quantization of the A operand, while the
+weights stream), :func:`ex1_finish`, then :func:`ex2_issue` and
+:func:`ex2_finish` at ex2's place in the plan. ex2's first weights issue
+after ex1's products: issued with ex1's they sat on ex1's critical path (a
+full layer at 200k keys took 148.6 us instead of 145.9), and they still
+arrive before ex2's poll returns. The loads come before the polls: a poll
+waits for every earlier load of its wave (``vmcnt`` counts in order), so a
+load after a poll would start only when the poll returns. The finish steps
+then run the lane's other slots, one after another.
 """
 
 from __future__ import annotations
@@ -349,8 +350,8 @@ def ex1_operand(task, rows, gain_lo, gain_hi):
     rows past the launch's are zero). Returns the LDS (values, scales).
 
     It issues no global load, and its LDS barriers wait only for LDS, so it
-    runs while the weight loads that :func:`ex1_issue` and :func:`ex2_issue`
-    issued before it are in flight. The normed rows go through LDS once, in
+    runs while the weight loads that :func:`ex1_issue` issued before it are
+    in flight. The normed rows go through LDS once, in
     BF16 (the quantizer's input precision), into the quantizer's layout: a
     register relayout a row costs two barriers of all the CTA's waves.
     """
