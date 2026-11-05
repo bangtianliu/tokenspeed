@@ -189,6 +189,7 @@ def gluon_muse_spark_layer_gfx950(
     WIN: gl.constexpr,
     ROPE: gl.constexpr,
     TAP: gl.constexpr,
+    WHOLE_ROWS: gl.constexpr,
 ):
     """One decode step of one layer on rank ``RANK``.
 
@@ -201,7 +202,9 @@ def gluon_muse_spark_layer_gfx950(
     ``alpha``, ``beta`` (all 8192 columns), next input gain (all 8192
     columns), residual output, next attention input).
     ``tap``, ``tap_col``, ``tap_row``: with ``TAP``, where the residual
-    after the layer also goes, BF16 on every rank (``moe_tail.unpool_stages``).
+    after the layer also goes, BF16 on every rank (``moe_tail.out_stage``).
+    ``WHOLE_ROWS``: the residual output holds whole FP32 rows, not the owned
+    columns.
     ``warm_ptr``, ``warm_quads``: the next launch's packed QKVG weights, read
     (``4 * warm_quads`` int32 words) only when ``PLAN`` has the warm stage.
     """
@@ -379,16 +382,25 @@ def gluon_muse_spark_layer_gfx950(
             post_gain,
             alpha2,
             beta2,
+            RANK,
+        )
+    task, active = schedule.stage_task(PLAN, "out")
+    if active:
+        moe_tail.out_stage(
+            mb,
+            task,
+            beta2,
+            in_gain,
+            a_out,
             h_next,
             tap,
             tap_col,
             tap_row,
             RANK,
             TAP,
+            WHOLE_ROWS,
+            "out",
         )
-    task, active = schedule.stage_task(PLAN, "out")
-    if active:
-        moe_tail.out_stage(mb, task, beta2, in_gain, a_out, "out")
     trace.flush(table, trace_buf)
 
 
@@ -407,6 +419,7 @@ def launch_layer(
     full: bool,
     rows: int,
     chain: int,
+    whole_rows: bool,
     compile_only: bool,
 ):
     """Launch one layer step of ``rows`` token rows, requests of ``chain``
@@ -415,7 +428,9 @@ def launch_layer(
     launch. ``tap`` (None, or a BF16 ``[rows+, slots, 8192]`` buffer on the
     Iris heap) gets the residual after the layer in slot ``tap_slot`` on
     every rank. ``warm_next`` (None, or the next launch's packed QKVG
-    weights) is warmed into the memory-side cache after the experts."""
+    weights) is warmed into the memory-side cache after the experts. With
+    ``whole_rows`` the residual output (in ``moe_ops``) is whole FP32
+    ``[rows, 8192]`` rows, else the rank's owned ``[rows, 1024]`` columns."""
     plan = layer_plan(full, rows, chain, warm_next is not None)
     if tap is None:
         tap_args = (attn_ops[0], 0, 0)
@@ -444,6 +459,7 @@ def launch_layer(
         0 if full else WINDOW,
         not full,
         tap is not None,
+        whole_rows,
     )
     if compile_only:
         # The device library of _scheduling.wave_uniform_i32 (attention.py).
@@ -474,6 +490,7 @@ def launch_gluon_muse_spark_layer_gfx950(
     peer_bases,
     layer: int,
     chain: int,
+    whole_rows: bool,
     tap,
     tap_slot,
     warm_next,
@@ -488,7 +505,9 @@ def launch_gluon_muse_spark_layer_gfx950(
 
     Args:
         weights: From ``weights.pack_layer``.
-        h, h_out: FP32 ``[rows, 1024]`` owned residual columns, in and out.
+        h: FP32 ``[rows, 1024]`` owned residual columns.
+        h_out: The FP32 residual after the layer: whole ``[rows, 8192]``
+            rows with ``whole_rows``, else ``[rows, 1024]`` owned columns.
         a, a_out: BF16 ``[rows, 8192]`` attention input of this layer and of
             the next one (normed with the next layer's input gain).
         seq_len, slot: int32 ``[rows]``: each row's length including its
@@ -505,6 +524,8 @@ def launch_gluon_muse_spark_layer_gfx950(
         peer_bases: int64 ``[8]`` heap bases of the group's ranks.
         layer: The decoder layer index (the tag and the peer copy).
         chain: Tokens a request: 1 for decode, ``k + 1`` for a verify.
+        whole_rows: Every rank stores whole residual rows into ``h_out``
+            (for a next layer on the regular path), not its owned columns.
         tap: None, or a BF16 ``[rows+, slots, 8192]`` buffer on the Iris
             symmetric heap (the same on every rank): the launch also stores
             the residual after the layer, rounded to BF16, into slot
@@ -527,6 +548,13 @@ def launch_gluon_muse_spark_layer_gfx950(
         or h.data_ptr() == h_out.data_ptr()
     ):
         raise ValueError("h: contiguous FP32 [rows, 1024] that does not alias h_out")
+    width = 8192 if whole_rows else 1024
+    if (
+        h_out.dtype != torch.float32
+        or h_out.shape != (rows, width)
+        or not h_out.is_contiguous()
+    ):
+        raise ValueError(f"h_out: contiguous FP32 [rows, {width}]")
     if (
         a.dtype != torch.bfloat16
         or a.shape != (rows, 8192)
@@ -590,6 +618,7 @@ def launch_gluon_muse_spark_layer_gfx950(
         weights.full,
         rows,
         chain,
+        whole_rows,
         compile_only,
     )
 

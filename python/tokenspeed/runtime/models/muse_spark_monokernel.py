@@ -72,7 +72,7 @@ from tokenspeed_kernel.ops.monokernel import (
     prepare_muse_spark_layer,
 )
 
-from tokenspeed.runtime.distributed.comm_ops import all_gather, all_to_all_single
+from tokenspeed.runtime.distributed.comm_ops import all_to_all_single
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.models.decode_monokernel import coverage
@@ -441,7 +441,8 @@ class MuseSparkMonokernels:
             :meth:`prepare` (None before it).
         cpu_group: The TP8 group's CPU (gloo) process group, from
             :meth:`prepare` (None before it).
-        compiled: The ``(layer index, rows)`` launches compiled on every rank.
+        compiled: The ``(layer index, rows, whole_rows)`` launches compiled on
+            every rank.
         tap_slots: The draft taps the launches store, by captured layer: its
             slot in ``steps.taps``. Empty when some captured layer follows a
             layer without a launch (the regular capture then serves them all).
@@ -463,7 +464,7 @@ class MuseSparkMonokernels:
                 self.layers[index].mlp.monokernel_experts = None
         self.steps: MonokernelSteps | None = None
         self.cpu_group: dist.ProcessGroup | None = None
-        self.compiled: set[tuple[int, int]] = set()
+        self.compiled: set[tuple[int, int, bool]] = set()
         self.tap_slots: dict[int, int] = {}
 
     def prepare(
@@ -595,7 +596,12 @@ class MonokernelStep:
             if attn.rotary_emb is not None
             else attn.nope_cos_sin_cache
         )
-        h_out = h.new_empty(rows, OWNED)
+        # The next layer keeps the regular path, or a regular capture of a
+        # draft's tap reads the whole rows entering it: the launch stores
+        # whole residual rows on every rank (no gather).
+        tapped = index + 1 in self._taps and not self._store_taps
+        whole_rows = index + 1 not in monokernels.fused or tapped
+        h_out = h.new_empty(rows, HIDDEN if whole_rows else OWNED)
         a_out = attention_input.new_empty(rows, HIDDEN)
         operands = dict(
             h=h,
@@ -613,6 +619,7 @@ class MonokernelStep:
             peer_bases=steps.bases,
             layer_index=index,
             chain=self._chain,
+            whole_rows=whole_rows,
             tap=None,
             tap_slot=None,
             # The next fused layer's QKVG weights, warmed into the MALL after
@@ -623,22 +630,21 @@ class MonokernelStep:
         if self._store_taps and slot_of_next is not None:
             operands["tap"] = steps.taps
             operands["tap_slot"] = slot_of_next
-        if (index, rows) not in monokernels.compiled:
+        # A forward with a capture sink and one without differ in whole_rows
+        # before a tapped layer: each variant compiles on every rank first.
+        if (index, rows, whole_rows) not in monokernels.compiled:
             # A launch traps when its peers' values do not come within a few
             # seconds, and a first launch compiles for longer on some ranks
             # than on others: every rank compiles, then the ranks meet.
             muse_spark_layer_decode(fused, compile_only=True, **operands)
             dist.barrier(group=monokernels.cpu_group)
-            monokernels.compiled.add((index, rows))
+            monokernels.compiled.add((index, rows, whole_rows))
         muse_spark_layer_decode(fused, compile_only=False, **operands)
-        tapped = index + 1 in self._taps and not self._store_taps
-        if index + 1 in monokernels.fused and not tapped:
-            self._owned = h_out
-            return hidden_states, a_out
-        # The next layer keeps the regular path, or a regular capture of a
-        # draft's tap reads the whole rows entering it.
-        self._owned = None
-        return all_gather(h_out, monokernels.group, dim=-1), a_out
+        if whole_rows:
+            self._owned = None
+            return h_out, a_out
+        self._owned = h_out
+        return hidden_states, a_out
 
     def _row_lengths(self, group_id: int, seq_lens: torch.Tensor) -> torch.Tensor:
         """Each row's length from the step's ``seq_lens`` (each request's

@@ -240,16 +240,19 @@ def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
         h_in = sh["h"][:, own].contiguous().to(dev)
         a_in = sh["a_in"].to(dev)
         h_next = torch.empty(rows, OWNED, device=dev)
+        h_whole = torch.empty(rows, HIDDEN, device=dev)
         a_out = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
 
-        def launch(index: int, step: int, seq_len: int, compile_only: bool) -> None:
+        def launch(
+            index: int, step: int, seq_len: int, compile_only: bool, whole_rows=False
+        ) -> None:
             pos = torch.arange(seq_len - 1, seq_len - 1 + rows)
             slots = sh["table"][pos // 64].long() * 64 + pos % 64
             layer.launch_gluon_muse_spark_layer_gfx950(
                 weights,
                 h=h_in,
                 a=a_in,
-                h_out=h_next,
+                h_out=h_whole if whole_rows else h_next,
                 a_out=a_out,
                 seq_len=(pos + 1).to(torch.int32).to(dev),
                 slot=slots.to(torch.int32).to(dev),
@@ -262,6 +265,7 @@ def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
                 peer_bases=group.bases,
                 layer=index,
                 chain=rows,
+                whole_rows=whole_rows,
                 tap=tap,
                 tap_slot=3,
                 # The warm stage reads weights only: it runs here (on the
@@ -343,6 +347,17 @@ def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
             torch.testing.assert_close(
                 a_out[t].float().cpu(), a[t].float(), rtol=2**-6, atol=atol
             )
+        # Before a regular layer, every rank stores whole residual rows: the
+        # gather of the owned columns, bit for bit, and the same next input.
+        owned_a_out = a_out.cpu()
+        launch(lay, 4, length, compile_only=True, whole_rows=True)
+        torch.cuda.synchronize()
+        dist.barrier()
+        launch(lay, 4, length, compile_only=False, whole_rows=True)
+        torch.cuda.synchronize()
+        dist.barrier()
+        assert torch.equal(h_whole.cpu(), torch.cat(parts, dim=1))
+        assert torch.equal(a_out.cpu(), owned_a_out)
         dist.barrier()
         # Serving moves the layer index, the step and the length every
         # launch; they are runtime arguments: one binary serves them all.
@@ -437,6 +452,7 @@ def _two_requests_worker(rank: int, port: int, full: bool) -> None:
                 peer_bases=group.bases,
                 layer=1 if full else 2,
                 chain=rows,
+                whole_rows=False,
                 tap=None,
                 tap_slot=None,
                 warm_next=None,
@@ -533,6 +549,7 @@ def _graph_worker(rank: int, port: int, length: int) -> None:
                 peer_bases=group.bases,
                 layer=2,
                 chain=1,
+                whole_rows=False,
                 tap=None,
                 tap_slot=None,
                 warm_next=None,
