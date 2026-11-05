@@ -83,7 +83,9 @@ BASES = {
     "topk": 152,
     "pool": 192,
     "ex1": 0,
-    # The K sums on the CTAs of ex1's last lanes, which run the fewest slots.
+    # The K sums on the CTAs of ex1's last lanes, which run the fewest slots
+    # at one row (8 slots: one each). Past one row they spread over every CTA
+    # (CHAINED_BASES, moe_experts.EXR_PARTS).
     "exr": 192,
     "ex2": 0,
     "comb": 64,
@@ -103,8 +105,16 @@ BASES = {
 # The merge (16 tasks per row) leaves oproj's CTAs 0 .. 127: oproj streams
 # its 128 KiB of weights before it polls z, and behind a merge task that
 # stream started only at the merge's end (~19 us on a sliding layer), which
-# put oproj's ready ~4 us past the last merge.
-CHAINED_BASES = {**BASES, "tail": 64, "router": 160, "pool": 224, "merge": 128}
+# put oproj's ready ~4 us past the last merge. exr spreads over every CTA
+# (moe_experts.EXR_PARTS).
+CHAINED_BASES = {
+    **BASES,
+    "tail": 64,
+    "router": 160,
+    "pool": 224,
+    "merge": 128,
+    "exr": 0,
+}
 
 
 def _bases(rows: int, *names: str) -> dict[str, int]:
@@ -162,7 +172,7 @@ def layer_plan(full: bool, rows: int, chain: int, warm_next: bool) -> Plan:
         + attn_tail.stages(_bases(rows, "oproj", "tail"), rows)
         + moe_route.stages(_bases(rows, "router", "topk"), rows)
         + moe_pool.stages(_bases(rows, "pool"))
-        + moe_experts.stages(_bases(rows, "ex1", "exr", "ex2"))
+        + moe_experts.stages(_bases(rows, "ex1", "exr", "ex2"), rows)
         + ((Stage("warm", WARM_TASKS, 0),) if warm_next else ())
         + moe_tail.stages(_bases(rows, "comb", "unpool", "rnorm", "out"), rows)
     )

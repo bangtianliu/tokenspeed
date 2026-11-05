@@ -147,7 +147,10 @@ def _worker(rank: int, port: int, rows: int) -> None:
         group = IrisGroup(ctx, dist.group.WORLD, rank, device)
         plan = Plan(
             grid=256,
-            stages=moe_experts.stages({"ex1": 0, "exr": 192, "ex2": 0}),
+            # The layer's placement: exr over every CTA past one row.
+            stages=moe_experts.stages(
+                {"ex1": 0, "exr": 192 if rows == 1 else 0, "ex2": 0}, rows
+            ),
             regions=(("route", 2 * TOP_K), ("cg", POOLED // 2)) + moe_experts.regions(),
             rows=rows,
             chain=rows,
