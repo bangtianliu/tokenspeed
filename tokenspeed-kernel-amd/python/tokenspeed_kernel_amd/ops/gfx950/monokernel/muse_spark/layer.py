@@ -38,6 +38,7 @@ steps too (layers 0 and 61 keep the regular path).
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel_amd._scheduling import sched_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox, schedule, trace, warm
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
@@ -445,9 +446,14 @@ def launch_layer(
         tap is not None,
     )
     if compile_only:
-        gluon_muse_spark_layer_gfx950.warmup(*args, num_warps=8, grid=(plan.grid,))
+        # The device library of _scheduling.wave_uniform_i32 (attention.py).
+        gluon_muse_spark_layer_gfx950.warmup(
+            *args, num_warps=8, grid=(plan.grid,), **sched_compile_options()
+        )
     else:
-        gluon_muse_spark_layer_gfx950[(plan.grid,)](*args, num_warps=8)
+        gluon_muse_spark_layer_gfx950[(plan.grid,)](
+            *args, num_warps=8, **sched_compile_options()
+        )
 
 
 def launch_gluon_muse_spark_layer_gfx950(
