@@ -41,15 +41,16 @@ each row's 8 picks as for one row.
   row to MXFP4 (the regular path's "even" rule) in LDS, one MFMA row each.
   It publishes the FP32 partial sums of the rows that picked the slot's
   expert.
-* exr, 64 tasks: lane ``l``, one ex1 column block. For each slot, a task
-  polls the 4 K quarters of every row that picked the slot's expert, sums
-  them in K order, applies SwiGLU (``silu(gate) up``) and the regular
-  path's MXFP4 requantization (groups of 32: the block's 64 values are two
-  whole groups), and publishes them as words (``h1``). Done once here, an
-  ex2 task reads 72 words a row instead of 4096 partials and quantizes
-  nothing: polled by all 256 CTAs at once, the partials took one 0.7 us
-  round trip a row (the memory-side bandwidth, not the latency), so a slot
-  that many rows picked held its lane up, and each of a lane's 32 ex2
+* exr, 64 tasks at one row (lane ``l``, one ex1 column block), 256 past one
+  row (each lane's slots split over EXR_PARTS tasks, one a CTA). For each of
+  its slots, a task polls the 4 K quarters of every row that picked the
+  slot's expert, sums them in K order, applies SwiGLU (``silu(gate) up``)
+  and the regular path's MXFP4 requantization (groups of 32: the block's 64
+  values are two whole groups), and publishes them as words (``h1``). Done
+  once here, an ex2 task reads 72 words a row instead of 4096 partials and
+  quantizes nothing: polled by all 256 CTAs at once, the partials took one
+  0.7 us round trip a row (the memory-side bandwidth, not the latency), so a
+  slot that many rows picked held its lane up, and each of a lane's 32 ex2
   tasks requantized the same rows (1.3 us a slot).
 * ex2, 256 tasks: lane ``l``, 128 of the 4096 output columns over the rank's
   512 intermediate values (32 KiB a slot). A task polls the MXFP4
@@ -103,7 +104,14 @@ K_SLICE = gl.constexpr(1024)  # POOLED // KSPLIT
 NB1 = gl.constexpr(8)  # W13_N // BLOCK_N
 NB2 = gl.constexpr(32)  # POOLED // BLOCK_N
 EX1_TASKS = gl.constexpr(256)  # LANES * NB1 * KSPLIT
-EXR_TASKS = gl.constexpr(64)  # LANES * NB1
+# Past one row each lane's slots split over EXR_PARTS exr tasks (a slot of
+# every EXR_PARTS-th round each), one task a CTA: an exr task then holds its
+# CTA's ex2 task back by about one slot, whatever the slot count. On CTAs
+# 192-255 alone, the lanes there ran a round of exr, and when they also had
+# the most slots (slots % 8 = 7 or 0, a fifth of served launches) every ex2
+# lane waited ~6 us longer. One row has one slot a lane: one part.
+EXR_PARTS = gl.constexpr(4)
+EXR_LANE_TASKS = gl.constexpr(64)  # LANES * NB1: one part
 # An intermediate row in MXFP4 words: 64 of E2M1 values, then a word per
 # ex1 block holding its 2 scale bytes.
 H1_WORDS = gl.constexpr(72)  # INTER // 8 + NB1
@@ -131,11 +139,17 @@ def regions() -> tuple[tuple[str, int], ...]:
     )
 
 
-def stages(bases: dict[str, int]) -> tuple[Stage, ...]:
+def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
     ex1, exr, ex2 = placement(bases, ("ex1", "exr", "ex2"))
     return (
         Stage("ex1", int(EX1_TASKS), ex1, reads=("route", "cg"), writes=("p1",)),
-        Stage("exr", int(EXR_TASKS), exr, reads=("route", "p1"), writes=("h1",)),
+        Stage(
+            "exr",
+            int(EXR_LANE_TASKS) * (1 if rows == 1 else int(EXR_PARTS)),
+            exr,
+            reads=("route", "p1"),
+            writes=("h1",),
+        ),
         Stage("ex2", int(EX2_TASKS), ex2, reads=("route", "h1"), writes=("rr",)),
     )
 
@@ -620,8 +634,10 @@ def exr_stage(mb, task, union, BF16: gl.constexpr, STAGE: gl.constexpr):
     R: gl.constexpr = schedule.rows(mb.plan)
     RP: gl.constexpr = triton.next_power_of_2(R)
     nw: gl.constexpr = gl.num_warps()
-    lane = task // NB1
-    blk = task % NB1
+    PARTS: gl.constexpr = schedule.stage_tasks(mb.plan, STAGE) // EXR_LANE_TASKS
+    lane = task // (NB1 * PARTS)
+    blk = task // PARTS % NB1
+    first = lane + LANES * (task % PARTS)
     count = union[3]
     # [row, K quarter, column]: the K quarters in a lane's registers.
     pl: gl.constexpr = gl.BlockedLayout(
@@ -633,13 +649,13 @@ def exr_stage(mb, task, union, BF16: gl.constexpr, STAGE: gl.constexpr):
     hl: gl.constexpr = gl.SliceLayout(
         2, gl.BlockedLayout([1, 1, 2], [1, 64, 1], [nw, 1, 1], [2, 1, 0])
     )
-    for i in range(lane, count, LANES):
+    for i in range(first, count, LANES * PARTS):
         expert = _slot_expert(union, i)
         picks = _row_picks(union, expert, R)
         row, pick, _ = _slot_rows(mb, picks, RP, rl)
         at = ((pick[:, None, None] * NB1 + blk) * KSPLIT + ks) * BLOCK_N + n
         (got,) = mb.poll_many(("p1",), (mb.row_offset(row[:, None, None]) + at,))
-        if i == lane:
+        if i == first:
             mb.stamp(STAGE, trace.READY)
         parts = got.to(gl.float32, bitcast=True)
         # The regular path's order: K quarter 0, then 1, ...

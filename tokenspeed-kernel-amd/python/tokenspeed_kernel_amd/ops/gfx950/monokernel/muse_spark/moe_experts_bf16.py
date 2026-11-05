@@ -34,7 +34,7 @@ chunks, one chunk ahead.
   quantization) times the block, in four 256-wide K chunks. The FP32 partial
   sums go to ``p1`` in the MXFP4 path's order (gate and up columns
   interleaved), so ``exr`` reads them alike.
-* exr, 64 tasks: the K sums and SwiGLU as :func:`moe_experts.exr_stage`,
+* exr: the K sums and SwiGLU as :func:`moe_experts.exr_stage` (its tasks),
   then the regular route path's rounding of the intermediate to BF16,
   published as words (256 a row and pick).
 * ex2, 256 tasks: lane ``l``, 128 of the 4096 output columns over the

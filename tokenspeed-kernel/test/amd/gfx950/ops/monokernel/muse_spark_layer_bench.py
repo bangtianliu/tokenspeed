@@ -363,27 +363,39 @@ def worker(rank: int, port: int, args) -> None:
     if args.distinct:
         # Redraw the router bias (an operand: no recompile) until the launch's
         # rows pick exactly ``distinct`` experts. Rank 0 decides for all, so
-        # the ranks stop at the same seed.
+        # the ranks stop at the same seed. A wider spread makes the rows agree
+        # (fewer distinct experts): after 40 seeds without a hit, the spread
+        # doubles or halves toward the count.
         bias = moe_ops[1]
-        for seed in range(args.route_seed, args.route_seed + 1000):
-            g = torch.Generator().manual_seed(seed)
-            b = torch.full((256,), -1e4)
-            b[: args.experts] = torch.randn(args.experts, generator=g) * args.bias_std
-            bias.copy_(b)
-            step.add_(1)
-            launch(1)
-            torch.cuda.synchronize()
-            hit = torch.tensor(
-                [int(_distinct(plan, scratch, args.rows) == args.distinct)]
-            )
-            dist.broadcast(hit, 0)
-            if hit.item():
+        std, seed, found = args.bias_std, args.route_seed, False
+        for _ in range(25):
+            seen = []
+            for _ in range(40):
+                g = torch.Generator().manual_seed(seed)
+                b = torch.full((256,), -1e4)
+                b[: args.experts] = torch.randn(args.experts, generator=g) * std
+                bias.copy_(b)
+                step.add_(1)
+                launch(1)
+                torch.cuda.synchronize()
+                u = torch.tensor([_distinct(plan, scratch, args.rows)])
+                dist.broadcast(u, 0)
+                seen.append(int(u))
+                if seen[-1] == args.distinct:
+                    found = True
+                    break
+                seed += 1
+            if found:
                 break
-        else:
+            std = std * 2 if sum(seen) / len(seen) > args.distinct else std / 2
+        if not found:
             raise SystemExit(f"no seed gives {args.distinct} distinct experts")
         dist.barrier()
         if rank == 0:
-            print(f"routing: seed {seed} gives {args.distinct} distinct experts")
+            print(
+                f"routing: seed {seed} (bias spread {std:g}) gives "
+                f"{args.distinct} distinct experts"
+            )
 
     stream = torch.cuda.Stream()
     graphs = {}
