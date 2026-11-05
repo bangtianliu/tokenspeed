@@ -111,6 +111,8 @@ EXR_TASKS = gl.constexpr(64)  # LANES * NB1
 # An intermediate row in MXFP4 words: 64 of E2M1 values, then a word per
 # ex1 block holding its 2 scale bytes.
 H1_WORDS = gl.constexpr(72)  # INTER // 8 + NB1
+# A BF16 intermediate row (moe_experts_bf16): 512 values, two a word.
+H1_BF16_WORDS = gl.constexpr(256)
 EX2_BLOCKS = gl.constexpr(1)  # 128-column blocks of an ex2 task
 EX2_TASKS = gl.constexpr(256)  # LANES * NB2 // EX2_BLOCKS
 # ex2 slots polled in one pass, after a lane's first slot.
@@ -125,7 +127,9 @@ def regions() -> tuple[tuple[str, int], ...]:
     k, nb1, ks, bn = int(TOP_K), int(NB1), int(KSPLIT), int(BLOCK_N)
     return (
         ("p1", k * nb1 * ks * bn),  # FP32 [pick][block][K quarter][column] a row
-        ("h1", k * int(H1_WORDS)),  # MXFP4 intermediate [pick][word] a row
+        # The intermediate [pick][word] a row: MXFP4, or BF16 for the
+        # layers with BF16 experts (one layout serves both).
+        ("h1", k * max(int(H1_WORDS), int(H1_BF16_WORDS))),
         (
             "rr",
             int(WORLD) * k * int(OWNED_OUT) // 2,
@@ -610,12 +614,14 @@ def _words(x):
 
 
 @gluon.jit
-def exr_stage(mb, task, union, STAGE: gl.constexpr):
+def exr_stage(mb, task, union, BF16: gl.constexpr, STAGE: gl.constexpr):
     """Exr task ``task`` (slot lane, ex1 column block): for each slot of the
     lane, sum the 4 K quarters of the ex1 partials of every row that picked
     the slot's expert, apply SwiGLU (``silu(gate) up``) and publish the
     block's 64 intermediate values a row. The 32 ex2 tasks of the lane then
-    read 512 values a row, not 4 partials of 1024 columns each."""
+    read 512 values a row, not 4 partials of 1024 columns each. With
+    ``BF16`` (BF16 experts) the values are rounded to BF16, as the regular
+    BF16 route path stores its intermediate, else requantized to MXFP4."""
     mb.stamp(STAGE, trace.START)
     R: gl.constexpr = schedule.rows(mb.plan)
     RP: gl.constexpr = triton.next_power_of_2(R)
@@ -647,33 +653,57 @@ def exr_stage(mb, task, union, STAGE: gl.constexpr):
         for k in gl.static_range(KSPLIT):
             acc += gl.sum(gl.where(ks == k, parts, 0.0), axis=1)
         gate, up = gl.split(gl.reshape(acc, [RP, BLOCK_N // 2, 2]))
-        # The regular path's requantization: groups of 32 values, and the
-        # block's 64 values are two whole groups.
-        packed, scales = _mxfp4_quantize_tile(gate / (1.0 + gl.exp(-gate)) * up)
-        words = _words(packed)
-        wl: gl.constexpr = words.type.layout
-        row, pick, routed = _slot_rows(mb, picks, RP, gl.SliceLayout(1, wl))
-        w = gl.arange(0, BLOCK_N // 16, gl.SliceLayout(0, wl))[None, :]
-        mb.put(
-            "h1",
-            mb.row_offset(row[:, None])
-            + pick[:, None] * H1_WORDS
-            + blk * (BLOCK_N // 16)
-            + w,
-            words,
-            mask=routed[:, None] & (w >= 0),
-        )
-        # A row's 2 scale bytes in one thread, for the split.
-        pl2: gl.constexpr = gl.BlockedLayout([1, 2], [64, 1], [nw, 1], [1, 0])
-        lo, hi = gl.split(gl.convert_layout(scales.to(gl.int32), pl2))
-        sl: gl.constexpr = lo.type.layout
-        row, pick, routed = _slot_rows(mb, picks, RP, sl)
-        mb.put(
-            "h1",
-            mb.row_offset(row) + pick * H1_WORDS + INTER // 8 + blk,
-            lo | (hi << 8),
-            mask=routed,
-        )
+        inter = gate / (1.0 + gl.exp(-gate)) * up
+        if BF16:
+            # A pair in one thread, for the split.
+            pairs: gl.constexpr = gl.BlockedLayout(
+                [1, 1, 2], [1, 64, 1], [nw, 1, 1], [2, 1, 0]
+            )
+            words = mx.pack_bf16_pairs(
+                gl.convert_layout(
+                    gl.reshape(inter.to(gl.bfloat16), [RP, BLOCK_N // 4, 2]), pairs
+                )
+            )
+            wl: gl.constexpr = words.type.layout
+            row, pick, routed = _slot_rows(mb, picks, RP, gl.SliceLayout(1, wl))
+            w = gl.arange(0, BLOCK_N // 4, gl.SliceLayout(0, wl))[None, :]
+            mb.put(
+                "h1",
+                mb.row_offset(row[:, None])
+                + pick[:, None] * H1_BF16_WORDS
+                + blk * (BLOCK_N // 4)
+                + w,
+                words,
+                mask=routed[:, None] & (w >= 0),
+            )
+        else:
+            # The regular path's requantization: groups of 32 values, and the
+            # block's 64 values are two whole groups.
+            packed, scales = _mxfp4_quantize_tile(inter)
+            words = _words(packed)
+            wl: gl.constexpr = words.type.layout
+            row, pick, routed = _slot_rows(mb, picks, RP, gl.SliceLayout(1, wl))
+            w = gl.arange(0, BLOCK_N // 16, gl.SliceLayout(0, wl))[None, :]
+            mb.put(
+                "h1",
+                mb.row_offset(row[:, None])
+                + pick[:, None] * H1_WORDS
+                + blk * (BLOCK_N // 16)
+                + w,
+                words,
+                mask=routed[:, None] & (w >= 0),
+            )
+            # A row's 2 scale bytes in one thread, for the split.
+            pl2: gl.constexpr = gl.BlockedLayout([1, 2], [64, 1], [nw, 1], [1, 0])
+            lo, hi = gl.split(gl.convert_layout(scales.to(gl.int32), pl2))
+            sl: gl.constexpr = lo.type.layout
+            row, pick, routed = _slot_rows(mb, picks, RP, sl)
+            mb.put(
+                "h1",
+                mb.row_offset(row) + pick * H1_WORDS + INTER // 8 + blk,
+                lo | (hi << 8),
+                mask=routed,
+            )
     mb.stamp(STAGE, trace.COMPUTED)
     mb.stamp(STAGE, trace.END)
 

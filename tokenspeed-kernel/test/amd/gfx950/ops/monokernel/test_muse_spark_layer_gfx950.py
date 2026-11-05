@@ -117,7 +117,7 @@ def _all_experts(t: torch.Tensor) -> torch.Tensor:
     return full
 
 
-def _reference(sh, length, full, kernel_pooled, kernel_hp, dev):
+def _reference(sh, length, full, kernel_pooled, kernel_hp, dev, bf16_experts=False):
     """Each row's pooled row, FP32 residual ``h''`` and next BF16 attention
     input (``[rows, ...]``).
 
@@ -157,7 +157,7 @@ def _reference(sh, length, full, kernel_pooled, kernel_hp, dev):
     routes = torch.zeros(rows, 8, POOLED)
     for r in range(WORLD):
         routes += (
-            ref.expert_partials(
+            (ref.expert_partials_bf16 if bf16_experts else ref.expert_partials)(
                 r, EXPERTS, kernel_pooled.to(dev), sh["pre_exp_gain"], ids.to(dev)
             )
             .float()
@@ -179,11 +179,28 @@ def _reference(sh, length, full, kernel_pooled, kernel_hp, dev):
     return pooled, hp, (sh["beta1"] * b).abs(), h2, a, gated
 
 
-def _pack(rank: int, dev: torch.device, sh: dict, length: int, full: bool):
+def _pack(
+    rank: int,
+    dev: torch.device,
+    sh: dict,
+    length: int,
+    full: bool,
+    bf16_experts: bool = False,
+):
     """Pack ``rank``'s layer from the regular path's tensors (``length``: the
-    last row's length)."""
+    last row's length), with MXFP4 or BF16 experts."""
     w = _rank_weights(rank, length)
-    w13, w13s, w2, w2s = ref.preprocessed_experts(rank, EXPERTS, dev)
+    if bf16_experts:
+        # Every expert's room, as the regular path holds them (the routing
+        # picks among the first EXPERTS).
+        w13 = torch.zeros(256, 1024, POOLED, dtype=torch.bfloat16, device=dev)
+        w2 = torch.zeros(256, POOLED, 512, dtype=torch.bfloat16, device=dev)
+        b13, b2 = ref.bf16_experts(rank, EXPERTS)
+        w13[:EXPERTS], w2[:EXPERTS] = b13.to(dev), b2.to(dev)
+        experts = (w13, w2)
+    else:
+        w13, w13s, w2, w2s = ref.preprocessed_experts(rank, EXPERTS, dev)
+        experts = tuple(_all_experts(t) for t in (w13, w13s, w2, w2s))
     # The packer takes the regular path's tensors: the replicated pooler
     # and post-expert weights, and the router as the regular path stores
     # it (logits are x @ router); it slices this rank's part.
@@ -200,7 +217,8 @@ def _pack(rank: int, dev: torch.device, sh: dict, length: int, full: bool):
         pool=torch.cat([_rank_weights(r, length)["w_pool"] for r in range(WORLD)]).to(
             dev
         ),
-        experts=tuple(_all_experts(t) for t in (w13, w13s, w2, w2s)),
+        bf16_experts=bf16_experts,
+        experts=experts,
         pre_exp_gain=sh["pre_exp_gain"].to(dev),
         pen_gain=sh["pen_gain"].to(dev),
         post=torch.cat([_rank_weights(r, length)["w_post"] for r in range(WORLD)]).to(
@@ -213,7 +231,9 @@ def _pack(rank: int, dev: torch.device, sh: dict, length: int, full: bool):
     )
 
 
-def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
+def _worker(
+    rank: int, port: int, length: int, full: bool, rows: int, bf16_experts=False
+) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "gloo",
@@ -234,7 +254,7 @@ def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
         end = length + rows - 1
         sh = _shared(42, length, rows)
         w = _rank_weights(rank, end)
-        weights = _pack(rank, dev, sh, end, full)
+        weights = _pack(rank, dev, sh, end, full, bf16_experts)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         k_cache, v_cache = w["k_cache"].to(dev), w["v_cache"].to(dev)
         h_in = sh["h"][:, own].contiguous().to(dev)
@@ -311,7 +331,7 @@ def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
         dist.all_gather(slices, hp_own)
         kernel_hp = torch.cat(slices, dim=1)
         pooled, hp, gated1, h2, a, gated = _reference(
-            sh, length, full, kernel_pooled, kernel_hp, dev
+            sh, length, full, kernel_pooled, kernel_hp, dev, bf16_experts
         )
         # h' sums 8 ranks' BF16 partials: where they cancel, a step of one
         # partial is an absolute error at the row's scale, which the norm
@@ -383,6 +403,19 @@ def test_layer_matches_the_regular_path_math(full, rows):
         sock.bind(("", 0))
         port = sock.getsockname()[1]
     mp.spawn(_worker, args=(port, 3000, full, rows), nprocs=WORLD, join=True)
+
+
+@pytest.mark.parametrize("rows", [1, 8])
+@pytest.mark.parametrize("full", [False, True])
+def test_bf16_expert_layer_matches_the_regular_path_math(full, rows):
+    """A layer whose checkpoint keeps BF16 experts (0 and 61): the BF16
+    expert stages in place of the MXFP4 ones."""
+    if torch.cuda.device_count() < WORLD:
+        pytest.skip(f"requires {WORLD} GPUs")
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_worker, args=(port, 3000, full, rows, True), nprocs=WORLD, join=True)
 
 
 def _two_requests_worker(rank: int, port: int, full: bool) -> None:
@@ -642,6 +675,7 @@ def test_the_packer_names_every_tensor_of_another_layout():
             router=torch.empty(256, HIDDEN, dtype=f32),
             router_bias=torch.empty(256, dtype=f32),
             pool=torch.empty(POOLED, HIDDEN, dtype=bf16),
+            bf16_experts=False,
             experts=experts,
             pre_exp_gain=pooled,
             pen_gain=pooled,
