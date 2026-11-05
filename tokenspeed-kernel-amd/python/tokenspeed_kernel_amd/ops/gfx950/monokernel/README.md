@@ -27,6 +27,7 @@ Read these documents with this one:
 | `weights.py` | Host side: the weight and scale layouts that `mx.py` and `bf16.py` read. |
 | `trace.py` | Timestamps for each wave and stage inside a launch. |
 | `warm.py` | A warm task: reads weights of the next launch into the memory-side cache, through LDS, with no registers. |
+| `code_warm.py` | A code task: reads the launch's own code into every XCD's L2 at its start, so later stages do not wait on instruction fetch. |
 
 | Model directory | Model |
 |---|---|
