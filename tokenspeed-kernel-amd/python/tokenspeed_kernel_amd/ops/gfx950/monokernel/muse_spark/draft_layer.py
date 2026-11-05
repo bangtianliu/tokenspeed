@@ -40,7 +40,12 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
-from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox, schedule, trace
+from tokenspeed_kernel_amd.ops.gfx950.monokernel import (
+    code_warm,
+    mailbox,
+    schedule,
+    trace,
+)
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
     draft_attn,
     draft_mlp,
@@ -61,6 +66,9 @@ MAX_ROWS = 8  # one request's block
 FINAL_PEERS = ("fred", "fss", "fhin")
 PEERS = draft_attn.PEERS + draft_mlp.PEERS + FINAL_PEERS
 FOUT_TASKS = gl.constexpr(8)  # per row: 1024 columns each
+# CTAs 0 .. CODE_TASKS - 1 first read the launch's own code into the L2s
+# (code_warm.py): 8 tasks on each XCD.
+CODE_TASKS = 64
 
 
 def regions(splits: int) -> tuple[tuple[str, int], ...]:
@@ -153,7 +161,7 @@ def layer_plan(rows: int, last: bool) -> Plan:
     ``last`` layer's ends in the draft's final norm."""
     return Plan(
         grid=256,
-        stages=stages(BASES, SPLITS, rows, last),
+        stages=(Stage("code", CODE_TASKS, 0),) + stages(BASES, SPLITS, rows, last),
         regions=regions(SPLITS),
         rows=rows,
         chain=rows,
@@ -237,8 +245,9 @@ def pack_draft_layer(tensors: dict[str, torch.Tensor], rank: int) -> DraftLayerW
 
 
 # The layer index changes every launch: a specialization on it would compile
-# new binaries while serving.
-@gluon.jit(do_not_specialize=("layer",))
+# new binaries while serving. The code range is the compiled binary's own,
+# known only after the compile.
+@gluon.jit(do_not_specialize=("layer", "code_offset", "code_quads"))
 def gluon_muse_spark_draft_layer_gfx950(
     scratch,
     step,
@@ -269,6 +278,8 @@ def gluon_muse_spark_draft_layer_gfx950(
     out,
     final_gain,
     normed,
+    code_offset,
+    code_quads,
     trace_buf,
     PLAN: gl.constexpr,
     RANK: gl.constexpr,
@@ -276,13 +287,25 @@ def gluon_muse_spark_draft_layer_gfx950(
     LAST: gl.constexpr,
 ):
     """One step of draft layer ``layer`` on rank ``RANK`` (see the module
-    docstring and :func:`launch_gluon_muse_spark_draft_layer_gfx950`)."""
+    docstring and :func:`launch_gluon_muse_spark_draft_layer_gfx950`).
+    ``code_offset``, ``code_quads``: this binary's ``code_warm.text_range``."""
     table_ = trace.allocate(trace_buf)
     # The peer copies alternate from launch to launch, across forwards too:
     # a forward runs DRAFT_LAYERS launches.
     parity = (gl.load(step) * DRAFT_LAYERS + layer) & 1
     peers = mailbox.load_peers(bases, RANK, parity, WORLD)
     mb = mailbox.Mailbox(scratch, mailbox.launch_tag(step, layer), PLAN, table_, peers)
+    task, active = schedule.stage_task(PLAN, "code")
+    if active:
+        code_warm.code_warm_stage(
+            mb,
+            task,
+            schedule.stage_tasks(PLAN, "code"),
+            scratch,
+            code_offset,
+            code_quads,
+            "code",
+        )
     H: gl.constexpr = draft_mlp.HIDDEN
     G: gl.constexpr = schedule.grid(PLAN)
     # The attention half.
@@ -631,49 +654,56 @@ def launch_gluon_muse_spark_draft_layer_gfx950(
         raise ValueError(f"layer {layer} out of range({int(DRAFT_LAYERS)})")
     plan = layer_plan(rows, last)
     w = weights
-    args = (
-        scratch,
-        step,
-        layer,
-        peer_bases,
-        x,
-        residual,
-        residual_out,
-        w.in_gain,
-        w.a_coef,
-        w.a_base,
-        w.qkv,
-        w.q_norm,
-        w.k_norm,
-        cos_sin,
-        positions,
-        slots,
-        page_table,
-        seq_len,
-        k_cache,
-        v_cache,
-        w.o,
-        w.post_gain,
-        w.m_coef,
-        w.m_base,
-        w.gu,
-        w.down,
-        # The pointers a launch does not use point at a written tensor.
-        written,
-        final_gain if last else w.post_gain,
-        written,
-        trace_buf,
-        plan.key,
-        w.rank,
-        SPLITS,
-        last,
+
+    def kernel_args(code: tuple[int, int]) -> tuple:
+        return (
+            scratch,
+            step,
+            layer,
+            peer_bases,
+            x,
+            residual,
+            residual_out,
+            w.in_gain,
+            w.a_coef,
+            w.a_base,
+            w.qkv,
+            w.q_norm,
+            w.k_norm,
+            cos_sin,
+            positions,
+            slots,
+            page_table,
+            seq_len,
+            k_cache,
+            v_cache,
+            w.o,
+            w.post_gain,
+            w.m_coef,
+            w.m_base,
+            w.gu,
+            w.down,
+            # The pointers a launch does not use point at a written tensor.
+            written,
+            final_gain if last else w.post_gain,
+            written,
+            *code,
+            trace_buf,
+            plan.key,
+            w.rank,
+            SPLITS,
+            last,
+        )
+
+    kernel = gluon_muse_spark_draft_layer_gfx950.warmup(
+        *kernel_args((0, 0)), num_warps=8, grid=(plan.grid,)
     )
     if compile_only:
-        gluon_muse_spark_draft_layer_gfx950.warmup(
-            *args, num_warps=8, grid=(plan.grid,)
-        )
-    else:
-        gluon_muse_spark_draft_layer_gfx950[(plan.grid,)](*args, num_warps=8)
+        return
+    # The code range is a runtime argument: the same binary.
+    gluon_muse_spark_draft_layer_gfx950[(plan.grid,)](
+        *kernel_args(code_warm.text_range(kernel)), num_warps=8
+    )
 
 
 __all__ = [
