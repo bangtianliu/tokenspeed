@@ -82,6 +82,8 @@ BASES = {
     "router": 136,
     "topk": 152,
     "pool": 192,
+    # The slot table, once, on a topk CTA (after its topk task).
+    "slt": 152,
     "ex1": 0,
     # The K sums on the CTAs of ex1's last lanes, which run the fewest slots
     # at one row (8 slots: one each). Past one row they spread over every CTA
@@ -170,7 +172,7 @@ def layer_plan(full: bool, rows: int, chain: int, warm_next: bool) -> Plan:
         + attn_tail.stages(_bases(rows, "oproj", "tail"), rows)
         + moe_route.stages(_bases(rows, "router", "topk"), rows)
         + moe_pool.stages(_bases(rows, "pool"))
-        + moe_experts.stages(_bases(rows, "ex1", "exr", "ex2"), rows)
+        + moe_experts.stages(_bases(rows, "slt", "ex1", "exr", "ex2"), rows)
         + ((Stage("warm", WARM_TASKS, 0),) if warm_next else ())
         + moe_tail.stages(_bases(rows, "comb", "unpool", "out"), rows)
     )
@@ -346,6 +348,9 @@ def gluon_muse_spark_layer_gfx950(
     task, active = schedule.stage_task(PLAN, "pool")
     if active:
         moe_pool.pool_stage(mb, task, w_pool, RANK, "pool")
+    task, active = schedule.stage_task(PLAN, "slt")
+    if active:
+        moe_experts.slot_table_stage(mb, "slt")
     # A CTA's ex1 and ex2 tasks run in parts (see moe_experts): ex1's weights
     # once routing names the experts, the A operand meanwhile, ex1's products,
     # the K sums (exr), then ex2's weights ahead of ex2's poll.
@@ -358,7 +363,7 @@ def gluon_muse_spark_layer_gfx950(
     )
     if BF16_EXPERTS:
         loads1 = moe_experts_bf16.ex1_issue(task1, active1, e1, w13, s13_we)
-        union = moe_experts.slots(ids)
+        union = moe_experts.union_of(ids)
         a1 = moe_experts_bf16.ex1_operand(task1, got1, gain_lo, gain_hi)
         if active1:
             moe_experts_bf16.ex1_finish(
@@ -376,7 +381,7 @@ def gluon_muse_spark_layer_gfx950(
         loads1 = moe_experts.ex1_issue(
             task1, active1, e1, w13, w13s, s13_we, s13_se, s13_lin, s13_nb
         )
-        union = moe_experts.slots(ids)
+        union = moe_experts.union_of(ids)
         a1 = moe_experts.ex1_operand(task1, got1, gain_lo, gain_hi)
         if active1:
             moe_experts.ex1_finish(

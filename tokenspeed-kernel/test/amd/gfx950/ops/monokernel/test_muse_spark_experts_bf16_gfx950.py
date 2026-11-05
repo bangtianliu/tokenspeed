@@ -71,6 +71,9 @@ def experts_kernel(
 ):
     peers = mailbox.load_peers(bases, RANK, gl.load(step) & 1, 8)
     mb = mailbox.Mailbox(scratch, mailbox.launch_tag(step, 0), PLAN, None, peers)
+    task, active = schedule.stage_task(PLAN, "slt")
+    if active:
+        moe_experts.slot_table_stage(mb, "slt")
     task1, active1 = schedule.stage_task(PLAN, "ex1")
     task1 = gl.where(active1, task1, 0)
     task2, active2 = schedule.stage_task(PLAN, "ex2")
@@ -79,7 +82,7 @@ def experts_kernel(
         mb, task1, task2, active1, pre_gain, "ex1"
     )
     loads1 = moe_experts_bf16.ex1_issue(task1, active1, e1, w13, s13_we)
-    union = moe_experts.slots(ids)
+    union = moe_experts.union_of(ids)
     a1 = moe_experts_bf16.ex1_operand(task1, got1, gain_lo, gain_hi)
     if active1:
         moe_experts_bf16.ex1_finish(mb, task1, a1, loads1, union, w13, s13_we, "ex1")
@@ -149,7 +152,7 @@ def _worker(rank: int, port: int, rows: int) -> None:
             grid=256,
             # The layer's placement: exr over every CTA past one row.
             stages=moe_experts.stages(
-                {"ex1": 0, "exr": 192 if rows == 1 else 0, "ex2": 0}, rows
+                {"slt": 255, "ex1": 0, "exr": 192 if rows == 1 else 0, "ex2": 0}, rows
             ),
             regions=(("route", 2 * TOP_K), ("cg", POOLED // 2)) + moe_experts.regions(),
             rows=rows,
