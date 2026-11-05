@@ -446,6 +446,7 @@ def gluon_muse_spark_layer_gfx950(
         moe_tail.out_stage(
             mb,
             task,
+            post_gain,
             beta2,
             in_gain,
             a_out,
