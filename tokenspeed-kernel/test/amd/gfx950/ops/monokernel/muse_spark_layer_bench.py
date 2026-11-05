@@ -227,7 +227,7 @@ def _operands(
         sh["pre_exp_gain"].to(dev),
         sh["pen_gain"][own_pool].to(dev),
         bf16_tiles(w["w_post"]).to(dev),
-        sh["post_gain"][own].to(dev),
+        sh["post_gain"].to(dev),
         sh["alpha2"][own].to(dev),
         sh["beta2"].to(dev),
         sh["in_gain"].to(dev),

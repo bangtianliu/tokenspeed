@@ -32,10 +32,13 @@ columns ``1024 r ..`` of the residual.
   rounded to BF16, put into every rank's ``cmb``.
 * unpool, 64 tasks of 16 owned hidden columns: the post-expert projection
   (BF16 ``[1024, 4096]``, 128 KiB a task) of every whole combined row,
-  rounded to BF16, times the post-FFN gain. For each row, a task puts its
-  ``y`` and ``alpha h'`` and four partial sums, of ``y^2``, ``(beta y)^2``,
-  ``(alpha h')(beta y)`` and ``(alpha h')^2``, into every rank's ``ffn``, in
-  one store per rank.
+  rounded to BF16 (``p``), and ``y = p`` times the post-FFN gain. For each
+  row, a task puts ``p`` (two BF16 values a word: the out tasks apply the
+  gain, so ``y`` is the same FP32 product) and ``alpha h'``, and four partial
+  sums, of ``y^2``, ``(beta y)^2``, ``(alpha h')(beta y)`` and ``(alpha
+  h')^2``, into every rank's ``ffn``, in one store per rank. The puts of all
+  64 tasks to 8 ranks are bound by the links between the GPUs, so ``p``
+  goes in 3 pairs per 2 columns instead of 4.
 * out, 16 tasks of 512 hidden columns per row: the row's 512 x 4 partial
   sums from every rank's ``ffn``, summed into the inverse RMS of the post-FFN
   norm (over 8192 columns) and of the next layer's input norm, whose sum of
@@ -82,7 +85,8 @@ SUMS = gl.constexpr(4)
 OUT_TASKS = gl.constexpr(16)
 POST_EPS = gl.constexpr(1e-8)
 PRE_EPS = gl.constexpr(1e-5)
-SUMS_AT = gl.constexpr(2 * int(HIDDEN))  # where the sums start in ``ffn``
+AH_AT = gl.constexpr(int(HIDDEN) // 2)  # where ``alpha h'`` starts in ``ffn``
+SUMS_AT = gl.constexpr(3 * int(HIDDEN) // 2)  # where the sums start in ``ffn``
 
 PEERS = ("ss3", "cmb", "ffn")
 
@@ -92,8 +96,9 @@ def regions() -> tuple[tuple[str, int], ...]:
     return (
         ("ss3", world * int(COMB_TASKS) * k),  # FP32 [rank][task][route]
         ("cmb", int(POOLED) // 2),  # BF16 pairs of the combined row
-        # FP32 [y, alpha h'][column], then the sums: [rank][task][sum].
-        ("ffn", 2 * int(HIDDEN) + world * int(UNPOOL_TASKS) * int(SUMS)),
+        # BF16 pairs of p, FP32 alpha h' [column], then the FP32 sums:
+        # [rank][task][sum].
+        ("ffn", int(SUMS_AT) + world * int(UNPOOL_TASKS) * int(SUMS)),
     )
 
 
@@ -255,7 +260,8 @@ def unpool_stages(
     Args:
         w: This rank's post-expert projection rows, BF16 ``[1024, 4096]``
             (``weights.bf16_tiles``).
-        post_gain: FP32 ``bf16(w + 1)`` of the post-FFN norm, owned columns.
+        post_gain: FP32 ``bf16(w + 1)`` of the post-FFN norm, all 8192
+            columns.
         alpha: FP32 residual-gate coefficient of the FFN, owned columns.
         beta: FP32 residual-gate coefficient of the FFN, all 8192 columns.
     """
@@ -278,8 +284,8 @@ def unpool_stages(
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
     j = gl.arange(0, UNPOOL_COLS // 2, lanes)
     c = task * UNPOOL_COLS + 2 * j
-    post_lo = gl.load(post_gain + c)
-    post_hi = gl.load(post_gain + c + 1)
+    post_lo = gl.load(post_gain + RANK * OWNED + c)
+    post_hi = gl.load(post_gain + RANK * OWNED + c + 1)
     b_lo = gl.load(beta + RANK * OWNED + c)
     b_hi = gl.load(beta + RANK * OWNED + c + 1)
     a_lo = gl.load(alpha + c)
@@ -308,9 +314,9 @@ def unpool_stages(
     lo, hi = gl.split(
         gl.reshape(gl.convert_layout(out, pairs), [RP, UNPOOL_COLS // 2, 2])
     )
-    # Every row at once: [row, kind, pair], a wave per row. Kinds 0 .. 3 are
-    # y_lo, y_hi, (alpha h')_lo, (alpha h')_hi of the 8 pairs; kind 4 holds
-    # the row's 4 sums. One put per peer serves every row.
+    # Every row at once: [row, kind, pair], a wave per row. Kinds 0 .. 2 are
+    # p (both columns), (alpha h')_lo, (alpha h')_hi of the 8 pairs; kind 3
+    # holds the row's 4 sums. One put per peer serves every row.
     L3: gl.constexpr = gl.BlockedLayout([1, 1, 1], [1, 8, 8], [nw, 1, 1], [2, 1, 0])
     P2: gl.constexpr = gl.SliceLayout(1, L3)
     r2 = gl.arange(0, RP, gl.SliceLayout(1, P2))[:, None]
@@ -318,10 +324,11 @@ def unpool_stages(
     c2 = task * UNPOOL_COLS + 2 * j2
     hp_lo = hp[0].to(gl.float32, bitcast=True)
     hp_hi = hp[1].to(gl.float32, bitcast=True)
-    y_lo = gl.convert_layout(lo, P2).to(gl.bfloat16).to(gl.float32)
-    y_hi = gl.convert_layout(hi, P2).to(gl.bfloat16).to(gl.float32)
-    y_lo = y_lo * gl.convert_layout(post_lo, gl.SliceLayout(0, P2))[None, :]
-    y_hi = y_hi * gl.convert_layout(post_hi, gl.SliceLayout(0, P2))[None, :]
+    p_lo = gl.convert_layout(lo, P2).to(gl.bfloat16).to(gl.float32)
+    p_hi = gl.convert_layout(hi, P2).to(gl.bfloat16).to(gl.float32)
+    p_word = _bf16_word(p_lo, p_hi).to(gl.float32, bitcast=True)
+    y_lo = p_lo * gl.convert_layout(post_lo, gl.SliceLayout(0, P2))[None, :]
+    y_hi = p_hi * gl.convert_layout(post_hi, gl.SliceLayout(0, P2))[None, :]
     a2_lo = gl.convert_layout(a_lo, gl.SliceLayout(0, P2))[None, :]
     a2_hi = gl.convert_layout(a_hi, gl.SliceLayout(0, P2))[None, :]
     b2_lo = gl.convert_layout(b_lo, gl.SliceLayout(0, P2))[None, :]
@@ -340,25 +347,25 @@ def unpool_stages(
     r3 = r2[:, None, :]
     vals = gl.where(
         k == 0,
-        y_lo[:, None, :],
+        p_word[:, None, :],
         gl.where(
             k == 1,
-            y_hi[:, None, :],
-            gl.where(
-                k == 2,
-                ah_lo[:, None, :],
-                gl.where(k == 3, ah_hi[:, None, :], sr[:, None, :]),
-            ),
+            ah_lo[:, None, :],
+            gl.where(k == 2, ah_hi[:, None, :], sr[:, None, :]),
         ),
     )
     col = RANK * OWNED + task * UNPOOL_COLS + 2 * j3
     idx = mb.row_offset(r3) + gl.where(
-        k < 4,
-        (k >> 1) * HIDDEN + col + (k & 1),
-        SUMS_AT + (RANK * UNPOOL_TASKS + task) * SUMS + j3,
+        k == 0,
+        col // 2,
+        gl.where(
+            k < 3,
+            AH_AT + col + k - 1,
+            SUMS_AT + (RANK * UNPOOL_TASKS + task) * SUMS + j3,
+        ),
     )
     word = vals.to(gl.int32, bitcast=True)
-    put = ((k < 4) | ((k == 4) & (j3 < SUMS))) & (r3 < R)
+    put = ((k < 3) | ((k == 3) & (j3 < SUMS))) & (r3 < R)
     for p in gl.static_range(WORLD):
         mb.put_peer("ffn", p, idx, word, mask=put)
     mb.stamp("unpool", trace.END)
@@ -368,6 +375,7 @@ def unpool_stages(
 def out_stage(
     mb,
     task,
+    post_gain,
     beta,
     in_gain,
     a_out,
@@ -388,6 +396,8 @@ def out_stage(
     owned columns store those.
 
     Args:
+        post_gain: FP32 ``bf16(w + 1)`` of the post-FFN norm, all 8192
+            columns.
         beta: FP32 residual-gate coefficient of the FFN, all 8192 columns.
         in_gain: FP32 ``bf16(w + 1)`` of the next layer's input norm, all
             8192 columns.
@@ -406,6 +416,8 @@ def out_stage(
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     i = task * 256 + gl.arange(0, 256, lanes)
     c = 2 * i
+    post_lo = gl.load(post_gain + c)
+    post_hi = gl.load(post_gain + c + 1)
     b_lo = gl.load(beta + c)
     b_hi = gl.load(beta + c + 1)
     in_lo = gl.load(in_gain + c)
@@ -413,20 +425,15 @@ def out_stage(
     # Each unpool task puts its columns and its sums in one store, so the
     # columns' poll after the sums' barely waits.
     inv, inv2 = _ffn_norms(mb)
-    y_lo, y_hi, ah_lo, ah_hi = mb.poll_many(
-        ("ffn", "ffn", "ffn", "ffn"), (c, c + 1, HIDDEN + c, HIDDEN + c + 1)
+    pw, ah_lo, ah_hi = mb.poll_many(
+        ("ffn", "ffn", "ffn"), (i, AH_AT + c, AH_AT + c + 1)
     )
     mb.stamp(STAGE, trace.READY)
-    h_lo = gl.fma(
-        b_lo,
-        y_lo.to(gl.float32, bitcast=True) * inv,
-        ah_lo.to(gl.float32, bitcast=True),
-    )
-    h_hi = gl.fma(
-        b_hi,
-        y_hi.to(gl.float32, bitcast=True) * inv,
-        ah_hi.to(gl.float32, bitcast=True),
-    )
+    # y as unpool computed it: the BF16 projection times the gain.
+    y_lo = (pw << 16).to(gl.float32, bitcast=True) * post_lo
+    y_hi = (pw & -65536).to(gl.float32, bitcast=True) * post_hi
+    h_lo = gl.fma(b_lo, y_lo * inv, ah_lo.to(gl.float32, bitcast=True))
+    h_hi = gl.fma(b_hi, y_hi * inv, ah_hi.to(gl.float32, bitcast=True))
     word = _bf16_word(h_lo * inv2 * in_lo, h_hi * inv2 * in_hi)
     gl.store(a_out.to(gl.pointer_type(gl.int32), bitcast=True) + i, word)
     if WHOLE_ROWS:
