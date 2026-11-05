@@ -283,7 +283,7 @@ def lmh_stage(mb, task, x, w, scale):
     packed = gl.where(valid, (key << ID_BITS) | ((1 << ID_BITS) - 1 - lid), -1)
     j = gl.arange(0, TOPK, gl.SliceLayout(0, bl))[None, :]
     best = gl.full([RP, TOPK], -1, gl.int32, bl)
-    for i in gl.static_range(TOPK):
+    for i in range(TOPK):  # a runtime loop, as in _best16
         m = gl.max(packed, axis=1)[:, None]
         best = gl.where(j == i, m, best)
         packed = gl.where(packed == m, -1, packed)
@@ -317,7 +317,10 @@ def _best16(values, axis: gl.constexpr, layout: gl.constexpr):
         values.dtype,
         j.type.layout,
     )
-    for i in gl.static_range(TOPK):
+    # A runtime loop: unrolled, the passes are straight-line code that runs
+    # once a step on a few CUs, cold in the instruction cache in serving
+    # (MI355X, a cold launch: merge1 14.5 -> 8.8 us, merge2 ~15 -> ~7 us).
+    for i in range(TOPK):
         m = gl.max(values, axis=axis)
         if axis == 1:
             m = m[:, None]
