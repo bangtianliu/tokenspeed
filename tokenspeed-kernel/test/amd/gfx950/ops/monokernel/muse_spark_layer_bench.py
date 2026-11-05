@@ -132,7 +132,9 @@ def rank0_payloads(plan, parity: int, gpus: int, scratch) -> torch.Tensor:
     )
 
 
-def _operands(rank: int, length: int, rows: int, experts: int, kv_dtype, dev):
+def _operands(
+    rank: int, length: int, rows: int, experts: int, bf16_experts: bool, kv_dtype, dev
+):
     """The launch operands of ``rows`` chained rows (row 0 at ``length``)
     whose routing picks among the first ``experts`` experts, with a
     ``kv_dtype`` KV cache."""
@@ -144,7 +146,19 @@ def _operands(rank: int, length: int, rows: int, experts: int, kv_dtype, dev):
     g = torch.Generator().manual_seed(7)
     sh["bias"] = torch.full((256,), -1e4)
     sh["bias"][:experts] = torch.randn(experts, generator=g) * 0.1
-    w13, w13s, w2, w2s = ref.preprocessed_experts(rank, experts, dev)
+    if bf16_experts:
+        # The regular BF16 route path's layout, every expert's room (the
+        # routing reads only the first ``experts``); no scales.
+        w13 = torch.empty(256, 1024, 4096, dtype=torch.bfloat16, device=dev)
+        w2 = torch.empty(256, 4096, 512, dtype=torch.bfloat16, device=dev)
+        gen = torch.Generator(device=dev).manual_seed(500 + rank)
+        w13[:experts].normal_(0.0, 0.02, generator=gen)
+        w2[:experts].normal_(0.0, 0.04, generator=gen)
+        w13s, w2s = w13, w2
+        s13 = s2 = (0, 0, 0)
+    else:
+        w13, w13s, w2, w2s = ref.preprocessed_experts(rank, experts, dev)
+        s13, s2 = w13s.stride(), w2s.stride()
     own = slice(rank * OWNED, (rank + 1) * OWNED)
     own_pool = slice(rank * POOL_OWNED, (rank + 1) * POOL_OWNED)
     pos = torch.arange(length - 1, end)
@@ -174,15 +188,11 @@ def _operands(rank: int, length: int, rows: int, experts: int, kv_dtype, dev):
         w13,
         w13s,
         w13.stride(0),
-        w13s.stride(0),
-        w13s.stride(1),
-        w13s.stride(2),
+        *s13,
         w2,
         w2s,
         w2.stride(0),
-        w2s.stride(0),
-        w2s.stride(1),
-        w2s.stride(2),
+        *s2,
         sh["pre_exp_gain"].to(dev),
         sh["pen_gain"][own_pool].to(dev),
         bf16_tiles(w["w_post"]).to(dev),
@@ -247,7 +257,13 @@ def worker(rank: int, port: int, args) -> None:
     bases[:gpus] = group.bases.to(dev)
     bases[gpus:] = int(group.bases[rank]) + (ghost.data_ptr() - scratch.data_ptr())
     attn_ops, moe_ops, h_next, a_out = _operands(
-        rank, args.length, args.rows, args.experts, KV_DTYPES[args.kv_dtype], dev
+        rank,
+        args.length,
+        args.rows,
+        args.experts,
+        args.bf16_experts,
+        KV_DTYPES[args.kv_dtype],
+        dev,
     )
     step = torch.full((1,), 100, dtype=torch.int32, device=dev)
     idx = [absent_index(plan, p, gpus).to(dev) for p in (0, 1)]
@@ -300,6 +316,7 @@ def worker(rank: int, port: int, args) -> None:
             args.rows,
             args.rows,
             False,  # whole_rows: the owned residual columns
+            args.bf16_experts,
             False,  # compile_only
         )
 
@@ -426,6 +443,11 @@ def main() -> None:
     )
     p.add_argument(
         "--experts", type=int, default=EXPERTS, help="experts the routing picks among"
+    )
+    p.add_argument(
+        "--bf16-experts",
+        action="store_true",
+        help="BF16 experts (layers 0 and 61) instead of MXFP4",
     )
     p.add_argument("--replays", type=int, default=15)
     p.add_argument(

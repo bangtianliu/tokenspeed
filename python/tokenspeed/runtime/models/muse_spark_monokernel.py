@@ -295,6 +295,7 @@ def _pack(model, index, window, qkvg, o, pool, post, gains, experts):
             "router": mlp.gate.weight.data,
             "router_bias": mlp.gate.e_score_correction_bias.data,
             "pool": pool,
+            "bf16_experts": False,
             "experts": experts,
             "pre_exp_gain": pre_exp_gain,
             "pen_gain": pen_gain,

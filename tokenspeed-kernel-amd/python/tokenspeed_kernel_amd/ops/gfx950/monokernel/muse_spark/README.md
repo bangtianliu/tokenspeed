@@ -86,6 +86,7 @@ docstring gives its math and task split):
 | `moe_route.py` | router, topk | Partial router logits of the owned columns; the sum, sigmoid scores and top 8. |
 | `moe_pool.py` | pool | The pre-expert projection, gathered on every rank. |
 | `moe_experts.py` | ex1, exr, ex2 | The MXFP4 experts, each rank's 512 of 4096 intermediate values. The rows' distinct experts are slots: each streams once for every row that picked it. exr sums ex1's K quarters and requantizes to MXFP4 once, so ex2 polls 72 words a row, not 4096 partials, and quantizes nothing (8 rows: sliding at 100k 109.0 to 104.4 us, full at 200k 145.5 to 143.0 us). |
+| `moe_experts_bf16.py` | ex1, ex2 (exr shared) | The BF16 experts of the layers whose checkpoint keeps them BF16 (0 and 61), on the regular BF16 route path's weights read in place: the same slots, polls and K sums, each slot streamed in K chunks (4x an MXFP4 slot's bytes), the intermediate rounded to BF16 as the route path rounds it. A layer launch selects them with `pack_layer(bf16_experts=True)` (8 rows of 40 experts, sliding at 8.7k: 140.5 us, vs 93.4 with MXFP4 experts). |
 | `warm.py` (shared) | warm | When the next layer is fused too, CTAs 0 to 63 read its packed QKVG weights into the memory-side cache after their expert tasks, so the next launch's projections read the MALL (earlier, the expert weights would evict them). GSM8K with DFlash2: 8.86 vs 9.15 ms a round; at 100k keys 9.23 vs 9.58. |
 | `moe_tail.py` | comb1, comb2, unpool, rnorm, out | Combine the routes, the post-expert projection, the post-FFN norm, residual gate and the next layer's input norm. One rnorm task a row sums every rank's partial sums of squares once and hands out the two norm scales. The out tasks of the rank's owned columns also store the FP32 residual and, before a layer a draft taps, the BF16 residual into every rank's tap buffer. |
 | `draft_layer.py` | both halves in one plan | A whole DFlash2 draft layer as one launch: the attention half hands its partial to the MLP half's owners through the mailbox (afin in place of scat) and the residual between the two sums stays in registers. The last layer's launch also runs the draft's final norm (fin puts its partial to the owners; fsum, fnorm and fout store the normed rows on every rank). Served with `--decode-monokernel` for one request's draft block (`python/tokenspeed/runtime/models/dflash2_monokernel.py`). |
@@ -130,7 +131,7 @@ docstring gives its math and task split):
 | `layer.py` | The plans, the layer kernel and its launcher. |
 | `dims.py` | The dimensions that several modules use. |
 | `qkvg.py`, `attention.py`, `attn_tail.py` | The attention stages. |
-| `moe_route.py`, `moe_pool.py`, `moe_experts.py`, `moe_tail.py` | The MoE stages and the layer boundary. |
+| `moe_route.py`, `moe_pool.py`, `moe_experts.py`, `moe_experts_bf16.py`, `moe_tail.py` | The MoE stages and the layer boundary. |
 | `draft_mlp.py`, `draft_attn.py`, `draft_layer.py`, `draft_head.py`, `draft_context.py` | The DFlash2 draft layer's MLP and attention halves, the whole layer in one plan, the draft head and the context write. |
 | `weights.py` | Host packing of the layer weights. |
 
