@@ -44,6 +44,12 @@ Run from the repository root (each line is one example):
         python tokenspeed-kernel/test/amd/gfx950/ops/monokernel/muse_spark_layer_bench.py --gpus 4 \\
         --trace-out /tmp/trace --out-save /tmp/new.pt
 
+The rows' routing picks ``--distinct`` experts (4 a row by default: 32 at 8
+rows, the median of served 8-row verifies, which pick 18 to 56). Expert
+stages scale with that count, and rows that agree on their experts (the
+earlier default, 17 at 8 rows) understate them by about half. The bench
+redraws the router bias until the count matches, before it times anything.
+
 The first line of the output is the time per launch. The table after it is the
 trace of rank 0: for each stage, the first and last time (us, relative to the
 first event) at which a wave starts, has its inputs, has computed, and ends.
@@ -132,20 +138,45 @@ def rank0_payloads(plan, parity: int, gpus: int, scratch) -> torch.Tensor:
     )
 
 
+def _distinct(plan, scratch, rows: int) -> int:
+    """The distinct experts the last launch's rows picked (every row's 8 ids
+    open its route region)."""
+    o = plan.offset("route")
+    picks = torch.stack(
+        [
+            scratch[o + r * plan.row_pairs : o + r * plan.row_pairs + 8]
+            for r in range(rows)
+        ]
+    )
+    return len(set((picks & 0xFFFFFFFF).flatten().tolist()))
+
+
 def _operands(
-    rank: int, length: int, rows: int, experts: int, bf16_experts: bool, kv_dtype, dev
+    rank: int,
+    length: int,
+    rows: int,
+    experts: int,
+    bias_std: float,
+    route_seed: int,
+    bf16_experts: bool,
+    kv_dtype,
+    dev,
 ):
     """The launch operands of ``rows`` chained rows (row 0 at ``length``)
-    whose routing picks among the first ``experts`` experts, with a
+    whose routing picks among the first ``experts`` experts, the router bias
+    drawn with standard deviation ``bias_std`` (seed ``route_seed``), with a
     ``kv_dtype`` KV cache."""
     sh = layer_test._shared(42, length, rows)
     end = length + rows - 1
     w = layer_test._rank_weights(rank, end)
-    # Each row picks 8 of the held experts: 8 independent rows of 40 experts
-    # share about 33, as a verify's 8 consecutive tokens do.
-    g = torch.Generator().manual_seed(7)
+    # Each row picks 8 of the held experts. The bias spread sets how much
+    # the rows agree: the router scores vary by ~0.04 across experts, so a
+    # bias spread of 0.1 makes 8 rows pick about the same experts (12-18
+    # distinct of 40), and 0.01 about as many as served 8-row verifies do
+    # (median 32 distinct; each run prints its count).
+    g = torch.Generator().manual_seed(route_seed)
     sh["bias"] = torch.full((256,), -1e4)
-    sh["bias"][:experts] = torch.randn(experts, generator=g) * 0.1
+    sh["bias"][:experts] = torch.randn(experts, generator=g) * bias_std
     if bf16_experts:
         # The regular BF16 route path's layout, every expert's room (the
         # routing reads only the first ``experts``); no scales.
@@ -261,6 +292,8 @@ def worker(rank: int, port: int, args) -> None:
         args.length,
         args.rows,
         args.experts,
+        args.bias_std,
+        args.route_seed,
         args.bf16_experts,
         KV_DTYPES[args.kv_dtype],
         dev,
@@ -327,6 +360,31 @@ def worker(rank: int, port: int, args) -> None:
                 do_flush()
             launch(lay)
 
+    if args.distinct:
+        # Redraw the router bias (an operand: no recompile) until the launch's
+        # rows pick exactly ``distinct`` experts. Rank 0 decides for all, so
+        # the ranks stop at the same seed.
+        bias = moe_ops[1]
+        for seed in range(args.route_seed, args.route_seed + 1000):
+            g = torch.Generator().manual_seed(seed)
+            b = torch.full((256,), -1e4)
+            b[: args.experts] = torch.randn(args.experts, generator=g) * args.bias_std
+            bias.copy_(b)
+            step.add_(1)
+            launch(1)
+            torch.cuda.synchronize()
+            hit = torch.tensor(
+                [int(_distinct(plan, scratch, args.rows) == args.distinct)]
+            )
+            dist.broadcast(hit, 0)
+            if hit.item():
+                break
+        else:
+            raise SystemExit(f"no seed gives {args.distinct} distinct experts")
+        dist.barrier()
+        if rank == 0:
+            print(f"routing: seed {seed} gives {args.distinct} distinct experts")
+
     stream = torch.cuda.Stream()
     graphs = {}
     with torch.cuda.stream(stream):
@@ -366,6 +424,8 @@ def worker(rank: int, port: int, args) -> None:
     dist.barrier()
     us = {name: _median_us(g, args.replays) for name, g in graphs.items()}
     if rank == 0:
+        u = _distinct(plan, scratch, args.rows)
+        print(f"routing: {u} distinct experts over {args.rows} rows")
         f = us["fill"] if gpus < TP else 0.0
         kind = "full" if args.full else "sliding"
         print(
@@ -445,6 +505,23 @@ def main() -> None:
         "--experts", type=int, default=EXPERTS, help="experts the routing picks among"
     )
     p.add_argument(
+        "--bias-std",
+        type=float,
+        default=0.01,
+        help="router bias spread: 0.01 spreads 8 rows over ~32 of 40 experts "
+        "like served verifies; 0.1 makes them agree (12-18)",
+    )
+    p.add_argument(
+        "--distinct",
+        type=int,
+        default=-1,
+        help="redraw the router bias until the rows pick exactly this many "
+        "experts; -1: 4 a row, at least 8, at most 3/4 of --experts (served "
+        "8-row verifies: median 32, "
+        "18-56); 0 keeps --route-seed",
+    )
+    p.add_argument("--route-seed", type=int, default=7, help="router bias seed")
+    p.add_argument(
         "--bf16-experts",
         action="store_true",
         help="BF16 experts (layers 0 and 61) instead of MXFP4",
@@ -465,6 +542,9 @@ def main() -> None:
         "--compare", nargs=2, metavar="OUT", help="check two --out-save files"
     )
     args = p.parse_args()
+    if args.distinct < 0:
+        # Reachable: 8 rows cannot pick all of few experts.
+        args.distinct = min(max(8, 4 * args.rows), max(8, args.experts * 3 // 4))
     if args.view:
         for path in args.view:
             d = torch.load(path)
