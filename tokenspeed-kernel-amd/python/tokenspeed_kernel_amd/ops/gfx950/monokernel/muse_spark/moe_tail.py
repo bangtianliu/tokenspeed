@@ -30,27 +30,29 @@ columns ``1024 r ..`` of the residual.
   exchange of partial sums of squares per route), and the weighted sum of
   the 8 routes (a tree within a wave, not the regular path's pick order),
   rounded to BF16, put into every rank's ``cmb``.
-* unpool, fin, 64 tasks of 16 owned hidden columns (same CTAs): the
-  post-expert projection (BF16 ``[1024, 4096]``, 128 KiB a task) of every
-  whole combined row, rounded to BF16, times the post-FFN gain. For each
-  row, a task puts its
+* unpool, 64 tasks of 16 owned hidden columns: the post-expert projection
+  (BF16 ``[1024, 4096]``, 128 KiB a task) of every whole combined row,
+  rounded to BF16, times the post-FFN gain. For each row, a task puts its
   ``y`` and ``alpha h'`` and four partial sums, of ``y^2``, ``(beta y)^2``,
   ``(alpha h')(beta y)`` and ``(alpha h')^2``, into every rank's ``ffn``, in
-  one store per rank. Then fin, after rnorm: the residual gate ``h'' = beta y
-  inv + alpha h'`` of the owned columns (stored: the launch's residual output).
+  one store per rank.
 * rnorm, one task per row: the row's 512 x 4 partial sums from every rank's
   ``ffn``, summed once into the inverse RMS of the post-FFN norm (over 8192
   columns) and of the next layer's input norm, whose sum of squares is the
   expansion of ``(beta y inv + alpha h')^2`` in the four sums. Both go to the
-  local ``fnorm``. (Every fin and out task polled all 2048 sums of every row
-  itself before: at 8 rows, 64 fin CTAs x 128 KB of system-scope loads, and fin
-  ended the layer about 6 us after unpool instead of 1 at one row.)
-* out, 16 tasks of 512 hidden columns per row: the residual gate with rnorm's
-  scales and the next layer's input norm. The result is rounded to BF16 and
-  stored as the next attention input, for the next launch. Every rank
-  computes the whole row from the ``ffn`` of all ranks, with fin's arithmetic:
-  putting the owned slice of the result to the other ranks instead would add a
-  second exchange to the end of the layer.
+  local ``fnorm``. (Every out task polled all 2048 sums of every row itself
+  before: at 8 rows, 128 KB of system-scope loads a CTA.)
+* out, 16 tasks of 512 hidden columns per row: the residual gate ``h'' =
+  beta y inv + alpha h'`` with rnorm's scales, then the next layer's input
+  norm. The result is rounded to BF16 and stored as the next attention input,
+  for the next launch. Every rank computes the whole row from the ``ffn`` of
+  all ranks: putting the owned slice of the result to the other ranks instead
+  would add a second exchange to the end of the layer. The 2 tasks of a row
+  that cover the rank's owned columns also store ``h''`` (FP32, the launch's
+  residual output) and the draft's tap. (Unpool's CTAs did that before, after
+  their ``ffn`` puts: a poll waits for every earlier store of its wave, so
+  their wait for rnorm also waited for those 8 remote stores, and at 8 rows
+  ended the layer about 4 us after out.)
 """
 
 from __future__ import annotations
@@ -97,9 +99,9 @@ def regions() -> tuple[tuple[str, int], ...]:
 
 
 def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
-    """Comb1, comb2, unpool, rnorm, fin and out of ``rows`` token rows,
-    placed by ``bases``. Rnorm's CTAs must not run unpool: the kernel calls
-    unpool and fin together (fin keeps unpool's values in registers)."""
+    """Comb1, comb2, unpool, rnorm and out of ``rows`` token rows, placed by
+    ``bases``. Rnorm's CTAs must not run unpool: the kernel calls rnorm
+    first, and rnorm waits for every unpool task."""
     comb, unpool, rnorm, out = placement(bases, ("comb", "unpool", "rnorm", "out"))
     c, u = int(COMB_TASKS) * rows, int(UNPOOL_TASKS)
     if (rnorm - unpool) % 256 < u or (unpool - rnorm) % 256 < rows:
@@ -109,7 +111,6 @@ def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
         Stage("comb2", c, comb, reads=("ss3",), writes=("cmb",)),
         Stage("unpool", u, unpool, reads=("cmb", "hp"), writes=("ffn",)),
         Stage("rnorm", rows, rnorm, reads=("ffn",), writes=("fnorm",)),
-        Stage("fin", u, unpool, reads=("fnorm",)),
         Stage("out", int(OUT_TASKS) * rows, out, reads=("ffn", "fnorm")),
     )
 
@@ -277,15 +278,9 @@ def unpool_stages(
     post_gain,
     alpha,
     beta,
-    h_next,
-    tap,
-    tap_col,
-    tap_row,
     RANK: gl.constexpr,
-    TAP: gl.constexpr,
 ):
-    """Unpool and fin task ``task``: owned hidden columns ``16 task ..`` of
-    every row.
+    """Unpool task ``task``: owned hidden columns ``16 task ..`` of every row.
 
     Args:
         w: This rank's post-expert projection rows, BF16 ``[1024, 4096]``
@@ -293,12 +288,6 @@ def unpool_stages(
         post_gain: FP32 ``bf16(w + 1)`` of the post-FFN norm, owned columns.
         alpha: FP32 residual-gate coefficient of the FFN, owned columns.
         beta: FP32 residual-gate coefficient of the FFN, all 8192 columns.
-        h_next: Where the owned FP32 residual ``h''`` goes, ``[rows, 1024]``.
-        tap, tap_col, tap_row: With ``TAP``, a BF16 buffer on the Iris
-            symmetric heap where every rank's copy gets ``bf16(h'')`` of the
-            owned columns: row ``r``, column ``c`` (of 8192) at ``tap + r
-            tap_row + tap_col + c``. A draft reads this residual (the one
-            entering the next layer) as a tap. Unused without ``TAP``.
     """
     R: gl.constexpr = schedule.rows(mb.plan)
     nw: gl.constexpr = gl.num_warps()
@@ -404,41 +393,41 @@ def unpool_stages(
         mb.put_peer("ffn", p, idx, word, mask=put)
     mb.stamp("unpool", trace.END)
 
-    mb.stamp("fin", trace.START)
-    _fnorm_ready(mb)
-    (got,) = mb.poll_many(("fnorm",), (mb.row_offset(r2) + 0 * j2,))
-    mb.stamp("fin", trace.READY)
-    # [RP, 8]: each pair's row scale (padded rows repeat the last row's).
-    inv = got.to(gl.float32, bitcast=True)
-    at = h_next + r2 * OWNED + c2
-    keep = (r2 < R) & (j2 >= 0)
-    h_lo = gl.fma(b2_lo, y_lo * inv, ah_lo)
-    h_hi = gl.fma(b2_hi, y_hi * inv, ah_hi)
-    gl.store(at, h_lo, mask=keep)
-    gl.store(at + 1, h_hi, mask=keep)
-    if TAP:
-        # The draft's tap of the residual, rounded once to BF16 as the
-        # regular capture rounds the FP32 stream, into every rank's buffer.
-        # Its reader runs after later collectives of the forward, which
-        # order these stores before it.
-        t_at = tap + r2.to(gl.int64) * tap_row + tap_col + RANK * OWNED + c2
-        for p in gl.static_range(WORLD):
-            peer_at = mb.peers.translate(t_at, p)
-            gl.store(peer_at, h_lo.to(gl.bfloat16), mask=keep)
-            gl.store(peer_at + 1, h_hi.to(gl.bfloat16), mask=keep)
-    mb.stamp("fin", trace.END)
-
 
 @gluon.jit
-def out_stage(mb, task, beta, in_gain, a_out, STAGE: gl.constexpr):
+def out_stage(
+    mb,
+    task,
+    beta,
+    in_gain,
+    a_out,
+    h_next,
+    tap,
+    tap_col,
+    tap_row,
+    RANK: gl.constexpr,
+    TAP: gl.constexpr,
+    WHOLE_ROWS: gl.constexpr,
+    STAGE: gl.constexpr,
+):
     """Out task ``task``: next attention input values ``512 (task % 16) ..``
     of row ``task // 16`` to ``a_out`` (BF16 ``[rows, 8192]``), from every
-    rank's ``ffn``.
+    rank's ``ffn``. The residual ``h''`` goes to ``h_next``: with
+    ``WHOLE_ROWS`` every task stores its columns (each rank then holds whole
+    rows, for a next layer on the regular path), else the tasks of the rank's
+    owned columns store those.
 
     Args:
         beta: FP32 residual-gate coefficient of the FFN, all 8192 columns.
         in_gain: FP32 ``bf16(w + 1)`` of the next layer's input norm, all
             8192 columns.
+        h_next: Where the FP32 residual ``h''`` goes: ``[rows, 8192]`` with
+            ``WHOLE_ROWS``, else the owned columns, ``[rows, 1024]``.
+        tap, tap_col, tap_row: With ``TAP``, a BF16 buffer on the Iris
+            symmetric heap where every rank's copy gets ``bf16(h'')`` of the
+            owned columns: row ``r``, column ``c`` (of 8192) at ``tap + r
+            tap_row + tap_col + c``. A draft reads this residual (the one
+            entering the next layer) as a tap. Unused without ``TAP``.
     """
     mb.stamp(STAGE, trace.START)
     row, task, _ = schedule.row_task(mb.plan, task, OUT_TASKS)
@@ -472,4 +461,25 @@ def out_stage(mb, task, beta, in_gain, a_out, STAGE: gl.constexpr):
     )
     word = _bf16_word(h_lo * inv2 * in_lo, h_hi * inv2 * in_hi)
     gl.store(a_out.to(gl.pointer_type(gl.int32), bitcast=True) + i, word)
+    if WHOLE_ROWS:
+        # The same arithmetic on every rank as on the owner of the columns:
+        # the whole rows match a gather of every rank's owned columns.
+        at = h_next + row * HIDDEN + c
+        gl.store(at, h_lo)
+        gl.store(at + 1, h_hi)
+    if task // (OUT_TASKS // WORLD) == RANK:
+        # The owned columns: the residual output and the draft's tap.
+        if not WHOLE_ROWS:
+            at = h_next + row * OWNED + c - RANK * OWNED
+            gl.store(at, h_lo)
+            gl.store(at + 1, h_hi)
+        if TAP:
+            # Rounded once to BF16 as the regular capture rounds the FP32
+            # stream, into every rank's buffer. Its reader runs after later
+            # collectives of the forward, which order these stores before it.
+            t_at = tap + row.to(gl.int64) * tap_row + tap_col + c
+            for p in gl.static_range(WORLD):
+                peer_at = mb.peers.translate(t_at, p)
+                gl.store(peer_at, h_lo.to(gl.bfloat16))
+                gl.store(peer_at + 1, h_hi.to(gl.bfloat16))
     mb.stamp(STAGE, trace.END)

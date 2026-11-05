@@ -411,6 +411,7 @@ def muse_spark_layer_decode(
     peer_bases: torch.Tensor,
     layer_index: int,
     chain: int,
+    whole_rows: bool,
     tap: torch.Tensor | None,
     tap_slot: int | None,
     warm_next: FusedDecodeLayer | None,
@@ -423,8 +424,11 @@ def muse_spark_layer_decode(
 
     Args:
         layer: From :func:`prepare_muse_spark_layer`.
-        h, h_out: FP32 ``[rows, 1024]``: the rank's owned residual columns
-            (``1024 rank ..``) before and after the layer.
+        h: FP32 ``[rows, 1024]``: the rank's owned residual columns
+            (``1024 rank ..``) before the layer.
+        h_out: FP32: the residual after the layer, whole ``[rows, 8192]``
+            rows on every rank with ``whole_rows``, else the owned columns
+            ``[rows, 1024]``.
         a, a_out: BF16 ``[rows, 8192]``: the layer's attention input (normed
             with its input norm) and the next layer's. Outputs alias no
             input.
@@ -445,6 +449,9 @@ def muse_spark_layer_decode(
             forward alternate its parity.
         chain: Tokens a request: 1 for decode, ``k + 1`` for a verify of
             ``k`` draft tokens. The rows are whole requests.
+        whole_rows: Store whole residual rows on every rank (for a next
+            layer on the regular path, which reads whole rows), not the
+            owned columns (for a next fused layer).
         tap: None, or a BF16 ``[rows+, slots, 8192]`` buffer on the Iris
             symmetric heap: the launch also stores the residual after the
             layer (BF16) into slot ``tap_slot`` of every rank's copy, the
@@ -477,6 +484,7 @@ def muse_spark_layer_decode(
         peer_bases=peer_bases,
         layer_index=layer_index,
         chain=chain,
+        whole_rows=whole_rows,
         tap=tap,
         tap_slot=tap_slot,
         warm_next=None if warm_next is None else warm_next.weights,
