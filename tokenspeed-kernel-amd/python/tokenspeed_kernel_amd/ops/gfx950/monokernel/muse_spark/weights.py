@@ -81,7 +81,7 @@ class LayerWeights:
     pre_exp_gain: torch.Tensor  # FP32 [POOLED]
     pen_gain: torch.Tensor  # FP32 [POOL_OWNED], post-expert norm
     post: torch.Tensor  # BF16 tiles [OWNED, POOLED]
-    post_gain: torch.Tensor  # FP32 [OWNED], post-FFN norm
+    post_gain: torch.Tensor  # FP32 [HIDDEN], post-FFN norm: out reads it all
     alpha2: torch.Tensor  # FP32 [OWNED]
     beta2: torch.Tensor  # FP32 [HIDDEN]: every rank's out stage reads it all
     in_gain: torch.Tensor  # FP32 [HIDDEN], the next layer's input norm
@@ -334,7 +334,7 @@ def pack_layer(
         pre_exp_gain=pre_exp_gain.contiguous(),
         pen_gain=pen_gain[pool_own].contiguous(),
         post=bf16_tiles(post[own]),
-        post_gain=post_gain[own].contiguous(),
+        post_gain=post_gain.contiguous(),
         alpha2=alpha2[own],
         beta2=beta2,
         in_gain=in_gain.contiguous(),

@@ -86,6 +86,7 @@ def moe_tail_kernel(
         moe_tail.out_stage(
             mb,
             task,
+            post_gain,
             beta,
             in_gain,
             a_out,
@@ -194,7 +195,7 @@ def _worker(rank: int, port: int, rows: int) -> None:
                 group.bases,
                 pen[own_pool].to(device),
                 bf16_tiles(w_post[own].contiguous()).to(device),
-                post[own].to(device),
+                post.to(device),
                 alpha[own].to(device),
                 beta.to(device),
                 ing.to(device),
