@@ -474,6 +474,62 @@ class Mailbox:
         _put(ptrs, payload, self.tag, mask, "sys")
 
     @gluon.jit
+    def _words(self, region: gl.constexpr):
+        """``int32`` base pointer of local region ``region``'s 32-bit words
+        (a region of ``n`` pairs holds ``2 n`` words)."""
+        gl.static_assert(
+            not schedule.is_peer(self.plan, region), "plain words are local only"
+        )
+        return (self.scratch + self._base(region)).to(
+            gl.pointer_type(gl.int32), bitcast=True
+        )
+
+    @gluon.jit
+    def store_words(self, region: gl.constexpr, index, values, mask=None):
+        """Store 32-bit ``values`` at word ``index`` of ``region`` without
+        tags, for a producer that writes many values and one flag
+        (:meth:`raise_flag`) instead of a tagged pair each.
+
+        The stores are vector buffer stores that write through to memory
+        (``sc0 sc1``), so a consumer on another XCD reads them past its L2
+        after it sees the flag (:meth:`load_words`). Word indices count
+        from row 0's copy: row ``r``'s copy starts at word
+        ``2 * row_offset(r)``."""
+        gl.amd.cdna4.buffer_store(
+            values.to(gl.int32, bitcast=True),
+            self._words(region),
+            index,
+            mask=mask,
+            cache=".wt",
+        )
+
+    @gluon.jit
+    def raise_flag(self, region: gl.constexpr, index):
+        """Publish the CTA's earlier :meth:`store_words` with the flag pair
+        ``index`` of ``region``: every wave waits for its stores to land (on
+        gfx9 ``vmcnt`` counts stores), the CTA meets at a barrier, then one
+        thread puts the pair. A consumer polls the flag, then loads the
+        words."""
+        gl.inline_asm("s_waitcnt vmcnt(0)")
+        gl.barrier()
+        lanes = gl.arange(0, 64 * gl.num_warps(), lane_layout(gl.num_warps()))
+        _put(
+            self.scratch + self._base(region) + index + lanes * 0,
+            gl.full(lanes.shape, 1, gl.int32, lanes.type.layout),
+            self.tag,
+            lanes == 0,
+            "gpu",
+        )
+
+    @gluon.jit
+    def load_words(self, region: gl.constexpr, index):
+        """Load the 32-bit words at ``index`` of ``region`` (int32) that a
+        producer published with :meth:`raise_flag`, past the caches
+        (``sc0 sc1``). Call it after the CTA polled the flags and met at a
+        barrier, so no load issues before the poll returns."""
+        return gl.amd.cdna4.buffer_load(self._words(region), index, cache=".cv")
+
+    @gluon.jit
     def poll(self, region: gl.constexpr, index):
         return _payload(
             _poll_n(
