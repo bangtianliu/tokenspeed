@@ -129,6 +129,10 @@ from a measurement:
 2. Change the placement:
    - Put a stage that streams weights on CTAs that are idle while other
      stages produce its inputs, so that its loads overlap the wait.
+   - A task behind another task on its CTA starts its weight stream only
+     when that task ends: read `START`, not only `READY`. On Muse Spark's
+     8-row layers, oproj behind the merge and the router behind oproj each
+     reached their inputs 3 to 4 us late.
    - CTAs without a task in the first two stages sleep for a short time
      first (`schedule.head_sleep`). Without this, their weight streams
      compete with the critical path.

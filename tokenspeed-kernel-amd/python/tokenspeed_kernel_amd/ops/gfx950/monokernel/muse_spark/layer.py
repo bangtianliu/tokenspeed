@@ -100,7 +100,11 @@ BASES = {
 # its weight stream, alpha-h logits and their puts finish before the tail's
 # b lands: after oproj, they made its ready ~6.6 us past its start, ~4.5 us
 # past b. The pool moves past the router's CTAs: its input lands late.
-CHAINED_BASES = {**BASES, "tail": 64, "router": 160, "pool": 224}
+# The merge (16 tasks per row) leaves oproj's CTAs 0 .. 127: oproj streams
+# its 128 KiB of weights before it polls z, and behind a merge task that
+# stream started only at the merge's end (~19 us on a sliding layer), which
+# put oproj's ready ~4 us past the last merge.
+CHAINED_BASES = {**BASES, "tail": 64, "router": 160, "pool": 224, "merge": 128}
 
 
 def _bases(rows: int, *names: str) -> dict[str, int]:
