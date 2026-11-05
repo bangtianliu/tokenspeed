@@ -46,9 +46,12 @@ layers' ``window_left`` of 2047 plus the row's own key).
   chunk of at most 128 (16 splits hold the 2040) with a base-2 softmax; every row's 8 heads are one
   MFMA row each (64 rows). The last split also takes the block's 8 keys from
   ``kb`` / ``vb``, as one more chunk, for every row (non-causal). A task
-  publishes FP32 ``acc / l`` and the LSE (``-inf`` for an empty split).
-* merge, 8 tasks per row, one per q head: the LSE merge of the splits, BF16,
-  published in ``ao`` for the output projection.
+  publishes FP32 ``acc / l`` and the LSE (``-inf`` for an empty split) as
+  plain words, then one flag (``Mailbox.store_words`` / ``raise_flag``): at
+  8 rows a task writes 64 x 128 values, which as tagged pairs took ~18 us to
+  publish.
+* merge, 8 tasks per row, one per q head: after the splits' flags, the LSE
+  merge of the splits, BF16, published in ``ao`` for the output projection.
 
 The softmax step and the cache loads follow the target layer's
 ``attention.py`` at the draft's head of 128 and single KV head.
@@ -101,8 +104,9 @@ def regions(splits: int) -> tuple[tuple[str, int], ...]:
         ("qh", q * head // 2),  # BF16 pairs of the rotated query heads
         ("kb", head // 2),  # BF16 pairs of the block row's rotated key
         ("vb", head // 2),  # BF16 pairs of the block row's value
-        ("apart", splits * q * head),  # FP32 [split][head][dim] acc / l
-        ("alse", splits * q),  # FP32 [split][head] LSE
+        ("apart", splits * q * head),  # FP32 words [split][head][dim] acc / l
+        ("alse", splits * q),  # FP32 words [split][head] LSE
+        ("aflag", splits),  # a flag per attn task, in row 0
         ("ao", q * head // 2),  # BF16 pairs of the attention output
         ("opart", int(OPROJ_KPARTS) * hidden),  # FP32 [K part][column]
     )
@@ -153,12 +157,18 @@ def stages(bases: dict[str, int], splits: int, rows: int) -> tuple[Stage, ...]:
             reads=("qpart",),
             writes=("qh", "kb", "vb"),
         ),
-        Stage("attn", splits, attn, reads=("qh", "kb", "vb"), writes=("apart", "alse")),
+        Stage(
+            "attn",
+            splits,
+            attn,
+            reads=("qh", "kb", "vb"),
+            writes=("apart", "alse", "aflag"),
+        ),
         Stage(
             "merge",
             int(Q_HEADS) * rows,
             merge,
-            reads=("apart", "alse"),
+            reads=("apart", "alse", "aflag"),
             writes=("ao",),
         ),
         Stage("oproj", int(OPROJ_TASKS), oproj, reads=("ao",), writes=("opart",)),
@@ -438,18 +448,21 @@ def attn_stage(
     r = gl.arange(0, QM, gl.SliceLayout(1, pv_mma))
     c = gl.arange(0, HEAD, gl.SliceLayout(0, pv_mma))
     part = (s * Q_HEADS + r[:, None] % Q_HEADS) * HEAD + c[None, :]
-    mb.put(
+    # Plain words (row r's copy starts at word 2 row_offset(r)), then one
+    # flag: as tagged pairs, the 64 x 128 values took ~18 us to publish.
+    mb.store_words(
         "apart",
-        mb.row_offset(r[:, None] // Q_HEADS) + part,
-        out.to(gl.int32, bitcast=True),
+        2 * mb.row_offset(r[:, None] // Q_HEADS) + part,
+        out,
         mask=(r < R * Q_HEADS)[:, None] & (c >= 0)[None, :],
     )
-    mb.put(
+    mb.store_words(
         "alse",
-        mb.row_offset(qi // Q_HEADS) + s * Q_HEADS + qi % Q_HEADS,
-        lse.to(gl.int32, bitcast=True),
+        2 * mb.row_offset(qi // Q_HEADS) + s * Q_HEADS + qi % Q_HEADS,
+        lse,
         mask=qi < R * Q_HEADS,
     )
+    mb.raise_flag("aflag", s)
     mb.stamp(STAGE, trace.END)
 
 
@@ -459,15 +472,18 @@ def merge_stage(mb, task, SPLITS: gl.constexpr, STAGE: gl.constexpr):
     LSE merge of the splits, rounded to BF16, into ``ao``."""
     mb.stamp(STAGE, trace.START)
     row, h, _ = schedule.row_task(mb.plan, task, Q_HEADS)
+    # The splits' flags sit in row 0 (one request a launch).
+    flag0 = -row * schedule.row_pairs(mb.plan)
     mb = mb.row(row)
     nw: gl.constexpr = gl.num_warps()
     ml: gl.constexpr = gl.BlockedLayout([1, 1], [2, 32], [nw, 1], [1, 0])
     s = gl.arange(0, SPLITS, gl.SliceLayout(1, ml))
     c = gl.arange(0, HEAD, gl.SliceLayout(0, ml))
-    got_p, got_l = mb.poll_many(
-        ("apart", "alse"),
-        ((s[:, None] * Q_HEADS + h) * HEAD + c[None, :], s * Q_HEADS + h),
-    )
+    mb.poll_many(("aflag",), (flag0 + s,))
+    # Every split's flag is in: the words load after the poll returned.
+    gl.barrier()
+    got_p = mb.load_words("apart", (s[:, None] * Q_HEADS + h) * HEAD + c[None, :])
+    got_l = mb.load_words("alse", s * Q_HEADS + h)
     mb.stamp(STAGE, trace.READY)
     lse = got_l.to(gl.float32, bitcast=True)
     top = gl.max(lse, axis=0)
