@@ -40,7 +40,13 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel_amd._scheduling import sched_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon
-from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox, schedule, trace, warm
+from tokenspeed_kernel_amd.ops.gfx950.monokernel import (
+    code_warm,
+    mailbox,
+    schedule,
+    trace,
+    warm,
+)
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
     attention,
     attn_tail,
@@ -111,6 +117,9 @@ KV_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
 # expert weights streaming after them would evict them. The comb tasks start
 # at CTA 64.
 WARM_TASKS = 64
+# CTAs 0 .. CODE_TASKS - 1 first read the launch's own code into the L2s
+# (code_warm.py): 8 tasks on each XCD.
+CODE_TASKS = 64
 
 
 def layer_plan(full: bool, rows: int, chain: int, warm_next: bool) -> Plan:
@@ -139,7 +148,8 @@ def layer_plan(full: bool, rows: int, chain: int, warm_next: bool) -> Plan:
         + moe_tail.regions()
     )
     stages = (
-        qkvg.stages(_bases(rows, "qkvg", "gate"))
+        (Stage("code", CODE_TASKS, 0),)
+        + qkvg.stages(_bases(rows, "qkvg", "gate"))
         + attention.stages(_bases(rows, "head", "attn", "merge"), splits, rows, chain)
         + attn_tail.stages(_bases(rows, "oproj", "tail"), rows)
         + moe_route.stages(_bases(rows, "router", "topk"), rows)
@@ -168,8 +178,9 @@ def layer_plan(full: bool, rows: int, chain: int, warm_next: bool) -> Plan:
 
 # The layer index changes every launch: a specialization on it (1, or a
 # multiple of 16) would compile new binaries while serving. The warm word
-# count is the next layer's, a runtime value too.
-@gluon.jit(do_not_specialize=("layer", "warm_quads"))
+# count is the next layer's, a runtime value too. The code range is the
+# compiled binary's own, known only after the compile.
+@gluon.jit(do_not_specialize=("layer", "warm_quads", "code_offset", "code_quads"))
 def gluon_muse_spark_layer_gfx950(
     scratch,
     step,
@@ -182,6 +193,8 @@ def gluon_muse_spark_layer_gfx950(
     tap_row,
     warm_ptr,
     warm_quads,
+    code_offset,
+    code_quads,
     trace_buf,
     PLAN: gl.constexpr,
     RANK: gl.constexpr,
@@ -207,10 +220,22 @@ def gluon_muse_spark_layer_gfx950(
     columns.
     ``warm_ptr``, ``warm_quads``: the next launch's packed QKVG weights, read
     (``4 * warm_quads`` int32 words) only when ``PLAN`` has the warm stage.
+    ``code_offset``, ``code_quads``: this binary's ``code_warm.text_range``.
     """
     table = trace.allocate(trace_buf)
     peers = mailbox.load_peers(bases, RANK, layer & 1, WORLD)
     mb = mailbox.Mailbox(scratch, mailbox.launch_tag(step, layer), PLAN, table, peers)
+    task, active = schedule.stage_task(PLAN, "code")
+    if active:
+        code_warm.code_warm_stage(
+            mb,
+            task,
+            schedule.stage_tasks(PLAN, "code"),
+            scratch,
+            code_offset,
+            code_quads,
+            "code",
+        )
     (
         w_qkvg,
         a_in,
@@ -443,33 +468,43 @@ def launch_layer(
             raise ValueError("warm_next: contiguous, a whole number of 16-byte quads")
         # The warm stage reads int32 words: the same bytes, viewed.
         warm_args = (warm_next.view(-1).view(torch.int32), warm_next.nbytes // 16)
-    args = (
-        scratch,
-        step,
-        layer,
-        bases,
-        attn_ops,
-        moe_ops,
-        *tap_args,
-        *warm_args,
-        trace_buf,
-        plan.key,
-        rank,
-        FULL_SPLITS if full else SLIDING_SPLITS,
-        0 if full else WINDOW,
-        not full,
-        tap is not None,
-        whole_rows,
+
+    def kernel_args(code: tuple[int, int]) -> tuple:
+        return (
+            scratch,
+            step,
+            layer,
+            bases,
+            attn_ops,
+            moe_ops,
+            *tap_args,
+            *warm_args,
+            *code,
+            trace_buf,
+            plan.key,
+            rank,
+            FULL_SPLITS if full else SLIDING_SPLITS,
+            0 if full else WINDOW,
+            not full,
+            tap is not None,
+            whole_rows,
+        )
+
+    # The device library of _scheduling.wave_uniform_i32 (attention.py).
+    kernel = gluon_muse_spark_layer_gfx950.warmup(
+        *kernel_args((0, 0)),
+        num_warps=8,
+        grid=(plan.grid,),
+        **sched_compile_options(),
     )
     if compile_only:
-        # The device library of _scheduling.wave_uniform_i32 (attention.py).
-        gluon_muse_spark_layer_gfx950.warmup(
-            *args, num_warps=8, grid=(plan.grid,), **sched_compile_options()
-        )
-    else:
-        gluon_muse_spark_layer_gfx950[(plan.grid,)](
-            *args, num_warps=8, **sched_compile_options()
-        )
+        return
+    # The code range is a runtime argument: the same binary.
+    gluon_muse_spark_layer_gfx950[(plan.grid,)](
+        *kernel_args(code_warm.text_range(kernel)),
+        num_warps=8,
+        **sched_compile_options(),
+    )
 
 
 def launch_gluon_muse_spark_layer_gfx950(

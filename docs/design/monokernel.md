@@ -21,7 +21,7 @@ its context write after a verify (fc, hidden_norm and the K/V of every layer).
 
 | Layer | Path | Holds |
 |---|---|---|
-| Runtime building blocks | `tokenspeed_kernel_amd/ops/gfx950/monokernel/` | `plan.py`: stages, placement, regions, the deadlock check. `schedule.py`: a kernel's view of its plan (which tasks this CTA runs). `mailbox.py`: tagged put / poll, throttling. `mx.py`: MXFP4 x MXFP4 split-K GEMV, MXFP4 and BF16 publishing. `bf16.py`: BF16 x BF16 GEMV. `trace.py`: per-stage timestamps. `warm.py`: warm tasks that read the next launch's weights into the memory-side cache. `weights.py`: tile and scale layouts. |
+| Runtime building blocks | `tokenspeed_kernel_amd/ops/gfx950/monokernel/` | `plan.py`: stages, placement, regions, the deadlock check. `schedule.py`: a kernel's view of its plan (which tasks this CTA runs). `mailbox.py`: tagged put / poll, throttling. `mx.py`: MXFP4 x MXFP4 split-K GEMV, MXFP4 and BF16 publishing. `bf16.py`: BF16 x BF16 GEMV. `trace.py`: per-stage timestamps. `warm.py`: warm tasks that read the next launch's weights into the memory-side cache. `code_warm.py`: code tasks that read the launch's own code into the L2s. `weights.py`: tile and scale layouts. |
 | Model stages | `.../monokernel/<model>/` (`qwen4_exp/`, `muse_spark/`) | One module per block (for `qwen4_exp`: `hc.py`, `ple.py`, `gdn.py`, `qsa.py`, `out_proj.py`, `moe.py`) with its regions, stages and operand bundles. `dims.py`: shared dimensions. `layer.py`: the layer plans, kernels and launchers. `weights.py`: weight packing. |
 | Kernel boundary | `tokenspeed_kernel/ops/monokernel/` | `prepare_*` and `*_decode`, through `select_kernel`. `prepare_*` packs once after loading and returns `None` when no kernel serves the layer. `README.md` is the guide for adding a model. |
 | Runtime seam | `runtime/models/<model>_monokernel.py` | `Qwen4ExpMonokernels`, `MuseSparkMonokernels`: eligibility with reasons, packing from the model's modules, the step counter, and `plan()` once per forward. `MonokernelStep.layer(i)`: the launch that replaces layer `i`. `DFlash2Monokernels` (`dflash2_monokernel.py`): the draft's launches, which replace its whole layer loop. `decode_monokernel.py`: the shared startup report. |
@@ -120,6 +120,16 @@ wave spin on hint pairs before a wide poll.
 `mailbox.MAX_RETRIES` retries, at least about 8 s, where a launch takes about
 100 us. A deadlock or a missing producer then gives a GPU error
 (`hipErrorLaunchFailure`) and the process stops, instead of a hang.
+
+**A launch first reads its own code into the L2s.** A layer kernel's code
+(~100 KB) is larger than the instruction cache, and the weights that stream
+through the L2 evict it during a launch. Each stage then waits on its
+instructions from the memory-side cache or HBM, one stage after another on
+the critical path: ~20 us a launch, ~30 more after a launch of another
+binary (a sliding layer after a full one). So the first stage of a launch
+(`code`, 8 tasks on each XCD) loads its own `.text` as data
+(`code_warm.py`). Code size still costs time: keep compute-light stages
+rolled (`range`, not `static_range`) where they run once a launch.
 
 **A tensor-parallel group runs one plan.** In a plan of `world` > 1 ranks,
 every rank runs the same stages, and a stage can put into another rank's
