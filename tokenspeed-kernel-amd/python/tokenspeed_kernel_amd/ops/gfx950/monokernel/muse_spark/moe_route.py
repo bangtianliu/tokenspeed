@@ -191,6 +191,115 @@ def _router_rows(
         mb.put_peer("lg", p, at, word, mask=put)
 
 
+# The top-8 asm operands: 16 results, 2 VGPR and 14 SGPR temporaries, 2 inputs.
+_TOP8_CONSTRAINTS = gl.constexpr(
+    (
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&v",
+        "=&v",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "=&s",
+        "v",
+        "v",
+    )
+)
+
+
+@gluon.constexpr_function
+def _top8_asm(outputs, inputs):
+    """The top 8 of a wave's 256 choices (4 a lane, expert 4 lane + j in
+    register j): 8 passes of the wave max (DPP), the lowest expert at it
+    (lane masks and s_ff1) and its removal. Returns the ids and the scores
+    at them as uniform scalars."""
+    ids = [o[0] for o in outputs[0:8]]
+    picks = [o[0] for o in outputs[8:16]]
+    cw, t = outputs[16], outputs[17]
+    masks = [o[0] for o in outputs[18:22]]
+    any_, lane, j = outputs[22][0], outputs[23][0], outputs[24][0]
+    r = [o[0] for o in outputs[25:30]]
+    cur, val = outputs[30][0], outputs[31][0]
+    c_in, score = inputs
+    nop = "s_nop 1"
+    a = [f"v_mov_b32 {d}, {x}" for d, x in zip(cw, c_in)]
+    for k in range(8):
+        a += [
+            f"v_max3_f32 {t[0]}, {cw[0]}, {cw[1]}, {cw[2]}",
+            f"v_max_f32 {t[0]}, {t[0]}, {cw[3]}",
+        ]
+        for ctrl in (
+            "quad_perm:[1,0,3,2]",
+            "quad_perm:[2,3,0,1]",
+            "row_half_mirror",
+            "row_mirror",
+            "row_bcast:15 row_mask:0xa",
+            "row_bcast:31 row_mask:0xc",
+        ):
+            a += [nop, f"v_max_f32_dpp {t[0]}, {t[0]}, {t[0]} {ctrl}"]
+        best = r[0]
+        a += [nop, f"v_readlane_b32 {best}, {t[0]}, 63"]
+        for jj in range(4):
+            a += [f"v_cmp_eq_f32_e64 {masks[jj]}, {cw[jj]}, {best}"]
+        a += [
+            f"s_or_b64 {any_}, {masks[0]}, {masks[1]}",
+            f"s_or_b64 {any_}, {any_}, {masks[2]}",
+            f"s_or_b64 {any_}, {any_}, {masks[3]}",
+            f"s_ff1_i32_b64 {lane}, {any_}",
+            f"s_mov_b32 {j}, 3",
+        ]
+        for jj in (2, 1, 0):
+            a += [f"s_bitcmp1_b64 {masks[jj]}, {lane}", f"s_cselect_b32 {j}, {jj}, {j}"]
+        a += [
+            f"s_lshl_b32 {ids[k]}, {lane}, 2",
+            f"s_add_u32 {ids[k]}, {ids[k]}, {j}",
+            "s_nop 3",
+        ]
+        for jj in range(4):
+            a += [f"v_readlane_b32 {r[1 + jj]}, {score[jj]}, {lane}"]
+        a += [f"s_mov_b32 {picks[k]}, {r[4]}"]
+        for jj in (2, 1, 0):
+            a += [
+                f"s_cmp_eq_u32 {j}, {jj}",
+                f"s_cselect_b32 {picks[k]}, {r[1 + jj]}, {picks[k]}",
+            ]
+        # Remove the pick: -inf in register j of lane `lane` (a one-lane mask;
+        # a VALU op reads one SGPR on gfx9, so -inf goes in a VGPR).
+        a += [f"v_mov_b32 {t[0]}, 0xff800000", f"s_lshl_b64 {any_}, 1, {lane}"]
+        for jj in range(4):
+            a += [
+                f"s_cmp_eq_u32 {j}, {jj}",
+                f"s_cselect_b64 {masks[jj]}, {any_}, 0",
+                f"v_cndmask_b32_e64 {cw[jj]}, {cw[jj]}, {t[0]}, {masks[jj]}",
+            ]
+    return "\n".join(a)
+
+
 @gluon.jit
 def topk_stage(mb, task, bias, STAGE: gl.constexpr):
     """The top-8 of row ``task``'s summed logits (``bias``: FP32 ``[256]``)."""
@@ -226,20 +335,66 @@ def topk_stage(mb, task, bias, STAGE: gl.constexpr):
     # An exact division: the scores decide which experts a near tie picks.
     score = 1.0 / (1.0 + gl.exp(-(logit * ROUTER_SCALE)))
     choice = score + bias_w
+    # The 8 passes (max, then the lowest expert at it) by hand: the wave
+    # reductions Triton emits cost hundreds of cycles each, 3 a pass.
+    one: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
+    tile = gl.arange(0, 64 * nw, one)
+    vt: gl.constexpr = tile.type.with_element_ty(gl.float32)
+    res = gl.inline_asm(
+        _top8_asm,
+        _TOP8_CONSTRAINTS,
+        [choice, score],
+        [
+            gl.int32,
+            gl.int32,
+            gl.int32,
+            gl.int32,
+            gl.int32,
+            gl.int32,
+            gl.int32,
+            gl.int32,
+            gl.float32,
+            gl.float32,
+            gl.float32,
+            gl.float32,
+            gl.float32,
+            gl.float32,
+            gl.float32,
+            gl.float32,
+            choice.type,
+            vt,
+            gl.int64,
+            gl.int64,
+            gl.int64,
+            gl.int64,
+            gl.int64,
+            gl.int32,
+            gl.int32,
+            gl.int32,
+            gl.int32,
+            gl.int32,
+            gl.int32,
+            gl.int32,
+            gl.int32,
+            gl.int32,
+        ],
+        is_pure=True,
+    )
     slot = gl.arange(0, TOP_K, gl.BlockedLayout([1], [64], [nw], [0]))
     ids = gl.zeros([TOP_K], gl.int32, slot.type.layout)
     picked = gl.zeros([TOP_K], gl.float32, slot.type.layout)
     for k in gl.static_range(TOP_K):
-        best = gl.max(choice, axis=0)
-        first = gl.min(gl.where(choice == best, ew, EXPERTS), axis=0)
-        ids = gl.where(slot == k, first, ids)
-        picked = gl.where(
-            slot == k, gl.sum(gl.where(ew == first, score, 0.0), axis=0), picked
-        )
-        choice = gl.where(ew == first, float("-inf"), choice)
-    total = gl.sum(picked, axis=0)
+        ids = gl.where(slot == k, res[k], ids)
+    # The experts stages read only the ids: publish them first.
+    mb.put("route", slot, ids)
+    for k in gl.static_range(TOP_K):
+        picked = gl.where(slot == k, res[8 + k], picked)
+    # The sum on the uniform scalars, in the pairwise order of a lane
+    # butterfly (gl.sum's order): a cross-wave gl.sum costs an LDS round trip.
+    total = ((res[8] + res[9]) + (res[10] + res[11])) + (
+        (res[12] + res[13]) + (res[14] + res[15])
+    )
     weight = picked / gl.where(total == 0.0, 1.0, total)
     mb.stamp(STAGE, trace.COMPUTED)
-    mb.put("route", slot, ids)
     mb.put("route", TOP_K + slot, weight.to(gl.int32, bitcast=True))
     mb.stamp(STAGE, trace.END)
