@@ -51,6 +51,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
     attention,
     attn_tail,
     moe_experts,
+    moe_experts_bf16,
     moe_pool,
     moe_route,
     moe_tail,
@@ -203,6 +204,7 @@ def gluon_muse_spark_layer_gfx950(
     ROPE: gl.constexpr,
     TAP: gl.constexpr,
     WHOLE_ROWS: gl.constexpr,
+    BF16_EXPERTS: gl.constexpr,
 ):
     """One decode step of one layer on rank ``RANK``.
 
@@ -217,7 +219,8 @@ def gluon_muse_spark_layer_gfx950(
     ``tap``, ``tap_col``, ``tap_row``: with ``TAP``, where the residual
     after the layer also goes, BF16 on every rank (``moe_tail.out_stage``).
     ``WHOLE_ROWS``: the residual output holds whole FP32 rows, not the owned
-    columns.
+    columns. ``BF16_EXPERTS``: the experts are BF16 (``moe_experts_bf16``;
+    the scale operands are unused).
     ``warm_ptr``, ``warm_quads``: the next launch's packed QKVG weights, read
     (``4 * warm_quads`` int32 words) only when ``PLAN`` has the warm stage.
     ``code_offset``, ``code_quads``: this binary's ``code_warm.text_range``.
@@ -338,49 +341,66 @@ def gluon_muse_spark_layer_gfx950(
     got1, gain_lo, gain_hi, ids, e1, e2 = moe_experts.ex1_poll(
         mb, task1, task2, active1, pre_exp_gain, "ex1"
     )
-    loads1 = moe_experts.ex1_issue(
-        task1, active1, e1, w13, w13s, s13_we, s13_se, s13_lin, s13_nb
-    )
-    union = moe_experts.slots(ids)
-    a1 = moe_experts.ex1_operand(task1, got1, gain_lo, gain_hi)
-    if active1:
-        moe_experts.ex1_finish(
-            mb,
-            task1,
-            a1,
-            loads1,
-            e1,
-            union,
-            w13,
-            w13s,
-            s13_we,
-            s13_se,
-            s13_lin,
-            s13_nb,
-            "ex1",
+    if BF16_EXPERTS:
+        loads1 = moe_experts_bf16.ex1_issue(task1, active1, e1, w13, s13_we)
+        union = moe_experts.slots(ids)
+        a1 = moe_experts_bf16.ex1_operand(task1, got1, gain_lo, gain_hi)
+        if active1:
+            moe_experts_bf16.ex1_finish(
+                mb, task1, a1, loads1, union, w13, s13_we, "ex1"
+            )
+        task, active = schedule.stage_task(PLAN, "exr")
+        if active:
+            moe_experts.exr_stage(mb, task, union, True, "exr")
+        loads2 = moe_experts_bf16.ex2_issue(mb, task2, active2, e2, w2, s2_we, "ex2")
+        if active2:
+            moe_experts_bf16.ex2_finish(
+                mb, task2, loads2, union, w2, s2_we, RANK, "ex2"
+            )
+    else:
+        loads1 = moe_experts.ex1_issue(
+            task1, active1, e1, w13, w13s, s13_we, s13_se, s13_lin, s13_nb
         )
-    task, active = schedule.stage_task(PLAN, "exr")
-    if active:
-        moe_experts.exr_stage(mb, task, union, "exr")
-    loads2 = moe_experts.ex2_issue(
-        mb, task2, active2, e2, w2, w2s, s2_we, s2_se, s2_lin, s2_nb, "ex2"
-    )
-    if active2:
-        moe_experts.ex2_finish(
-            mb,
-            task2,
-            loads2,
-            e2,
-            union,
-            w2,
-            w2s,
-            s2_we,
-            s2_se,
-            s2_lin,
-            s2_nb,
-            RANK,
-            "ex2",
+        union = moe_experts.slots(ids)
+        a1 = moe_experts.ex1_operand(task1, got1, gain_lo, gain_hi)
+        if active1:
+            moe_experts.ex1_finish(
+                mb,
+                task1,
+                a1,
+                loads1,
+                e1,
+                union,
+                w13,
+                w13s,
+                s13_we,
+                s13_se,
+                s13_lin,
+                s13_nb,
+                "ex1",
+            )
+        task, active = schedule.stage_task(PLAN, "exr")
+        if active:
+            moe_experts.exr_stage(mb, task, union, False, "exr")
+        loads2 = moe_experts.ex2_issue(
+            mb, task2, active2, e2, w2, w2s, s2_we, s2_se, s2_lin, s2_nb, "ex2"
         )
+        if active2:
+            moe_experts.ex2_finish(
+                mb,
+                task2,
+                loads2,
+                e2,
+                union,
+                w2,
+                w2s,
+                s2_we,
+                s2_se,
+                s2_lin,
+                s2_nb,
+                RANK,
+                "ex2",
+            )
     if schedule.has_stage(PLAN, "warm"):
         task, active = schedule.stage_task(PLAN, "warm")
         if active:
@@ -445,6 +465,7 @@ def launch_layer(
     rows: int,
     chain: int,
     whole_rows: bool,
+    bf16_experts: bool,
     compile_only: bool,
 ):
     """Launch one layer step of ``rows`` token rows, requests of ``chain``
@@ -488,6 +509,7 @@ def launch_layer(
             not full,
             tap is not None,
             whole_rows,
+            bf16_experts,
         )
 
     # The device library of _scheduling.wave_uniform_i32 (attention.py).
@@ -654,6 +676,7 @@ def launch_gluon_muse_spark_layer_gfx950(
         rows,
         chain,
         whole_rows,
+        weights.bf16_experts,
         compile_only,
     )
 
