@@ -99,19 +99,35 @@ def regions() -> tuple[tuple[str, int], ...]:
         # BF16 pairs of p, FP32 alpha h' [column], then the FP32 sums:
         # [rank][task][sum].
         ("ffn", int(SUMS_AT) + world * int(UNPOOL_TASKS) * int(SUMS)),
+        # BF16 words of the next attention input, and a flag per out task:
+        # for the next layer's qkvg tasks at the end of the launch (qnext).
+        ("anx", int(HIDDEN) // 4),
+        ("anxf", int(OUT_TASKS)),
     )
 
 
-def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
+def stages(
+    bases: dict[str, int], rows: int, out_per_row: int, publish: bool
+) -> tuple[Stage, ...]:
     """Comb1, comb2, unpool and out of ``rows`` token rows, placed by
-    ``bases``."""
+    ``bases``, with ``out_per_row`` out tasks a row (a divisor of 16 and a
+    multiple of 8: a rank's owned columns are whole tasks). With ``publish``
+    out also publishes the next attention input for qnext (``anx``)."""
+    if out_per_row not in (8, 16):
+        raise ValueError(f"out tasks a row: 8 or 16, got {out_per_row}")
     comb, unpool, out = placement(bases, ("comb", "unpool", "out"))
     c, u = int(COMB_TASKS) * rows, int(UNPOOL_TASKS)
     return (
         Stage("comb1", c, comb, reads=("rr", "route"), writes=("ss3",)),
         Stage("comb2", c, comb, reads=("ss3",), writes=("cmb",)),
         Stage("unpool", u, unpool, reads=("cmb", "hp"), writes=("ffn",)),
-        Stage("out", int(OUT_TASKS) * rows, out, reads=("ffn",)),
+        Stage(
+            "out",
+            out_per_row * rows,
+            out,
+            reads=("ffn",),
+            writes=("anx", "anxf") if publish else (),
+        ),
     )
 
 
@@ -386,14 +402,19 @@ def out_stage(
     RANK: gl.constexpr,
     TAP: gl.constexpr,
     WHOLE_ROWS: gl.constexpr,
+    PER_ROW: gl.constexpr,
+    PUBLISH: gl.constexpr,
     STAGE: gl.constexpr,
 ):
-    """Out task ``task``: next attention input values ``512 (task % 16) ..``
-    of row ``task // 16`` to ``a_out`` (BF16 ``[rows, 8192]``), from every
-    rank's ``ffn``. The residual ``h''`` goes to ``h_next``: with
-    ``WHOLE_ROWS`` every task stores its columns (each rank then holds whole
-    rows, for a next layer on the regular path), else the tasks of the rank's
-    owned columns store those.
+    """Out task ``task``: next attention input values ``(8192 / PER_ROW)
+    (task % PER_ROW) ..`` of row ``task // PER_ROW`` to ``a_out`` (BF16
+    ``[rows, 8192]``), from every rank's ``ffn``. The residual ``h''`` goes
+    to ``h_next``: with ``WHOLE_ROWS`` every task stores its columns (each
+    rank then holds whole rows, for a next layer on the regular path), else
+    the tasks of the rank's owned columns store those. With ``PUBLISH`` the
+    task first publishes its values as plain words in ``anx`` and raises
+    its flag in ``anxf`` (for qnext: the launch's own CTAs cannot read
+    ``a_out``'s plain stores).
 
     Args:
         post_gain: FP32 ``bf16(w + 1)`` of the post-FFN norm, all 8192
@@ -410,11 +431,12 @@ def out_stage(
             entering the next layer) as a tap. Unused without ``TAP``.
     """
     mb.stamp(STAGE, trace.START)
-    row, task, _ = schedule.row_task(mb.plan, task, OUT_TASKS)
+    row, task, _ = schedule.row_task(mb.plan, task, PER_ROW)
     mb = mb.row(row)
     a_out = a_out + row * HIDDEN
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
-    i = task * 256 + gl.arange(0, 256, lanes)
+    WORDS: gl.constexpr = HIDDEN // 2 // PER_ROW
+    i = task * WORDS + gl.arange(0, WORDS, lanes)
     c = 2 * i
     post_lo = gl.load(post_gain + c)
     post_hi = gl.load(post_gain + c + 1)
@@ -435,6 +457,10 @@ def out_stage(
     h_lo = gl.fma(b_lo, y_lo * inv, ah_lo.to(gl.float32, bitcast=True))
     h_hi = gl.fma(b_hi, y_hi * inv, ah_hi.to(gl.float32, bitcast=True))
     word = _bf16_word(h_lo * inv2 * in_lo, h_hi * inv2 * in_hi)
+    if PUBLISH:
+        # First: raise_flag waits for every earlier store of the wave.
+        mb.store_words("anx", i, word)
+        mb.raise_flag("anxf", task)
     gl.store(a_out.to(gl.pointer_type(gl.int32), bitcast=True) + i, word)
     if WHOLE_ROWS:
         # The same arithmetic on every rank as on the owner of the columns:
@@ -442,7 +468,7 @@ def out_stage(
         at = h_next + row * HIDDEN + c
         gl.store(at, h_lo)
         gl.store(at + 1, h_hi)
-    if task // (OUT_TASKS // WORLD) == RANK:
+    if task // (PER_ROW // WORLD) == RANK:
         # The owned columns: the residual output and the draft's tap.
         if not WHOLE_ROWS:
             at = h_next + row * OWNED + c - RANK * OWNED

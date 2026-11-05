@@ -48,6 +48,7 @@ __all__ = [
     "muse_spark_draft_context_decode",
     "muse_spark_draft_head_decode",
     "muse_spark_draft_layer_decode",
+    "MUSE_SPARK_PROJ_WORDS",
     "muse_spark_layer_decode",
     "prepare_muse_spark_draft_context",
     "prepare_muse_spark_draft_head",
@@ -393,6 +394,12 @@ def prepare_muse_spark_experts(
     return prepare(tensors=tensors)
 
 
+# int32 words of one token row's q | k | v projection that a Muse Spark
+# launch hands to the next (``muse_spark_layer_decode``'s ``proj_in`` /
+# ``proj_out``): FP32 partial sums of two K halves of 1280 rows.
+MUSE_SPARK_PROJ_WORDS = 2560
+
+
 def muse_spark_layer_decode(
     layer: FusedDecodeLayer,
     *,
@@ -415,6 +422,8 @@ def muse_spark_layer_decode(
     tap: torch.Tensor | None,
     tap_slot: int | None,
     warm_next: FusedDecodeLayer | None,
+    proj_in: torch.Tensor | None,
+    proj_out: torch.Tensor | None,
     compile_only: bool,
 ) -> None:
     """One step of a packed Muse Spark layer for the rows of one or more
@@ -461,6 +470,15 @@ def muse_spark_layer_decode(
             :func:`prepare_muse_spark_layer`) that follows this one: this
             launch reads its QKVG weights into the memory-side cache after
             the experts, so the next launch's projections read the MALL.
+        proj_in: None (the launch projects its own q | k | v at its start),
+            or int32 ``[rows+, MUSE_SPARK_PROJ_WORDS]``: the projection that
+            the previous launch stored with ``proj_out``. Its attention then
+            starts at once.
+        proj_out: None, or (past one row, with ``warm_next``) an int32
+            ``[rows+, MUSE_SPARK_PROJ_WORDS]`` buffer other than ``proj_in``:
+            the launch ends with ``warm_next``'s q | k | v projection of the
+            rows it outputs, for the next launch's ``proj_in`` (in place of
+            warming its weights). The results are the same bits either way.
         compile_only: Only compile the launch for these operands, without
             running it. A launch polls its peers' values for a few seconds
             before it traps, so a rank that compiles much longer than its
@@ -488,6 +506,8 @@ def muse_spark_layer_decode(
         tap=tap,
         tap_slot=tap_slot,
         warm_next=None if warm_next is None else warm_next.weights,
+        proj_in=proj_in,
+        proj_out=proj_out,
         compile_only=compile_only,
     )
 
