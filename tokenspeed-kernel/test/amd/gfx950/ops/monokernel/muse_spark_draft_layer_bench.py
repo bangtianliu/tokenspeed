@@ -142,11 +142,19 @@ def worker(rank: int, port: int, args) -> None:
             print("  stage     start   ready  computed    end  (us)", flush=True)
             for i, st in enumerate(plan.stages):
                 pts = []
-                for point, reduce in ((0, torch.min), (1, torch.max), (2, torch.max), (3, torch.max)):
+                for point, reduce in (
+                    (0, torch.min),
+                    (1, torch.max),
+                    (2, torch.max),
+                    (3, torch.max),
+                ):
                     v = tb[:, 4 * i + point, :]
                     v = v[v > 0]
                     pts.append(us(reduce(v).item()) if v.numel() else float("nan"))
-                print(f"  {st.name:7s} {pts[0]:7.1f} {pts[1]:7.1f} {pts[2]:8.1f} {pts[3]:7.1f}", flush=True)
+                print(
+                    f"  {st.name:7s} {pts[0]:7.1f} {pts[1]:7.1f} {pts[2]:8.1f} {pts[3]:7.1f}",
+                    flush=True,
+                )
     dist.destroy_process_group()
 
 
