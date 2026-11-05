@@ -79,6 +79,9 @@ from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
 from tokenspeed_kernel_amd._triton import tl, triton  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import plan as plan_mod  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import layer  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.qkvg import (  # noqa: E402
+    PROJ_WORDS,
+)
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import (  # noqa: E402
     bf16_tiles,
 )
@@ -281,7 +284,12 @@ def worker(rank: int, port: int, args) -> None:
     dev = torch.device(f"cuda:{rank}")
     ctx = get_or_create_context(heap_size=256 << 20)
     group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
-    plan = layer.layer_plan(args.full, args.rows, args.rows, False)
+    # With --shift every launch reads the q | k | v projection that the one
+    # before it stored, and ends with the next one's (qnext).
+    plan = layer.layer_plan(
+        args.full, args.rows, args.rows, False, not args.shift, args.shift
+    )
+    proj = torch.zeros(2, args.rows, int(PROJ_WORDS), dtype=torch.int32, device=dev)
     scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
     ghost = torch.zeros_like(scratch)
     bases = torch.empty(TP, dtype=torch.int64, device=dev)
@@ -343,6 +351,9 @@ def worker(rank: int, port: int, args) -> None:
             None,
             None,
             None,
+            proj[lay & 1] if args.shift else None,
+            proj[(lay + 1) & 1] if args.shift else None,
+            attn_ops[0] if args.shift else None,  # the next layer's: this one's
             trace_buf,
             rank,
             args.full,
@@ -539,6 +550,13 @@ def main() -> None:
         help="BF16 experts (layers 0 and 61) instead of MXFP4",
     )
     p.add_argument("--replays", type=int, default=15)
+    p.add_argument(
+        "--shift",
+        action="store_true",
+        help="launches of a run of shifted layers: each reads the q | k | v "
+        "projection the launch before it stored and ends with the next one's "
+        "(qnext, past one row)",
+    )
     p.add_argument(
         "--settle",
         type=int,

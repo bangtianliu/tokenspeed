@@ -277,6 +277,44 @@ def load_word_rows(
 
 
 @gluon.jit
+def load_local_word_rows(
+    mb, region: gl.constexpr, k0, KS: gl.constexpr, R: gl.constexpr
+):
+    """:func:`load_rows` of BF16 rows that producers published as plain
+    words (``Mailbox.store_words`` / ``raise_flag``) in local region
+    ``region``, values ``k0 .. k0 + KS - 1`` of rows ``0 .. R - 1``. Call it
+    after the CTA polled the producers' flags (and met at a barrier). One
+    round trip: a word holds two values, so all the rows fit the registers
+    that :func:`load_rows` gives a group of rows' pairs. Unlike
+    :func:`load_word_rows` the caller polls the flags (for a slice ``k0 ..``
+    of the rows, its own subset of them).
+
+    Returns:
+        ``x_smem [RP, KP, 32] bf16``, as :func:`load_rows`.
+    """
+    gl.static_assert(KS % 32 == 0)
+    KI: gl.constexpr = KS // 32
+    KP: gl.constexpr = triton.next_power_of_2(KI)
+    RP: gl.constexpr = triton.next_power_of_2(R)
+    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
+    p = gl.arange(0, RP * KP * 16, lanes)
+    row = gl.minimum(p // (KP * 16), R - 1)
+    at = p % (KP * 16)
+    # Row r's words start at word 2 row_offset(r) (Mailbox.store_words).
+    got = mb.load_words(
+        region, 2 * mb.row_offset(row) + k0 // 2 + gl.minimum(at, KS // 2 - 1)
+    )
+    words = gl.allocate_shared_memory(
+        gl.int32, [RP, KP, 16], mx._padded_rows([RP, KP, 16], KP * 16, 8)
+    )
+    words.store(gl.reshape(gl.where(at < KS // 2, got, 0), [RP, KP, 16]))
+    gl.barrier()
+    return words.reinterpret(
+        gl.bfloat16, [RP, KP, 32], mx._padded_rows([RP, KP, 32], KP * 32, 16)
+    )
+
+
+@gluon.jit
 def load_global_rows(x, row_stride, k0, KS: gl.constexpr, R: gl.constexpr):
     """:func:`load_rows` of BF16 rows in global memory that an earlier launch
     wrote (row ``r`` at ``x + r * row_stride``), values ``k0 .. k0 + KS - 1``.

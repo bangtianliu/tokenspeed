@@ -23,6 +23,7 @@ for one decode row or a speculative verify's chained rows."""
 
 from __future__ import annotations
 
+import dataclasses
 import socket
 from datetime import timedelta
 
@@ -42,10 +43,16 @@ from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
     get_or_create_context,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import layer  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.qkvg import (  # noqa: E402
+    PROJ_WORDS,
+)
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.weights import (  # noqa: E402
     pack_layer,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import launch_tag  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import (  # noqa: E402
+    bf16_tiles,
+)
 
 WORLD, HIDDEN, POOLED, OWNED, EXPERTS = 8, 8192, 4096, 1024, 16
 QKVG, Q = 2304, 1024
@@ -246,7 +253,7 @@ def _worker(
         dev = torch.device(f"cuda:{rank}")
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
-        plan = layer.layer_plan(full, rows, rows, True)
+        plan = layer.layer_plan(full, rows, rows, True, True, False)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         # A draft's taps: the launch stores its residual into slot 3 of
         # every rank's copy.
@@ -291,6 +298,8 @@ def _worker(
                 # The warm stage reads weights only: it runs here (on the
                 # layer's own QKVG weights) and changes no output.
                 warm_next=weights,
+                proj_in=None,
+                proj_out=None,
                 trace_buf=None,
                 compile_only=compile_only,
             )
@@ -432,7 +441,7 @@ def _two_requests_worker(rank: int, port: int, full: bool) -> None:
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
         rows = 8  # a verify of 7 draft tokens a request
-        plan = layer.layer_plan(full, 2 * rows, rows, False)
+        plan = layer.layer_plan(full, 2 * rows, rows, False, True, False)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         lengths = (3000, 3100)
@@ -489,6 +498,8 @@ def _two_requests_worker(rank: int, port: int, full: bool) -> None:
                 tap=None,
                 tap_slot=None,
                 warm_next=None,
+                proj_in=None,
+                proj_out=None,
                 trace_buf=None,
                 compile_only=False,
             )
@@ -532,6 +543,122 @@ def test_two_requests_in_one_launch_match_their_own_launches(full):
     mp.spawn(_two_requests_worker, args=(port, full), nprocs=WORLD, join=True)
 
 
+def _shift_worker(rank: int, port: int, kinds: tuple[bool, ...]) -> None:
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://localhost:{port}",
+        rank=rank,
+        world_size=WORLD,
+        timeout=timedelta(seconds=900),
+    )
+    try:
+        dev = torch.device(f"cuda:{rank}")
+        ctx = get_or_create_context(heap_size=256 << 20)
+        group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
+        rows, length = 8, 3000
+        end = length + rows - 1
+        plan = layer.layer_plan(False, rows, rows, False, True, False)
+        scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
+        sh = _shared(42, length, rows)
+        w = _rank_weights(rank, end)
+        packed = _pack(rank, dev, sh, end, kinds[0])
+        # Each layer its own kind and q | k | v | gate weights: a launch
+        # must project with the next layer's weights, not its own.
+        layers = []
+        for i, full in enumerate(kinds):
+            g = torch.Generator().manual_seed(2000 + 10 * rank + i)
+            qkvg = (torch.randn(QKVG, HIDDEN, generator=g) / HIDDEN**0.5).to(
+                torch.bfloat16
+            )
+            layers.append(
+                dataclasses.replace(packed, full=full, qkvg=bf16_tiles(qkvg.to(dev)))
+            )
+        own = slice(rank * OWNED, (rank + 1) * OWNED)
+        pos = torch.arange(length - 1, length - 1 + rows)
+        slots = (sh["table"][pos // 64].long() * 64 + pos % 64).to(torch.int32)
+        cos_sin = ref.rope_table(end + 1).to(dev)
+        proj = torch.zeros(2, rows, int(PROJ_WORDS), dtype=torch.int32, device=dev)
+
+        def launch(i, h, a, step, caches, proj_in, proj_out):
+            h_out = torch.empty(rows, OWNED, device=dev)
+            a_out = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
+            layer.launch_gluon_muse_spark_layer_gfx950(
+                layers[i],
+                h=h,
+                a=a,
+                h_out=h_out,
+                a_out=a_out,
+                seq_len=(pos + 1).to(torch.int32).to(dev),
+                slot=slots.to(dev),
+                page_table=sh["table"].to(dev),
+                k_cache=caches[0],
+                v_cache=caches[1],
+                cos_sin=cos_sin,
+                scratch=scratch,
+                step=torch.full((1,), step, dtype=torch.int32, device=dev),
+                peer_bases=group.bases,
+                layer=i + 1,
+                chain=rows,
+                whole_rows=False,
+                tap=None,
+                tap_slot=None,
+                warm_next=None if proj_out is None else layers[i + 1],
+                proj_in=proj_in,
+                proj_out=proj_out,
+                trace_buf=None,
+                compile_only=False,
+            )
+            torch.cuda.synchronize()
+            dist.barrier()
+            return h_out, a_out
+
+        group.finish_prepare()
+        n = len(kinds)
+        caches = [[w["k_cache"].to(dev), w["v_cache"].to(dev)] for _ in range(n)]
+        regular = [[c.clone() for c in cs] for cs in caches]
+        shifted = [[c.clone() for c in cs] for cs in caches]
+        h, a = sh["h"][:, own].contiguous().to(dev), sh["a_in"].to(dev)
+        want = []
+        for i in range(n):
+            h, a = launch(i, h, a, 3, regular[i], None, None)
+            want.append((h.cpu(), a.cpu()))
+        # The first launch projects its own q | k | v and the next layer's;
+        # the others read theirs from the previous launch; the last projects
+        # no next one.
+        h, a = sh["h"][:, own].contiguous().to(dev), sh["a_in"].to(dev)
+        for i in range(n):
+            h, a = launch(
+                i,
+                h,
+                a,
+                4,
+                shifted[i],
+                None if i == 0 else proj[i % 2],
+                None if i == n - 1 else proj[(i + 1) % 2],
+            )
+            assert torch.equal(h.cpu(), want[i][0]), f"layer {i}: residual"
+            assert torch.equal(a.cpu(), want[i][1]), f"layer {i}: next input"
+            assert torch.equal(shifted[i][0], regular[i][0]), f"layer {i}: k cache"
+            assert torch.equal(shifted[i][1], regular[i][1]), f"layer {i}: v cache"
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("kinds", [(True, False, False), (False, False, True)])
+def test_launches_that_project_the_next_layer_match_the_regular_order(kinds):
+    """A launch that ends with the next layer's q | k | v projection (qnext),
+    and a launch that reads it instead of projecting its own, give the same
+    bits as launches that each project their own: a full layer before two
+    sliding ones, and a sliding one between a sliding and a full one."""
+    if torch.cuda.device_count() < WORLD:
+        pytest.skip(f"requires {WORLD} GPUs")
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_shift_worker, args=(port, kinds), nprocs=WORLD, join=True)
+
+
 def _graph_worker(rank: int, port: int, length: int) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
@@ -545,7 +672,7 @@ def _graph_worker(rank: int, port: int, length: int) -> None:
         dev = torch.device(f"cuda:{rank}")
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
-        plan = layer.layer_plan(False, 1, 1, False)
+        plan = layer.layer_plan(False, 1, 1, False, True, False)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         sh = _shared(42, length, 1)
         weights = _pack(rank, dev, sh, length, False)
@@ -586,6 +713,8 @@ def _graph_worker(rank: int, port: int, length: int) -> None:
                 tap=None,
                 tap_slot=None,
                 warm_next=None,
+                proj_in=None,
+                proj_out=None,
                 trace_buf=None,
                 compile_only=False,
             )
@@ -636,16 +765,31 @@ def test_graph_replays_match_eager_launches():
     mp.spawn(_graph_worker, args=(port, 3000), nprocs=WORLD, join=True)
 
 
-@pytest.mark.parametrize("warm", [(False, False), (False, True), (True, False)])
+# (warm, own q | k | v, next layer's q | k | v) of the sliding and the full
+# plan: the warm stage or not (the last fused layer has none), and past one
+# row the launches of a run that hand the projection on (qnext).
+_VARIANTS = [
+    ((False, True, False), (False, True, False)),
+    ((False, True, False), (True, True, False)),
+    ((True, True, False), (False, True, False)),
+    ((False, True, True), (False, False, True)),
+    ((False, False, True), (False, False, False)),
+    ((False, False, False), (False, True, True)),
+]
+
+
+@pytest.mark.parametrize("variants", _VARIANTS)
 @pytest.mark.parametrize("rows", range(1, layer.MAX_ROWS + 1))
-def test_both_kinds_of_layer_lay_the_scratch_out_alike(rows: int, warm):
+def test_both_kinds_of_layer_lay_the_scratch_out_alike(rows: int, variants):
     """Sliding and full launches share one scratch and alternate the peer
     regions' copies. A rank a launch ahead must then put only into the copy
     no slower rank still reads, which holds only if both plans place every
-    region, and both copies of each peer region, at the same pairs, with or
-    without the warm stage (the last fused layer has none)."""
-    sliding = layer.layer_plan(False, rows, rows, warm[0])
-    full = layer.layer_plan(True, rows, rows, warm[1])
+    region, and both copies of each peer region, at the same pairs, whatever
+    their stages (the warm stage, qkvg or qnext)."""
+    if rows == 1 and any(v[2] for v in variants):
+        pytest.skip("qnext runs past one row")
+    sliding = layer.layer_plan(False, rows, rows, *variants[0])
+    full = layer.layer_plan(True, rows, rows, *variants[1])
     assert sliding.regions == full.regions
     assert sliding.peers == full.peers
     assert sliding.row_pairs == full.row_pairs

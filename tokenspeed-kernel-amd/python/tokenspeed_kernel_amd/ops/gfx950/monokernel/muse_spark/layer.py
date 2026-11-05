@@ -119,9 +119,16 @@ CHAINED_BASES = {
     "exr": 0,
 }
 
+# A launch that ends with the next layer's qkvg tasks (qnext, 160 tasks of
+# 128 KiB of weights): they take CTAs 192 .. 255 and 0 .. 95, which end their
+# expert tasks first (ex2's last lanes) or run only comb before; the
+# out tasks (8 a row) move to 96 .. 159, after comb or unpool, so no qnext
+# weight stream waits behind an out task.
+NEXT_BASES = {**CHAINED_BASES, "qnext": 192, "out": 96}
 
-def _bases(rows: int, *names: str) -> dict[str, int]:
-    table = BASES if rows == 1 else CHAINED_BASES
+
+def _bases(rows: int, next_qkvg: bool, *names: str) -> dict[str, int]:
+    table = NEXT_BASES if next_qkvg else BASES if rows == 1 else CHAINED_BASES
     return {name: table[name] for name in names}
 
 
@@ -143,15 +150,29 @@ WARM_TASKS = 64
 CODE_TASKS = 64
 
 
-def layer_plan(full: bool, rows: int, chain: int, warm_next: bool) -> Plan:
+def layer_plan(
+    full: bool,
+    rows: int,
+    chain: int,
+    warm_next: bool,
+    own_qkvg: bool,
+    next_qkvg: bool,
+) -> Plan:
     """The plan of a full-attention (``full``) or sliding-window layer for
     ``rows`` token rows: requests of ``chain`` tokens each, 1 for decode,
     ``k + 1`` for a speculative verify of ``k`` draft tokens. With
-    ``warm_next`` the launch also warms the next launch's QKVG weights."""
+    ``warm_next`` the launch also warms the next launch's QKVG weights.
+
+    ``own_qkvg``: the launch projects its own q | k | v (qkvg tasks), else
+    the previous launch did (its qnext tasks; the launch's attention then
+    starts at once). ``next_qkvg``: the launch ends with the next layer's
+    projection (qnext), which replaces the warm stage; past one row only."""
     if not 1 <= rows <= MAX_ROWS or rows % chain:
         raise ValueError(
             f"a launch serves 1 to {MAX_ROWS} rows of requests of {chain}, got {rows}"
         )
+    if next_qkvg and (rows == 1 or warm_next):
+        raise ValueError("qnext: past one row, and in place of the warm stage")
     splits = FULL_SPLITS if full else SLIDING_SPLITS
     # Both kinds of layer lay their regions out alike: the attention
     # regions are sized for the full layer's splits. Consecutive launches
@@ -168,16 +189,25 @@ def layer_plan(full: bool, rows: int, chain: int, warm_next: bool) -> Plan:
         + moe_experts.regions()
         + moe_tail.regions()
     )
+    nq = next_qkvg
     stages = (
         (Stage("code", CODE_TASKS, 0),)
-        + qkvg.stages(_bases(rows, "qkvg", "gate"))
-        + attention.stages(_bases(rows, "head", "attn", "merge"), splits, rows, chain)
-        + attn_tail.stages(_bases(rows, "oproj", "tail"), rows)
-        + moe_route.stages(_bases(rows, "router", "topk"), rows)
-        + moe_pool.stages(_bases(rows, "pool"))
-        + moe_experts.stages(_bases(rows, "slt", "xq", "ex1", "exr", "ex2"), rows)
+        + qkvg.stages(_bases(rows, nq, "qkvg", "gate"), own_qkvg)
+        + attention.stages(
+            _bases(rows, nq, "head", "attn", "merge"), splits, rows, chain, own_qkvg
+        )
+        + attn_tail.stages(_bases(rows, nq, "oproj", "tail"), rows)
+        + moe_route.stages(_bases(rows, nq, "router", "topk"), rows)
+        + moe_pool.stages(_bases(rows, nq, "pool"))
+        + moe_experts.stages(_bases(rows, nq, "slt", "xq", "ex1", "exr", "ex2"), rows)
         + ((Stage("warm", WARM_TASKS, 0),) if warm_next else ())
-        + moe_tail.stages(_bases(rows, "comb", "unpool", "out"), rows)
+        + moe_tail.stages(
+            _bases(rows, nq, "comb", "unpool", "out"),
+            rows,
+            8 if next_qkvg else 16,
+            next_qkvg,
+        )
+        + (qkvg.next_stages(_bases(rows, nq, "qnext")) if next_qkvg else ())
     )
     peers = (
         attn_tail.PEERS
@@ -216,6 +246,9 @@ def gluon_muse_spark_layer_gfx950(
     warm_quads,
     code_offset,
     code_quads,
+    proj_in,
+    proj_out,
+    w_next,
     trace_buf,
     PLAN: gl.constexpr,
     RANK: gl.constexpr,
@@ -244,6 +277,10 @@ def gluon_muse_spark_layer_gfx950(
     ``warm_ptr``, ``warm_quads``: the next launch's packed QKVG weights, read
     (``4 * warm_quads`` int32 words) only when ``PLAN`` has the warm stage.
     ``code_offset``, ``code_quads``: this binary's ``code_warm.text_range``.
+    ``proj_in``: int32 ``[rows, qkvg.PROJ_WORDS]``, the q | k | v projection
+    the previous launch's qnext tasks stored, read when ``PLAN`` has no qkvg
+    stage. ``proj_out``, ``w_next``: where the qnext tasks store the next
+    layer's projection, and its fused BF16 weight (with a qnext stage).
     """
     table = trace.allocate(trace_buf)
     peers = mailbox.load_peers(bases, RANK, layer & 1, WORLD)
@@ -302,16 +339,28 @@ def gluon_muse_spark_layer_gfx950(
         a_out,
     ) = moe_ops
 
-    task, active = schedule.stage_task(PLAN, "qkvg")
-    if active:
-        qkvg.qkvg_stage(mb, task, w_qkvg, a_in, HIDDEN, "qkvg")
+    OWN: gl.constexpr = schedule.has_stage(PLAN, "qkvg")
+    if OWN:
+        task, active = schedule.stage_task(PLAN, "qkvg")
+        if active:
+            qkvg.qkvg_stage(mb, task, w_qkvg, a_in, HIDDEN, "qkvg")
     task, active = schedule.stage_task(PLAN, "gate")
     if active:
         qkvg.gate_stage(mb, task, w_qkvg, a_in, HIDDEN, "gate")
     task, active = schedule.stage_task(PLAN, "head")
     if active:
         attention.head_stage(
-            mb, task, seq_len, slot, k_cache, v_cache, cos_sin, ROPE, "head"
+            mb,
+            task,
+            seq_len,
+            slot,
+            k_cache,
+            v_cache,
+            cos_sin,
+            proj_in,
+            ROPE,
+            OWN,
+            "head",
         )
     # Several requests' attention tasks may outnumber the CTAs: rounds.
     G: gl.constexpr = schedule.grid(PLAN)
@@ -326,7 +375,9 @@ def gluon_muse_spark_layer_gfx950(
             k_cache,
             v_cache,
             cos_sin,
+            proj_in,
             ROPE,
+            OWN,
             SPLITS,
             WIN,
             "attn",
@@ -471,8 +522,21 @@ def gluon_muse_spark_layer_gfx950(
             RANK,
             TAP,
             WHOLE_ROWS,
+            schedule.stage_tasks(PLAN, "out") // schedule.rows(PLAN),
+            schedule.has_stage(PLAN, "qnext"),
             "out",
         )
+    if schedule.has_stage(PLAN, "qnext"):
+        task, active = schedule.stage_task(PLAN, "qnext")
+        if active:
+            qkvg.qnext_stage(
+                mb,
+                task,
+                w_next,
+                proj_out,
+                schedule.stage_tasks(PLAN, "out") // schedule.rows(PLAN),
+                "qnext",
+            )
     trace.flush(table, trace_buf)
 
 
@@ -486,6 +550,9 @@ def launch_layer(
     tap,
     tap_slot,
     warm_next,
+    proj_in,
+    proj_out,
+    next_qkvg,
     trace_buf,
     rank: int,
     full: bool,
@@ -503,8 +570,19 @@ def launch_layer(
     every rank. ``warm_next`` (None, or the next launch's packed QKVG
     weights) is warmed into the memory-side cache after the experts. With
     ``whole_rows`` the residual output (in ``moe_ops``) is whole FP32
-    ``[rows, 8192]`` rows, else the rank's owned ``[rows, 1024]`` columns."""
-    plan = layer_plan(full, rows, chain, warm_next is not None)
+    ``[rows, 8192]`` rows, else the rank's owned ``[rows, 1024]`` columns.
+    ``proj_in`` (None: the launch projects its own q | k | v) is the
+    projection that the previous launch's qnext tasks stored; with
+    ``proj_out`` (and the next layer's fused weight ``next_qkvg``) this
+    launch's qnext tasks store the next layer's projection there."""
+    plan = layer_plan(
+        full,
+        rows,
+        chain,
+        warm_next is not None,
+        proj_in is None,
+        proj_out is not None,
+    )
     if tap is None:
         tap_args = (attn_ops[0], 0, 0)
     else:
@@ -517,6 +595,13 @@ def launch_layer(
         # The warm stage reads int32 words: the same bytes, viewed.
         warm_args = (warm_next.view(-1).view(torch.int32), warm_next.nbytes // 16)
 
+    # Unused projection operands take a placeholder of the same type.
+    proj_args = (
+        scratch.view(torch.int32) if proj_in is None else proj_in,
+        scratch.view(torch.int32) if proj_out is None else proj_out,
+        attn_ops[0] if next_qkvg is None else next_qkvg,
+    )
+
     def kernel_args(code: tuple[int, int]) -> tuple:
         return (
             scratch,
@@ -528,6 +613,7 @@ def launch_layer(
             *tap_args,
             *warm_args,
             *code,
+            *proj_args,
             trace_buf,
             plan.key,
             rank,
@@ -578,6 +664,8 @@ def launch_gluon_muse_spark_layer_gfx950(
     tap,
     tap_slot,
     warm_next,
+    proj_in,
+    proj_out,
     trace_buf,
     compile_only: bool,
 ):
@@ -615,9 +703,18 @@ def launch_gluon_muse_spark_layer_gfx950(
             the residual after the layer, rounded to BF16, into slot
             ``tap_slot`` of every rank's copy (a draft's tap).
         tap_slot: The tap's slot, or None without ``tap``.
-        warm_next: None, or the next launch's ``weights.LayerWeights``: this
-            launch reads its QKVG weights into the memory-side cache after
-            the experts, so the next launch's projections read the MALL.
+        warm_next: None, or the next launch's ``weights.LayerWeights``. Without
+            ``proj_out`` this launch reads its QKVG weights into the
+            memory-side cache after the experts, so the next launch's
+            projections read the MALL.
+        proj_in: None (the launch projects its own q | k | v at its start),
+            or int32 ``[>= rows, qkvg.PROJ_WORDS]``: the projection that the
+            previous launch stored with ``proj_out``. The launch's attention
+            then starts at once.
+        proj_out: None, or int32 ``[>= rows, qkvg.PROJ_WORDS]`` (past one
+            row, with ``warm_next``): the launch ends with ``warm_next``'s
+            q | k | v projection of its output rows, stored there for the
+            next launch's ``proj_in``.
         trace_buf: None, or a trace buffer (``trace.py``).
         compile_only: Only compile the launch for these operands. A rank's
             launch polls its peers' values for a few seconds before it traps,
@@ -666,6 +763,25 @@ def launch_gluon_muse_spark_layer_gfx950(
         )
     if (tap is None) != (tap_slot is None):
         raise ValueError("tap and tap_slot come together")
+    for name, t in (("proj_in", proj_in), ("proj_out", proj_out)):
+        if t is not None and (
+            t.dtype != torch.int32
+            or t.dim() != 2
+            or t.shape[0] < rows
+            or t.shape[1] != int(qkvg.PROJ_WORDS)
+            or not t.is_contiguous()
+        ):
+            raise ValueError(
+                f"{name}: contiguous int32 [>={rows}, {int(qkvg.PROJ_WORDS)}]"
+            )
+    if proj_out is not None and warm_next is None:
+        raise ValueError("proj_out: the next layer's weights come in warm_next")
+    if (
+        proj_in is not None
+        and proj_out is not None
+        and (proj_in.data_ptr() == proj_out.data_ptr())
+    ):
+        raise ValueError("proj_in and proj_out: two buffers (the launch reads one)")
     if tap is not None and (
         tap.dtype != torch.bfloat16
         or tap.dim() != 3
@@ -696,7 +812,10 @@ def launch_gluon_muse_spark_layer_gfx950(
         moe_ops,
         tap,
         tap_slot,
-        None if warm_next is None else warm_next.qkvg,
+        None if warm_next is None or proj_out is not None else warm_next.qkvg,
+        proj_in,
+        proj_out,
+        None if proj_out is None else warm_next.qkvg,
         trace_buf,
         weights.rank,
         weights.full,
