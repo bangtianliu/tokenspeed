@@ -94,10 +94,13 @@ BASES = {
 }
 
 
-# Past one row the attention tail has 8 tasks per row and the router 16 per
-# pair of rows: both move to CTAs whose only earlier task is oproj (the tail
-# off the router's CTAs, whose weight loads would otherwise wait for it).
-CHAINED_BASES = {**BASES, "tail": 64, "router": 0}
+# Past one row the attention tail has 8 tasks per row: it moves to CTAs
+# whose only earlier task is oproj. The router (16 tasks per pair of rows)
+# goes to CTAs free from the end of a sliding layer's attention (~16 us), so
+# its weight stream, alpha-h logits and their puts finish before the tail's
+# b lands: after oproj, they made its ready ~6.6 us past its start, ~4.5 us
+# past b. The pool moves past the router's CTAs: its input lands late.
+CHAINED_BASES = {**BASES, "tail": 64, "router": 160, "pool": 224}
 
 
 def _bases(rows: int, *names: str) -> dict[str, int]:
