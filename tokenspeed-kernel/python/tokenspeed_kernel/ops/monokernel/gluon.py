@@ -255,9 +255,12 @@ if _muse_spark_layer is not None:
         weights = _muse_spark_weights.pack_layer(**tensors)
         # One scratch serves launches of every row count up to max_rows.
         scratch_pairs = max(
-            # The scratch's size depends on the rows, not on how they chain
-            # or on the warm stage (which holds no region).
-            _muse_spark_layer.layer_plan(weights.full, rows, rows, True).scratch_pairs
+            # The scratch's size depends on the rows, not on how they chain,
+            # on the warm stage or on qnext (every plan lays out the same
+            # regions).
+            _muse_spark_layer.layer_plan(
+                weights.full, rows, rows, True, True, False
+            ).scratch_pairs
             for rows in range(1, max_rows + 1)
         )
         return weights, scratch_pairs, None
@@ -284,6 +287,8 @@ if _muse_spark_layer is not None:
         tap: torch.Tensor | None,
         tap_slot: int | None,
         warm_next: Any,
+        proj_in: torch.Tensor | None,
+        proj_out: torch.Tensor | None,
         compile_only: bool,
         **operands: torch.Tensor,
     ) -> None:
@@ -298,6 +303,8 @@ if _muse_spark_layer is not None:
             tap=tap,
             tap_slot=tap_slot,
             warm_next=warm_next,
+            proj_in=proj_in,
+            proj_out=proj_out,
             trace_buf=None,
             compile_only=compile_only,
             **operands,

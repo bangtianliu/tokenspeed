@@ -58,6 +58,16 @@ to the draft as its one capture. Its readers run after later collectives of
 the forward, which order the stores before them; a capture sink, which reads
 each tap during the forward, keeps the regular capture.
 
+Between two fused Muse Spark layers (past one row) the boundary shifts by
+the next layer's q | k | v projection: a launch ends with it (qnext tasks,
+on CTAs idle after the experts) and stores the FP32 partial sums in a global
+buffer, and the next launch reads them with plain loads, so its attention
+starts at once instead of after its own projection (~10 us). The math is
+the same as projecting at the start, so the results are the same bits. The
+hand-over to regular layers does not change: the first launch of a run of
+fused layers projects its own q | k | v, and the last one projects no next
+layer's.
+
 The DFlash2 draft's regular layers pass this rank's partial of the layer
 output (its reduction moves into the next norm) and the BF16 residual. A
 draft launch also takes and returns the partial, but keeps only the rank's
