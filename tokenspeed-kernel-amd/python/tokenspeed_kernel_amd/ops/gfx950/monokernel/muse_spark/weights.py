@@ -70,10 +70,14 @@ class LayerWeights:
     router: torch.Tensor  # FP32 [EXPERTS, OWNED]
     router_bias: torch.Tensor  # FP32 [EXPERTS]
     pool: torch.Tensor  # BF16 tiles [POOL_OWNED, HIDDEN]
+    # BF16 experts (the checkpoint's own, layers 0 and 61): the regular BF16
+    # route path's w13 [EXPERTS, 2 INTER, POOLED] and w2 [EXPERTS, POOLED,
+    # INTER], no scales. Else the gluon MXFP4 MoE's preprocessed tensors.
+    bf16_experts: bool
     w13: torch.Tensor
-    w13s: torch.Tensor
+    w13s: torch.Tensor | None
     w2: torch.Tensor
-    w2s: torch.Tensor
+    w2s: torch.Tensor | None
     pre_exp_gain: torch.Tensor  # FP32 [POOLED]
     pen_gain: torch.Tensor  # FP32 [POOL_OWNED], post-expert norm
     post: torch.Tensor  # BF16 tiles [OWNED, POOLED]
@@ -114,22 +118,25 @@ class LayerWeights:
             self.beta1,
             self.pre_gain,
         )
+        if self.bf16_experts:
+            # No scales: the scale operands are unused placeholders.
+            w13s, s13 = self.w13, (0, 0, 0)
+            w2s, s2 = self.w2, (0, 0, 0)
+        else:
+            w13s, s13 = self.w13s, self.w13s.stride()
+            w2s, s2 = self.w2s, self.w2s.stride()
         moe_ops = (
             self.router,
             self.router_bias,
             self.pool,
             self.w13,
-            self.w13s,
+            w13s,
             self.w13.stride(0),
-            self.w13s.stride(0),
-            self.w13s.stride(1),
-            self.w13s.stride(2),
+            *s13,
             self.w2,
-            self.w2s,
+            w2s,
             self.w2.stride(0),
-            self.w2s.stride(0),
-            self.w2s.stride(1),
-            self.w2s.stride(2),
+            *s2,
             self.pre_exp_gain,
             self.pen_gain,
             self.post,
@@ -228,7 +235,8 @@ def pack_layer(
     router: torch.Tensor,
     router_bias: torch.Tensor,
     pool: torch.Tensor,
-    experts: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    bf16_experts: bool,
+    experts: tuple[torch.Tensor, ...],
     pre_exp_gain: torch.Tensor,
     pen_gain: torch.Tensor,
     post: torch.Tensor,
@@ -253,8 +261,14 @@ def pack_layer(
         router: FP32 ``[8192, 256]`` router weight (logits are ``x @
             router``); ``router_bias`` FP32 ``[256]``.
         pool: BF16 pooler (pre-expert projection) ``[4096, 8192]``.
-        experts: ``(w13, w13 scales, w2, w2 scales)`` as the regular path's
-            gluon MoE prepared them (raw tensors of the triton tensors).
+        bf16_experts: Whether the experts are BF16 (the checkpoint keeps
+            layers 0 and 61's experts in BF16).
+        experts: With ``bf16_experts``, ``(w13, w2)`` as the regular BF16
+            route path takes them: contiguous BF16 ``[256, 1024, 4096]``
+            (the rank's gate rows, then its up rows) and ``[256, 4096,
+            512]``. Else ``(w13, w13 scales, w2, w2 scales)`` as the
+            regular path's gluon MoE prepared them (raw tensors of the
+            triton tensors).
         pre_exp_gain, pen_gain: FP32 ``[4096]`` gains of the pre-expert and
             post-expert norms.
         post: BF16 post-expert projection ``[8192, 4096]``.
@@ -284,7 +298,15 @@ def pack_layer(
     errors += _mismatch("post", post, (HIDDEN, POOLED), bf16)
     errors += _mismatch("pre_exp_gain", pre_exp_gain, (POOLED,), f32)
     errors += _mismatch("pen_gain", pen_gain, (POOLED,), f32)
-    w13, w13s, w2, w2s = experts
+    if bf16_experts:
+        w13, w2 = experts
+        w13s = w2s = None
+        errors += _mismatch("w13", w13, (EXPERTS, 2 * INTER, POOLED), bf16)
+        errors += _mismatch("w2", w2, (EXPERTS, POOLED, INTER), bf16)
+        if not (w13.is_contiguous() and w2.is_contiguous()):
+            errors.append("experts: BF16 w13 and w2 must be contiguous")
+    else:
+        w13, w13s, w2, w2s = experts
     if w13.shape[0] != EXPERTS or w2.shape[0] != EXPERTS:
         errors.append(
             f"experts: expected {EXPERTS} experts, got {w13.shape[0]} and {w2.shape[0]}"
@@ -304,6 +326,7 @@ def pack_layer(
         router=router[own].t().contiguous(),
         router_bias=router_bias.contiguous(),
         pool=bf16_tiles(pool[pool_own]),
+        bf16_experts=bf16_experts,
         w13=w13,
         w13s=w13s,
         w2=w2,

@@ -208,6 +208,36 @@ def raw_experts(rank: int, experts: int):
     return w13, s13, w2, s2
 
 
+def bf16_experts(rank: int, experts: int):
+    """Random BF16 expert shards of ``rank`` in the regular BF16 route
+    path's layout: w13 ``[experts, 2 INTER, POOLED]`` (gate rows, then up
+    rows) and w2 ``[experts, POOLED, INTER]``."""
+    g = torch.Generator().manual_seed(600 + rank)
+    w13 = (torch.randn(experts, 2 * INTER, POOLED, generator=g) * 0.02).to(
+        torch.bfloat16
+    )
+    w2 = (torch.randn(experts, POOLED, INTER, generator=g) * 0.04).to(torch.bfloat16)
+    return w13, w2
+
+
+def expert_partials_bf16(rank: int, experts: int, pooled, gain, ids) -> torch.Tensor:
+    """:func:`expert_partials` of :func:`bf16_experts`, with the regular BF16
+    route path's rounding: the expert input and the SwiGLU intermediate in
+    BF16, FP32 products."""
+    x = pooled.float()
+    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-5) * gain.to(x.device)
+    x = x.to(torch.bfloat16).float()
+    w13, w2 = (t.to(x.device) for t in bf16_experts(rank, experts))
+    out = torch.empty(ids.shape[0], TOP_K, POOLED, device=x.device)
+    for e in ids.unique().tolist():
+        gate, up, down = w13[e, :INTER].float(), w13[e, INTER:].float(), w2[e].float()
+        for row, k in (ids == e).nonzero().tolist():
+            g_, u = gate @ x[row], up @ x[row]
+            h = (g_ / (1.0 + torch.exp(-g_)) * u).to(torch.bfloat16).float()
+            out[row, k] = down @ h
+    return out.to(torch.bfloat16)
+
+
 def preprocessed_experts(rank: int, experts: int, device: torch.device):
     """``raw_experts`` through the regular path's MoE weight preprocessing."""
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
