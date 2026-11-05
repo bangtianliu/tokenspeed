@@ -76,9 +76,15 @@ def moe_tail_kernel(
     task, active = schedule.stage_task(PLAN, "comb1")
     if active:
         moe_tail.comb_stages(mb, task, pen_gain, RANK)
+    task, active = schedule.stage_task(PLAN, "rnorm")
+    if active:
+        moe_tail.rnorm_stage(mb, task, "rnorm")
     task, active = schedule.stage_task(PLAN, "unpool")
     if active:
-        moe_tail.unpool_stages(mb, task, w_post, post_gain, alpha, beta, h_next, RANK)
+        # No draft tap (TAP false): the tap arguments are unused.
+        moe_tail.unpool_stages(
+            mb, task, w_post, post_gain, alpha, beta, h_next, h_next, 0, 0, RANK, False
+        )
     task, active = schedule.stage_task(PLAN, "out")
     if active:
         moe_tail.out_stage(mb, task, beta, in_gain, a_out, "out")
@@ -132,7 +138,9 @@ def _worker(rank: int, port: int, rows: int) -> None:
         group = IrisGroup(ctx, dist.group.WORLD, rank, device)
         plan = Plan(
             grid=256,
-            stages=moe_tail.stages({"comb": 0, "unpool": 64, "out": 128}, rows),
+            stages=moe_tail.stages(
+                {"comb": 0, "unpool": 64, "rnorm": 200, "out": 128}, rows
+            ),
             regions=(
                 ("route", 2 * TOP_K),
                 ("hp", OWNED),
