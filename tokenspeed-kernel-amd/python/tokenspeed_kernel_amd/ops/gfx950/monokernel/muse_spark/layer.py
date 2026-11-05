@@ -90,8 +90,6 @@ BASES = {
     "ex2": 0,
     "comb": 64,
     "unpool": 128,
-    # One task per row, off unpool's CTAs (moe_tail.stages).
-    "rnorm": 200,
     "out": 216,
 }
 
@@ -174,7 +172,7 @@ def layer_plan(full: bool, rows: int, chain: int, warm_next: bool) -> Plan:
         + moe_pool.stages(_bases(rows, "pool"))
         + moe_experts.stages(_bases(rows, "ex1", "exr", "ex2"), rows)
         + ((Stage("warm", WARM_TASKS, 0),) if warm_next else ())
-        + moe_tail.stages(_bases(rows, "comb", "unpool", "rnorm", "out"), rows)
+        + moe_tail.stages(_bases(rows, "comb", "unpool", "out"), rows)
     )
     peers = (
         attn_tail.PEERS
@@ -432,9 +430,6 @@ def gluon_muse_spark_layer_gfx950(
     task, active = schedule.stage_task(PLAN, "comb1")
     if active:
         moe_tail.comb_stages(mb, task, pen_gain, RANK)
-    task, active = schedule.stage_task(PLAN, "rnorm")
-    if active:
-        moe_tail.rnorm_stage(mb, task, "rnorm")
     task, active = schedule.stage_task(PLAN, "unpool")
     if active:
         moe_tail.unpool_stages(
