@@ -418,7 +418,8 @@ Trainer-side contract:
 | --- | --- |
 | `--max-model-len` | Maximum sequence length. If omitted, TokenSpeed uses the model config. |
 | `--gpu-memory-utilization` | Fraction of GPU memory used for model weights and KV cache. Lower it to leave headroom. |
-| `--max-num-seqs` | Maximum number of active sequences the scheduler may process concurrently. |
+| `--max-num-seqs` | Maximum number of active sequences the scheduler may process concurrently. It also sizes the speculative warmup, the decode device graphs and the per-request device state. |
+| `--max-running-requests` | The most requests the scheduler runs at once, at most `--max-num-seqs` (defaults to it). It sizes nothing: a lower cap keeps everything `--max-num-seqs` sizes, and further requests wait in the queue (their wait counts in TTFT). For example, a speculative server needs `--max-num-seqs` of at least the attention-TP size for its warmup but can still run one request at a time. |
 | `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration; it also bounds the multimodal placeholder tokens one encoder call produces (an item larger than that runs alone). Defaults to `8192`. Set `-1` to disable chunked prefill. |
 | `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. Defaults to `8192`. |
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
