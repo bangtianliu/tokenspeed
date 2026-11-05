@@ -43,18 +43,19 @@ each row's 8 picks as for one row.
   expert.
 * exr, 64 tasks: lane ``l``, one ex1 column block. For each slot, a task
   polls the 4 K quarters of every row that picked the slot's expert, sums
-  them in K order, applies SwiGLU (``silu(gate) up``) and publishes the
-  block's 64 intermediate values a row (``h1``). Summed once here, an ex2
-  task reads 512 values a row instead of 4096 partials: polled by all 256
-  CTAs at once, the partials took one 0.7 us round trip a row (the
-  memory-side bandwidth, not the latency), so a slot that many rows
-  picked held its lane up.
+  them in K order, applies SwiGLU (``silu(gate) up``) and the regular
+  path's MXFP4 requantization (groups of 32: the block's 64 values are two
+  whole groups), and publishes them as words (``h1``). Done once here, an
+  ex2 task reads 72 words a row instead of 4096 partials and quantizes
+  nothing: polled by all 256 CTAs at once, the partials took one 0.7 us
+  round trip a row (the memory-side bandwidth, not the latency), so a slot
+  that many rows picked held its lane up, and each of a lane's 32 ex2
+  tasks requantized the same rows (1.3 us a slot).
 * ex2, 256 tasks: lane ``l``, 128 of the 4096 output columns over the rank's
-  512 intermediate values (32 KiB a slot). A task polls the intermediates of
-  the rows that picked the slot's expert (up to 8 rows a poll) and applies
-  the regular path's MXFP4 requantization (groups of 32) itself. The BF16
-  partials go to the rank that owns those columns (``rr``), which sums the
-  8 ranks' partials.
+  512 intermediate values (32 KiB a slot). A task polls the MXFP4
+  intermediates of the rows that picked the slot's expert (up to 8 rows a
+  poll) into LDS. The BF16 partials go to the rank that owns those columns
+  (``rr``), which sums the 8 ranks' partials.
 
 Expert weights cannot load before routing picks the experts. So a CTA runs
 the first slot of its ex1 and ex2 tasks in parts: :func:`ex1_poll` (one
@@ -103,6 +104,9 @@ NB1 = gl.constexpr(8)  # W13_N // BLOCK_N
 NB2 = gl.constexpr(32)  # POOLED // BLOCK_N
 EX1_TASKS = gl.constexpr(256)  # LANES * NB1 * KSPLIT
 EXR_TASKS = gl.constexpr(64)  # LANES * NB1
+# An intermediate row in MXFP4 words: 64 of E2M1 values, then a word per
+# ex1 block holding its 2 scale bytes.
+H1_WORDS = gl.constexpr(72)  # INTER // 8 + NB1
 EX2_BLOCKS = gl.constexpr(1)  # 128-column blocks of an ex2 task
 EX2_TASKS = gl.constexpr(256)  # LANES * NB2 // EX2_BLOCKS
 OWNED_OUT = gl.constexpr(512)  # output columns a rank reduces: POOLED / WORLD
@@ -115,7 +119,7 @@ def regions() -> tuple[tuple[str, int], ...]:
     k, nb1, ks, bn = int(TOP_K), int(NB1), int(KSPLIT), int(BLOCK_N)
     return (
         ("p1", k * nb1 * ks * bn),  # FP32 [pick][block][K quarter][column] a row
-        ("h1", k * int(INTER)),  # FP32 SwiGLU intermediate [pick][value] a row
+        ("h1", k * int(H1_WORDS)),  # MXFP4 intermediate [pick][word] a row
         (
             "rr",
             int(WORLD) * k * int(OWNED_OUT) // 2,
@@ -589,6 +593,17 @@ def _slot_rows(mb, picks, RP: gl.constexpr, layout: gl.constexpr):
 
 
 @gluon.jit
+def _words(x):
+    """Bytes ``[M, 4 W]`` as little-endian int32 words ``[M, W]``."""
+    M: gl.constexpr = x.shape[0]
+    W: gl.constexpr = x.shape[1] // 4
+    lo, hi = gl.split(gl.reshape(x.to(gl.int32), [M, W, 2, 2]))
+    half = lo | (hi << 8)
+    lo, hi = gl.split(half)
+    return lo | (hi << 16)
+
+
+@gluon.jit
 def exr_stage(mb, task, union, STAGE: gl.constexpr):
     """Exr task ``task`` (slot lane, ex1 column block): for each slot of the
     lane, sum the 4 K quarters of the ex1 partials of every row that picked
@@ -626,17 +641,32 @@ def exr_stage(mb, task, union, STAGE: gl.constexpr):
         for k in gl.static_range(KSPLIT):
             acc += gl.sum(gl.where(ks == k, parts, 0.0), axis=1)
         gate, up = gl.split(gl.reshape(acc, [RP, BLOCK_N // 2, 2]))
-        h = gl.convert_layout(gate / (1.0 + gl.exp(-gate)) * up, hl)
-        row, pick, routed = _slot_rows(mb, picks, RP, gl.SliceLayout(1, hl))
-        j = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, hl))[None, :]
+        # The regular path's requantization: groups of 32 values, and the
+        # block's 64 values are two whole groups.
+        packed, scales = _mxfp4_quantize_tile(gate / (1.0 + gl.exp(-gate)) * up)
+        words = _words(packed)
+        wl: gl.constexpr = words.type.layout
+        row, pick, routed = _slot_rows(mb, picks, RP, gl.SliceLayout(1, wl))
+        w = gl.arange(0, BLOCK_N // 16, gl.SliceLayout(0, wl))[None, :]
         mb.put(
             "h1",
             mb.row_offset(row[:, None])
-            + pick[:, None] * INTER
-            + blk * (BLOCK_N // 2)
-            + j,
-            h,
-            mask=routed[:, None] & (j >= 0),
+            + pick[:, None] * H1_WORDS
+            + blk * (BLOCK_N // 16)
+            + w,
+            words,
+            mask=routed[:, None] & (w >= 0),
+        )
+        # A row's 2 scale bytes in one thread, for the split.
+        pl2: gl.constexpr = gl.BlockedLayout([1, 2], [64, 1], [nw, 1], [1, 0])
+        lo, hi = gl.split(gl.convert_layout(scales.to(gl.int32), pl2))
+        sl: gl.constexpr = lo.type.layout
+        row, pick, routed = _slot_rows(mb, picks, RP, sl)
+        mb.put(
+            "h1",
+            mb.row_offset(row) + pick * H1_WORDS + INTER // 8 + blk,
+            lo | (hi << 8),
+            mask=routed,
         )
     mb.stamp(STAGE, trace.COMPUTED)
     mb.stamp(STAGE, trace.END)
@@ -644,10 +674,10 @@ def exr_stage(mb, task, union, STAGE: gl.constexpr):
 
 @gluon.jit
 def _ex2_gather(mb, union, expert):
-    """The polls of one ex2 slot: the SwiGLU intermediates (:func:`exr_stage`)
+    """The polls of one ex2 slot: the MXFP4 intermediates (:func:`exr_stage`)
     of the rows that picked ``expert``, MFMA row ``m`` the ``m``-th of them,
-    in one poll a group of up to 8 rows. Returns ``(h16 [16, 512], picks,
-    order)`` for :func:`_ex2_compute`."""
+    into LDS, one poll a group of up to 8 rows. Returns ``((values, scales)
+    in LDS, picks, order)`` for :func:`_ex2_compute`."""
     R: gl.constexpr = schedule.rows(mb.plan)
     RP: gl.constexpr = triton.next_power_of_2(R)
     G: gl.constexpr = min(RP, 8)
@@ -660,40 +690,80 @@ def _ex2_gather(mb, union, expert):
         order += (count,)
         count += (picks[r] >= 0).to(gl.int32)
     # MFMA row m's (row, pick): the routed row whose order is m. The others
-    # poll MFMA row 0's pairs, then hold zeros.
-    ql: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [1, nw], [1, 0])
-    ml: gl.constexpr = gl.SliceLayout(1, ql)
+    # poll MFMA row 0's words, then hold zeros (E2M1 0 at scale byte 0, as
+    # quantized zeros).
+    wl: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [1, nw], [1, 0])
+    sl: gl.constexpr = gl.BlockedLayout([1, 2], [8, 8], [1, nw], [1, 0])
     plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
-    h_smem = gl.allocate_shared_memory(gl.float32, [M_DUP, INTER], plain)
-    v = gl.arange(0, INTER, gl.SliceLayout(0, ql))[None, :]
+    p_words = gl.allocate_shared_memory(gl.int32, [M_DUP, INTER // 8], plain)
+    s_words = gl.allocate_shared_memory(gl.int32, [M_DUP, NB1 // 2], plain)
+    v = gl.arange(0, INTER // 8, gl.SliceLayout(0, wl))[None, :]
+    b = gl.arange(0, NB1, gl.SliceLayout(0, sl))[None, :]
     for g in gl.static_range(RP // G):
-        m = g * G + gl.arange(0, G, ml)
-        row = gl.full([G], -1, gl.int32, ml)
-        pick = gl.full([G], -1, gl.int32, ml)
-        row0 = gl.to_tensor(-1)
-        pick0 = gl.to_tensor(-1)
-        for r in gl.static_range(R):
-            hit = (picks[r] >= 0) & (m == order[r])
-            row = gl.where(hit, r, row)
-            pick = gl.where(hit, picks[r], pick)
-            first = (picks[r] >= 0) & (order[r] == 0)
-            row0 = gl.where(first, r, row0)
-            pick0 = gl.where(first, picks[r], pick0)
-        routed = m < count
-        row = gl.where(routed, row, row0)
-        pick = gl.where(routed, pick, pick0)
-        (got,) = mb.poll_many(
-            ("h1",), (mb.row_offset(row[:, None]) + pick[:, None] * INTER + v,)
+        row, pick, routed = _mfma_rows(
+            picks, order, count, g * G, G, R, gl.SliceLayout(1, wl)
         )
-        h = gl.where(routed[:, None], got.to(gl.float32, bitcast=True), 0.0)
-        h_smem.slice(g * G, G, dim=0).store(h)
-    for b in gl.static_range(4):  # M_DUP = 16 rows
-        if (RP << b) < M_DUP:
-            h_smem.slice(RP << b, RP << b, dim=0).store(
-                gl.zeros([RP << b, INTER], gl.float32, ql)
+        row_s, pick_s, routed_s = _mfma_rows(
+            picks, order, count, g * G, G, R, gl.SliceLayout(1, sl)
+        )
+        got, sc = mb.poll_many(
+            ("h1", "h1"),
+            (
+                mb.row_offset(row[:, None]) + pick[:, None] * H1_WORDS + v,
+                mb.row_offset(row_s[:, None])
+                + pick_s[:, None] * H1_WORDS
+                + INTER // 8
+                + b,
+            ),
+        )
+        got = gl.where(routed[:, None], got, 0)
+        sc = gl.where(routed_s[:, None], sc, 0)
+        lo, hi = gl.split(gl.reshape(sc, [G, NB1 // 2, 2]))
+        if g == 0:
+            # The previous slot's products read these buffers.
+            gl.barrier()
+        p_words.slice(g * G, G, dim=0).store(got)
+        s_words.slice(g * G, G, dim=0).store(lo | (hi << 16))
+    for k in gl.static_range(4):  # M_DUP = 16 rows
+        if (RP << k) < M_DUP:
+            p_words.slice(RP << k, RP << k, dim=0).store(
+                gl.zeros([RP << k, INTER // 8], gl.int32, wl)
+            )
+            s_words.slice(RP << k, RP << k, dim=0).store(
+                gl.zeros([RP << k, NB1 // 2], gl.int32, sl)
             )
     gl.barrier()
-    return h_smem.load(ql), picks, order
+    p_smem = p_words.reinterpret(gl.uint8, [M_DUP, INTER // 2], plain)
+    s_smem = s_words.reinterpret(gl.uint8, [M_DUP, INTER // 32], plain)
+    return (p_smem, s_smem), picks, order
+
+
+@gluon.jit
+def _mfma_rows(
+    picks,
+    order,
+    count,
+    M0: gl.constexpr,
+    G: gl.constexpr,
+    R: gl.constexpr,
+    layout: gl.constexpr,
+):
+    """``(row, pick, routed)`` ``[G]`` of MFMA rows ``M0 ..``: the routed row
+    whose order is the MFMA row, else MFMA row 0's."""
+    m = M0 + gl.arange(0, G, layout)
+    row = gl.full([G], -1, gl.int32, layout)
+    pick = gl.full([G], -1, gl.int32, layout)
+    row0 = gl.to_tensor(-1)
+    pick0 = gl.to_tensor(-1)
+    for r in gl.static_range(R):
+        hit = (picks[r] >= 0) & (m == order[r])
+        row = gl.where(hit, r, row)
+        pick = gl.where(hit, picks[r], pick)
+        first = (picks[r] >= 0) & (order[r] == 0)
+        row0 = gl.where(first, r, row0)
+        pick0 = gl.where(first, picks[r], pick0)
+    routed = m < count
+    return gl.where(routed, row, row0), gl.where(routed, pick, pick0), routed
 
 
 @gluon.jit
@@ -703,9 +773,8 @@ def _ex2_compute(mb, task, loads, gathered, RANK: gl.constexpr):
     R: gl.constexpr = schedule.rows(mb.plan)
     TASKS_PER_LANE: gl.constexpr = NB2 // EX2_BLOCKS
     blk0 = (task % TASKS_PER_LANE) * EX2_BLOCKS
-    h16, picks, order = gathered
-    packed, scales = _mxfp4_quantize_tile(h16)
-    p_smem, s_smem = _stage_a(packed, scales)
+    a, picks, order = gathered
+    p_smem, s_smem = a
     owner = (blk0 * BLOCK_N) // OWNED_OUT
     for b in gl.static_range(EX2_BLOCKS):
         acc = _mma_rows(p_smem, s_smem, loads[b])
