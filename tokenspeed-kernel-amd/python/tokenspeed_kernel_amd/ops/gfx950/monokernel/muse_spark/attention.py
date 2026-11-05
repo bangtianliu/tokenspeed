@@ -44,8 +44,11 @@ token at position ``L0 + t``, where ``L0`` is the request's own.
   (from the first key that row 0 attends), in chunks of 128 with an online
   base-2 softmax. The last split then also takes the launch's tokens, as one
   more chunk. A task publishes FP32 ``acc / l`` and the LSE of the 8 q heads
-  of its KV head of each row (an empty split publishes ``-inf``).
-* merge, 16 tasks per row, one per q head: the LSE merge of the splits,
+  of its KV head of each row (an empty split publishes ``-inf``) as plain
+  words, then one flag (``Mailbox.store_words`` / ``raise_flag``): at 8 rows
+  a task writes 64 x 64 values, which as tagged pairs took ~8 us to publish.
+* merge, 16 tasks per row, one per q head: after the splits' flags, the LSE
+  merge of the splits,
   BF16, then the regular path's gated head norm ``bf16(v rsqrt(mean(v^2) +
   eps) sigmoid(gate))``, published in ``z`` for the output projection.
 """
@@ -84,8 +87,9 @@ MERGE_TASKS = Q_HEADS
 def regions(splits: int) -> tuple[tuple[str, int], ...]:
     heads, kv, group, head = int(Q_HEADS), int(KV_HEADS), int(GROUP), int(HEAD)
     return (
-        ("part", splits * kv * group * head),  # FP32
-        ("lse", splits * heads),  # FP32
+        ("part", splits * kv * group * head),  # FP32 words (half the region)
+        ("lse", splits * heads),  # FP32 words (half the region)
+        ("pflag", splits * kv),  # a flag per attn task, in its request's first row
         ("z", heads * head // 2),  # BF16 pairs
     )
 
@@ -103,13 +107,13 @@ def stages(
             rows // chain * int(KV_HEADS) * splits,
             attn,
             reads=("qkvg",),
-            writes=("part", "lse"),
+            writes=("part", "lse", "pflag"),
         ),
         Stage(
             "merge",
             int(MERGE_TASKS) * rows,
             merge,
-            reads=("part", "lse", "gate"),
+            reads=("part", "lse", "pflag", "gate"),
             writes=("z",),
         ),
     )
@@ -666,18 +670,20 @@ def attn_stage(
     r = gl.arange(0, QM, gl.SliceLayout(1, pv_mma))
     c = gl.arange(0, HEAD, gl.SliceLayout(0, pv_mma))
     part = ((s * KV_HEADS + g) * GROUP + r[:, None] % GROUP) * HEAD + c[None, :]
-    mb.put(
+    # Plain words (row r's copy starts at word 2 row_offset(r)), then the flag.
+    mb.store_words(
         "part",
-        mb.row_offset(base + r[:, None] // GROUP) + part,
-        out.to(gl.int32, bitcast=True),
+        2 * mb.row_offset(base + r[:, None] // GROUP) + part,
+        out,
         mask=(r < C * GROUP)[:, None] & (c >= 0)[None, :],
     )
-    mb.put(
+    mb.store_words(
         "lse",
-        mb.row_offset(base + qi // GROUP) + s * Q_HEADS + g * GROUP + qi % GROUP,
-        lse.to(gl.int32, bitcast=True),
+        2 * mb.row_offset(base + qi // GROUP) + s * Q_HEADS + g * GROUP + qi % GROUP,
+        lse,
         mask=qi < C * GROUP,
     )
+    mb.raise_flag("pflag", mb.row_offset(base) + g * SPLITS + s)
     mb.stamp(STAGE, trace.END)
 
 
@@ -687,7 +693,9 @@ def merge_stage(mb, task, SPLITS: gl.constexpr, STAGE: gl.constexpr):
     the LSE merge, then the gated head norm of the regular path's output
     projection."""
     mb.stamp(STAGE, trace.START)
-    row, h, _ = schedule.row_task(mb.plan, task, MERGE_TASKS)
+    row, h, tok = schedule.row_task(mb.plan, task, MERGE_TASKS)
+    # The splits' flags sit in the request's first row (row - tok).
+    flag0 = -tok * schedule.row_pairs(mb.plan)
     mb = mb.row(row)
     g = h // GROUP
     hh = h % GROUP
@@ -699,10 +707,14 @@ def merge_stage(mb, task, SPLITS: gl.constexpr, STAGE: gl.constexpr):
     gl2: gl.constexpr = gl.BlockedLayout([1, 2], [64, 1], [nw, 1], [1, 0])
     gc = gl.arange(0, HEAD, gl.SliceLayout(1, gl2))[:, None]
     gh = gl.arange(0, 2, gl.SliceLayout(0, gl2))[None, :]
-    got_p, got_l, got_g = mb.poll_many(
-        ("part", "lse", "gate"),
-        (part, s * Q_HEADS + h, gh * (QKVG - GATE_ROW) + h * HEAD + gc),
+    _, got_g = mb.poll_many(
+        ("pflag", "gate"),
+        (flag0 + g * SPLITS + s, gh * (QKVG - GATE_ROW) + h * HEAD + gc),
     )
+    # Every split's flag is in: the words load after the poll returned.
+    gl.barrier()
+    got_p = mb.load_words("part", part)
+    got_l = mb.load_words("lse", s * Q_HEADS + h)
     mb.stamp(STAGE, trace.READY)
     lse = got_l.to(gl.float32, bitcast=True)
     top = gl.max(lse, axis=0)
