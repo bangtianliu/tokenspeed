@@ -55,11 +55,7 @@ each row's 8 picks as for one row.
   512 intermediate values (32 KiB a slot). A task polls the MXFP4
   intermediates of the rows that picked the slot's expert (up to 8 rows a
   poll) into LDS. The BF16 partials go to the rank that owns those columns
-  (``rr``), which sums the 8 ranks' partials. After its first slot, a task
-  polls its other slots in chunks of 4, one pass of polls a chunk, and
-  streams their weights two slots ahead: a poll a slot waited for the
-  slot's weights issued before it, so one slot's weights streamed at a time
-  (at 8 rows of 40 experts, a layer took 95.0 us instead of 93.6).
+  (``rr``), which sums the 8 ranks' partials.
 
 Expert weights cannot load before routing picks the experts. So a CTA runs
 the first slot of its ex1 and ex2 tasks in parts: :func:`ex1_poll` (one
@@ -115,8 +111,6 @@ H1_WORDS = gl.constexpr(72)  # INTER // 8 + NB1
 H1_BF16_WORDS = gl.constexpr(256)
 EX2_BLOCKS = gl.constexpr(1)  # 128-column blocks of an ex2 task
 EX2_TASKS = gl.constexpr(256)  # LANES * NB2 // EX2_BLOCKS
-# ex2 slots polled in one pass, after a lane's first slot.
-EX2_CHUNK = gl.constexpr(4)
 OWNED_OUT = gl.constexpr(512)  # output columns a rank reduces: POOLED / WORLD
 PRE_EPS = gl.constexpr(1e-5)
 
@@ -711,7 +705,7 @@ def exr_stage(mb, task, union, BF16: gl.constexpr, STAGE: gl.constexpr):
 @gluon.jit
 def _routed_order(picks, R: gl.constexpr):
     """The MFMA row of each routed row (the routed rows before it), and the
-    number of routed rows."""
+    number of routed rows (for moe_experts_bf16's polls)."""
     order = ()
     count = gl.to_tensor(0)
     for r in gl.static_range(R):
@@ -721,44 +715,30 @@ def _routed_order(picks, R: gl.constexpr):
 
 
 @gluon.jit
-def _ex2_words():
-    """LDS for one ex2 slot's polled MXFP4 rows: values and scale words."""
-    plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
-    return (
-        gl.allocate_shared_memory(gl.int32, [M_DUP, INTER // 8], plain),
-        gl.allocate_shared_memory(gl.int32, [M_DUP, NB1 // 2], plain),
-    )
-
-
-@gluon.jit
-def _ex2_a(p_words, s_words):
-    """:func:`_ex2_words`' buffers as the MFMA A operand (values, scales)."""
-    plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
-    return (
-        p_words.reinterpret(gl.uint8, [M_DUP, INTER // 2], plain),
-        s_words.reinterpret(gl.uint8, [M_DUP, INTER // 32], plain),
-    )
-
-
-@gluon.jit
-def _ex2_gather_into(mb, union, expert, p_words, s_words):
+def _ex2_gather(mb, union, expert):
     """The polls of one ex2 slot: the MXFP4 intermediates (:func:`exr_stage`)
     of the rows that picked ``expert``, MFMA row ``m`` the ``m``-th of them,
-    into ``p_words`` and ``s_words`` (:func:`_ex2_words`), one poll a group of
-    up to 8 rows. The caller orders the LDS: a barrier before (the buffers'
-    last readers) and after. Returns ``(picks, order)`` for
-    :func:`_ex2_compute`."""
+    into LDS, one poll a group of up to 8 rows. Returns ``((values, scales)
+    in LDS, picks, order)`` for :func:`_ex2_compute`."""
     R: gl.constexpr = schedule.rows(mb.plan)
     RP: gl.constexpr = triton.next_power_of_2(R)
     G: gl.constexpr = min(RP, 8)
     nw: gl.constexpr = gl.num_warps()
     picks = _row_picks(union, expert, R)
-    order, count = _routed_order(picks, R)
+    # The MFMA row of each routed row: the routed rows before it.
+    order = ()
+    count = gl.to_tensor(0)
+    for r in gl.static_range(R):
+        order += (count,)
+        count += (picks[r] >= 0).to(gl.int32)
     # MFMA row m's (row, pick): the routed row whose order is m. The others
     # poll MFMA row 0's words, then hold zeros (E2M1 0 at scale byte 0, as
     # quantized zeros).
     wl: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [1, nw], [1, 0])
     sl: gl.constexpr = gl.BlockedLayout([1, 2], [8, 8], [1, nw], [1, 0])
+    plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    p_words = gl.allocate_shared_memory(gl.int32, [M_DUP, INTER // 8], plain)
+    s_words = gl.allocate_shared_memory(gl.int32, [M_DUP, NB1 // 2], plain)
     v = gl.arange(0, INTER // 8, gl.SliceLayout(0, wl))[None, :]
     b = gl.arange(0, NB1, gl.SliceLayout(0, sl))[None, :]
     for g in gl.static_range(RP // G):
@@ -781,6 +761,9 @@ def _ex2_gather_into(mb, union, expert, p_words, s_words):
         got = gl.where(routed[:, None], got, 0)
         sc = gl.where(routed_s[:, None], sc, 0)
         lo, hi = gl.split(gl.reshape(sc, [G, NB1 // 2, 2]))
+        if g == 0:
+            # The previous slot's products read these buffers.
+            gl.barrier()
         p_words.slice(g * G, G, dim=0).store(got)
         s_words.slice(g * G, G, dim=0).store(lo | (hi << 16))
     for k in gl.static_range(4):  # M_DUP = 16 rows
@@ -791,7 +774,10 @@ def _ex2_gather_into(mb, union, expert, p_words, s_words):
             s_words.slice(RP << k, RP << k, dim=0).store(
                 gl.zeros([RP << k, NB1 // 2], gl.int32, sl)
             )
-    return picks, order
+    gl.barrier()
+    p_smem = p_words.reinterpret(gl.uint8, [M_DUP, INTER // 2], plain)
+    s_smem = s_words.reinterpret(gl.uint8, [M_DUP, INTER // 32], plain)
+    return (p_smem, s_smem), picks, order
 
 
 @gluon.jit
@@ -878,73 +864,30 @@ def ex2_finish(
     lane's other slots."""
     lane = task // (NB2 // EX2_BLOCKS)
     count = union[3]
-    R: gl.constexpr = schedule.rows(mb.plan)
-    # The first slot's polls, then the next two slots' loads, then its
-    # product while they stream.
-    p0, s0 = _ex2_words()
-    # The LDS may hold ex1's operand until its last product.
-    gl.barrier()
-    picks, order = _ex2_gather_into(mb, union, expert, p0, s0)
-    gl.barrier()
+    # A slot's polls, then the next slot's loads (a poll waits for every
+    # earlier load), then the slot's product while they stream.
+    gathered = _ex2_gather(mb, union, expert)
     mb.stamp(STAGE, trace.READY)
-    near = _ex2_loads(
-        task,
-        True,
-        _slot_expert(union, lane + LANES),
-        w2,
-        w2s,
-        stride_we,
-        stride_se,
-        stride_slin,
-        stride_snb,
+    following = _slot_expert(union, lane + LANES)
+    more = _ex2_loads(
+        task, True, following, w2, w2s, stride_we, stride_se, stride_slin, stride_snb
     )
-    far = _ex2_loads(
-        task,
-        True,
-        _slot_expert(union, lane + 2 * LANES),
-        w2,
-        w2s,
-        stride_we,
-        stride_se,
-        stride_slin,
-        stride_snb,
-    )
-    _ex2_compute(mb, task, loads, (_ex2_a(p0, s0), picks, order), RANK)
-    # The other slots in chunks: one pass of polls for a chunk's slots, then
-    # their products with the loads two slots ahead. A poll waits for every
-    # earlier load of its wave (vmcnt counts in order): a poll a slot let one
-    # slot's loads stream at a time.
-    plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
-    p_chunk = gl.allocate_shared_memory(gl.int32, [EX2_CHUNK, M_DUP, INTER // 8], plain)
-    s_chunk = gl.allocate_shared_memory(gl.int32, [EX2_CHUNK, M_DUP, NB1 // 2], plain)
-    for c0 in range(lane + LANES, count, EX2_CHUNK * LANES):
-        end = gl.minimum(count, c0 + EX2_CHUNK * LANES)
-        # The previous chunk's products read these buffers.
-        gl.barrier()
-        for i in range(c0, end, LANES):
-            j = (i - c0) // LANES
-            _ex2_gather_into(
-                mb, union, _slot_expert(union, i), p_chunk.index(j), s_chunk.index(j)
-            )
-        gl.barrier()
-        for i in range(c0, end, LANES):
-            j = (i - c0) // LANES
-            picks = _row_picks(union, _slot_expert(union, i), R)
-            order, _ = _routed_order(picks, R)
-            loads = near
-            near = far
-            far = _ex2_loads(
-                task,
-                True,
-                _slot_expert(union, i + 2 * LANES),
-                w2,
-                w2s,
-                stride_we,
-                stride_se,
-                stride_slin,
-                stride_snb,
-            )
-            a = _ex2_a(p_chunk.index(j), s_chunk.index(j))
-            _ex2_compute(mb, task, loads, (a, picks, order), RANK)
+    _ex2_compute(mb, task, loads, gathered, RANK)
+    for i in range(lane + LANES, count, LANES):
+        loads = more
+        gathered = _ex2_gather(mb, union, following)
+        following = _slot_expert(union, i + LANES)
+        more = _ex2_loads(
+            task,
+            True,
+            following,
+            w2,
+            w2s,
+            stride_we,
+            stride_se,
+            stride_slin,
+            stride_snb,
+        )
+        _ex2_compute(mb, task, loads, gathered, RANK)
     mb.stamp(STAGE, trace.COMPUTED)
     mb.stamp(STAGE, trace.END)
