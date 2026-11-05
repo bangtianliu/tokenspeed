@@ -36,22 +36,22 @@ columns ``1024 r ..`` of the residual.
   ``y`` and ``alpha h'`` and four partial sums, of ``y^2``, ``(beta y)^2``,
   ``(alpha h')(beta y)`` and ``(alpha h')^2``, into every rank's ``ffn``, in
   one store per rank.
-* rnorm, one task per row: the row's 512 x 4 partial sums from every rank's
-  ``ffn``, summed once into the inverse RMS of the post-FFN norm (over 8192
-  columns) and of the next layer's input norm, whose sum of squares is the
-  expansion of ``(beta y inv + alpha h')^2`` in the four sums. Both go to the
-  local ``fnorm``. (Every out task polled all 2048 sums of every row itself
-  before: at 8 rows, 128 KB of system-scope loads a CTA.)
-* out, 16 tasks of 512 hidden columns per row: the residual gate ``h'' =
-  beta y inv + alpha h'`` with rnorm's scales, then the next layer's input
-  norm. The result is rounded to BF16 and stored as the next attention input,
-  for the next launch. Every rank computes the whole row from the ``ffn`` of
+* out, 16 tasks of 512 hidden columns per row: the row's 512 x 4 partial
+  sums from every rank's ``ffn``, summed into the inverse RMS of the post-FFN
+  norm (over 8192 columns) and of the next layer's input norm, whose sum of
+  squares is the expansion of ``(beta y inv + alpha h')^2`` in the four sums;
+  then the residual gate ``h'' = beta y inv + alpha h'`` and the next layer's
+  input norm. Each task reads only its own row's sums, 16 KB: a separate
+  stage that summed each row once (rnorm) cost one more hand-off at the end
+  of the layer, and polling every row's sums (fin, before) 128 KB a CTA.
+  The result is rounded to BF16 and stored as the next attention input, for
+  the next launch. Every rank computes the whole row from the ``ffn`` of
   all ranks: putting the owned slice of the result to the other ranks instead
   would add a second exchange to the end of the layer. The 2 tasks of a row
   that cover the rank's owned columns also store ``h''`` (FP32, the launch's
   residual output) and the draft's tap. (Unpool's CTAs did that before, after
   their ``ffn`` puts: a poll waits for every earlier store of its wave, so
-  their wait for rnorm also waited for those 8 remote stores, and at 8 rows
+  their wait for the scales also waited for those 8 remote stores, and at 8 rows
   ended the layer about 4 us after out.)
 """
 
@@ -94,24 +94,19 @@ def regions() -> tuple[tuple[str, int], ...]:
         ("cmb", int(POOLED) // 2),  # BF16 pairs of the combined row
         # FP32 [y, alpha h'][column], then the sums: [rank][task][sum].
         ("ffn", 2 * int(HIDDEN) + world * int(UNPOOL_TASKS) * int(SUMS)),
-        ("fnorm", 2),  # FP32: the row's post-FFN and next input inverse RMS
     )
 
 
 def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
-    """Comb1, comb2, unpool, rnorm and out of ``rows`` token rows, placed by
-    ``bases``. Rnorm's CTAs must not run unpool: the kernel calls rnorm
-    first, and rnorm waits for every unpool task."""
-    comb, unpool, rnorm, out = placement(bases, ("comb", "unpool", "rnorm", "out"))
+    """Comb1, comb2, unpool and out of ``rows`` token rows, placed by
+    ``bases``."""
+    comb, unpool, out = placement(bases, ("comb", "unpool", "out"))
     c, u = int(COMB_TASKS) * rows, int(UNPOOL_TASKS)
-    if (rnorm - unpool) % 256 < u or (unpool - rnorm) % 256 < rows:
-        raise ValueError(f"rnorm's CTAs {rnorm} .. overlap unpool's {unpool} ..")
     return (
         Stage("comb1", c, comb, reads=("rr", "route"), writes=("ss3",)),
         Stage("comb2", c, comb, reads=("ss3",), writes=("cmb",)),
         Stage("unpool", u, unpool, reads=("cmb", "hp"), writes=("ffn",)),
-        Stage("rnorm", rows, rnorm, reads=("ffn",), writes=("fnorm",)),
-        Stage("out", int(OUT_TASKS) * rows, out, reads=("ffn", "fnorm")),
+        Stage("out", int(OUT_TASKS) * rows, out, reads=("ffn",)),
     )
 
 
@@ -203,35 +198,10 @@ def comb_stages(mb, task, pen_gain, RANK: gl.constexpr):
 @gluon.jit
 def _ffn_norms(mb):
     """The inverse RMS of the post-FFN norm and of the next layer's input
-    norm, from every rank's sums in ``ffn``. Fin and out share this, so both get the
-    same values."""
+    norm of ``mb``'s row, from every rank's sums in ``ffn``."""
+    _pre_poll_sums(mb)
     (got,) = mb.poll_many(("ffn",), (_ffn_sums_index(),))
     return _ffn_scales(got)
-
-
-@gluon.jit
-def rnorm_stage(mb, task, STAGE: gl.constexpr):
-    """Rnorm task ``task``: row ``task``'s two inverse RMS (:func:`_ffn_norms`)
-    into the local ``fnorm``."""
-    mb.stamp(STAGE, trace.START)
-    mb = mb.row(task)
-    _pre_poll_sums(mb)
-    inv, inv2 = _ffn_norms(mb)
-    mb.stamp(STAGE, trace.READY)
-    lanes = gl.arange(0, 64 * gl.num_warps(), mailbox.lane_layout(gl.num_warps()))
-    vals = gl.where(lanes == 0, inv, inv2)
-    mb.put("fnorm", lanes, vals.to(gl.int32, bitcast=True), mask=lanes < 2)
-    mb.stamp(STAGE, trace.END)
-
-
-@gluon.jit
-def _fnorm_ready(mb):
-    """Wave 0 spins on the last row's ``fnorm`` (rnorm publishes every row's
-    at about the same time) before a wide poll of the scales. ``mb`` must be
-    the launch's mailbox, not a row's (:meth:`Mailbox.row` is relative)."""
-    R: gl.constexpr = schedule.rows(mb.plan)
-    lanes = gl.arange(0, 64 * gl.num_warps(), mailbox.lane_layout(gl.num_warps()))
-    mb.row(R - 1).pre_poll("fnorm", lanes % 2)
 
 
 @gluon.jit
@@ -431,8 +401,6 @@ def out_stage(
     """
     mb.stamp(STAGE, trace.START)
     row, task, _ = schedule.row_task(mb.plan, task, OUT_TASKS)
-    # Before mb.row: Mailbox.row is relative to the mailbox it is called on.
-    _fnorm_ready(mb)
     mb = mb.row(row)
     a_out = a_out + row * HIDDEN
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
@@ -442,12 +410,12 @@ def out_stage(
     b_hi = gl.load(beta + c + 1)
     in_lo = gl.load(in_gain + c)
     in_hi = gl.load(in_gain + c + 1)
-    y_lo, y_hi, ah_lo, ah_hi, g1, g2 = mb.poll_many(
-        ("ffn", "ffn", "ffn", "ffn", "fnorm", "fnorm"),
-        (c, c + 1, HIDDEN + c, HIDDEN + c + 1, 0 * i, 0 * i + 1),
+    # Each unpool task puts its columns and its sums in one store, so the
+    # columns' poll after the sums' barely waits.
+    inv, inv2 = _ffn_norms(mb)
+    y_lo, y_hi, ah_lo, ah_hi = mb.poll_many(
+        ("ffn", "ffn", "ffn", "ffn"), (c, c + 1, HIDDEN + c, HIDDEN + c + 1)
     )
-    inv = g1.to(gl.float32, bitcast=True)
-    inv2 = g2.to(gl.float32, bitcast=True)
     mb.stamp(STAGE, trace.READY)
     h_lo = gl.fma(
         b_lo,
