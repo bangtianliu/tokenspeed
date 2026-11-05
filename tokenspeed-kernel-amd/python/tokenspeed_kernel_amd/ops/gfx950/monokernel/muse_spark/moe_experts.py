@@ -58,12 +58,16 @@ each row's 8 picks as for one row.
   poll) into LDS. The BF16 partials go to the rank that owns those columns
   (``rr``), which sums the 8 ranks' partials.
 
+The slot table (:func:`slots`: each pick's slot, whether it owns its
+expert, every row's pick of it) is built once, by one task after the
+routing (:func:`slot_table_stage`), and published in ``slt``; built on all
+256 CTAs it took ~5 us of each ex1 task's prelude.
+
 Expert weights cannot load before routing picks the experts. So a CTA runs
 the first slot of its ex1 and ex2 tasks in parts: :func:`ex1_poll` (one
-poll for the pooled rows, the first slots' experts and every row's picks),
-:func:`ex1_issue`, then :func:`slots` and :func:`ex1_operand` (the slots of
-the other picks, and the norm and quantization of the A operand, while the
-weights stream), :func:`ex1_finish`, then :func:`ex2_issue` and
+poll for the pooled rows, the first slots' experts and the slot table),
+:func:`ex1_issue`, then :func:`union_of` and :func:`ex1_operand` (the norm
+and quantization of the A operand, while the weights stream), :func:`ex1_finish`, then :func:`ex2_issue` and
 :func:`ex2_finish` at ex2's place in the plan. ex2's first weights issue
 after ex1's products: issued with ex1's they sat on ex1's critical path (a
 full layer at 200k keys took 148.6 us instead of 145.9), and they still
@@ -123,11 +127,20 @@ OWNED_OUT = gl.constexpr(512)  # output columns a rank reduces: POOLED / WORLD
 PRE_EPS = gl.constexpr(1e-5)
 
 PEERS = ("rr",)
+# The slot table (:func:`slot_table_stage`), plain words in row 0 under one
+# flag (sltf): a word a pick (its id, slot, whether it owns its expert, the
+# slot count), then each pick's row picks ``[pick, row]``. Sized for 16
+# rows. As tagged pairs, all 256 ex1 CTAs polling one CTA's 2176 pairs took
+# 9-14 us past the table's end.
+SLT_PICKS = gl.constexpr(128)
+SLT_WORDS = gl.constexpr(128 + 128 * 16)
 
 
 def regions() -> tuple[tuple[str, int], ...]:
     k, nb1, ks, bn = int(TOP_K), int(NB1), int(KSPLIT), int(BLOCK_N)
     return (
+        ("slt", int(SLT_WORDS) // 2),  # words (half the region)
+        ("sltf", 1),
         ("p1", k * nb1 * ks * bn),  # FP32 [pick][block][K quarter][column] a row
         # The intermediate [pick][word] a row: MXFP4, or BF16 for the
         # layers with BF16 experts (one layout serves both).
@@ -140,9 +153,16 @@ def regions() -> tuple[tuple[str, int], ...]:
 
 
 def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
-    ex1, exr, ex2 = placement(bases, ("ex1", "exr", "ex2"))
+    slt, ex1, exr, ex2 = placement(bases, ("slt", "ex1", "exr", "ex2"))
     return (
-        Stage("ex1", int(EX1_TASKS), ex1, reads=("route", "cg"), writes=("p1",)),
+        Stage("slt", 1, slt, reads=("route",), writes=("slt", "sltf")),
+        Stage(
+            "ex1",
+            int(EX1_TASKS),
+            ex1,
+            reads=("slt", "sltf", "route", "cg"),
+            writes=("p1",),
+        ),
         Stage(
             "exr",
             int(EXR_LANE_TASKS) * (1 if rows == 1 else int(EXR_PARTS)),
@@ -200,6 +220,54 @@ def slots(ids):
         gl.sum(owner, axis=0),
         table,
     )
+
+
+@gluon.jit
+def slot_table_stage(mb, STAGE: gl.constexpr):
+    """The launch's slots (:func:`slots`), once: every row's picks, then
+    each pick's word (id, slot, owner, slot count) and row picks as plain
+    words in ``slt`` (row 0) under one flag (``sltf``). ex1 polls the flag
+    with the pooled rows, then loads the words, instead of building the
+    table on every CTA (:func:`union_of`)."""
+    mb.stamp(STAGE, trace.START)
+    R: gl.constexpr = schedule.rows(mb.plan)
+    RP: gl.constexpr = triton.next_power_of_2(R)
+    NP: gl.constexpr = RP * TOP_K
+    nw: gl.constexpr = gl.num_warps()
+    pk = gl.arange(0, NP, gl.SliceLayout(1, _pick_layout(NP, nw)))
+    (ids,) = mb.poll_many(
+        ("route",), (mb.row_offset(gl.minimum(pk // TOP_K, R - 1)) + pk % TOP_K,)
+    )
+    mb.stamp(STAGE, trace.READY)
+    ids, owner, slot, count, table = slots(ids)
+    lanes: gl.constexpr = ids.type.layout
+    p = gl.arange(0, NP, lanes)
+    word = ids | (slot << 8) | (owner << 15) | (count << 16)
+    mb.stamp(STAGE, trace.COMPUTED)
+    mb.store_words("slt", p, word)
+    tl: gl.constexpr = table.type.layout
+    tp = gl.arange(0, NP, gl.SliceLayout(1, tl))[:, None]
+    tr = gl.arange(0, RP, gl.SliceLayout(0, tl))[None, :]
+    mb.store_words("slt", SLT_PICKS + tp * RP + tr, table)
+    mb.raise_flag("sltf", 0)
+    mb.stamp(STAGE, trace.END)
+
+
+@gluon.constexpr_function
+def _table_layout(NP, RP, num_warps):
+    """``[pick, row]`` of the polled table: a pick's row a thread."""
+    return gl.BlockedLayout([1, RP], [64, 1], [num_warps, 1], [1, 0])
+
+
+@gluon.jit
+def union_of(polled):
+    """:func:`slots`'s result from the polled slot table (``ex1_poll``)."""
+    words, table = polled
+    ids = words & 0xFF
+    slot = (words >> 8) & 0x7F
+    owner = (words >> 15) & 1
+    count = gl.max(words >> 16, axis=0)
+    return ids, owner, slot, count, table
 
 
 @gluon.jit
@@ -319,10 +387,11 @@ def _cg_layout(num_warps):
 def ex1_poll(mb, task, task2, active, pre_gain, STAGE: gl.constexpr):
     """The inputs of ex1 task ``task`` and the experts of the slots: poll
     every whole pooled row (the norm needs every value), four rows a round
-    trip, and every row's expert ids with the first rows (routing ends before
-    the pooler, so the ids add no wait). Returns the polled rows (a tuple of
-    groups), the task's pre-expert gains (low and high values of the pairs),
-    every row's picks (a lane each, for :func:`slots`), then the experts of
+    trip, and the slot table's flag (:func:`slot_table_stage`) with the first
+    rows, then the table's words.
+    Returns the polled rows (a tuple of groups), the task's pre-expert gains
+    (low and high values of the pairs), the polled slot table (for
+    :func:`union_of`), then the experts of
     the first slots of ex1 task ``task`` and ex2 task ``task2`` (row 0's
     picks), for :func:`ex1_operand`.
 
@@ -347,10 +416,14 @@ def ex1_poll(mb, task, task2, active, pre_gain, STAGE: gl.constexpr):
     gain_lo = gl.load(pre_gain + c)
     gain_hi = gl.load(pre_gain + c + 1)
     pair = q * (K_SLICE // 2) + j[None, None, :]
-    # Every row's 8 ids, a lane each, and the first slots' experts.
+    # The slot table's words (a lane a pick) and row picks, and the first
+    # slots' experts.
     NP: gl.constexpr = RP * TOP_K
-    pk = gl.arange(0, NP, gl.SliceLayout(1, _pick_layout(NP, nw)))
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
+    pk = gl.arange(0, NP, lanes)
+    tl: gl.constexpr = _table_layout(NP, RP, nw)
+    tp = gl.arange(0, NP, gl.SliceLayout(1, tl))[:, None]
+    tr = gl.arange(0, RP, gl.SliceLayout(0, tl))[None, :]
     i = gl.arange(0, 2, lanes)
     first = gl.where(i == 0, task // (NB1 * KSPLIT), task2 // (NB2 // EX2_BLOCKS))
     if R > 1:
@@ -358,10 +431,12 @@ def ex1_poll(mb, task, task2, active, pre_gain, STAGE: gl.constexpr):
         # one wave spins on hints first (unthrottled, the flood of polls
         # starves the producers' stores across ranks and the grid livelocks).
         mb.row(R - 1).pre_poll_spread("cg", POOLED // 2)
-    got, firsts, ids = mb.poll_many(
-        ("cg", "route", "route"),
-        (mb.row_offset(gr) + pair, first, mb.row_offset(pk // TOP_K) + pk % TOP_K),
+    got, firsts, _ = mb.poll_many(
+        ("cg", "route", "sltf"), (mb.row_offset(gr) + pair, first, i * 0)
     )
+    # The table's flag is in: its words load after the poll returned.
+    gl.barrier()
+    ids = (mb.load_words("slt", pk), mb.load_words("slt", SLT_PICKS + tp * RP + tr))
     rows = (got,)
     for g in gl.static_range(1, RP // G):
         (more,) = mb.poll_many(("cg",), (mb.row_offset(g * G + gr) + pair,))
