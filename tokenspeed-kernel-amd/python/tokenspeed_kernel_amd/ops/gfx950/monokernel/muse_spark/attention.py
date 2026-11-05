@@ -376,6 +376,19 @@ def _group_softmax_step(
 
 
 @gluon.constexpr_function
+def _k_ring_layout(bits):
+    """The K ring's layout. A lane reads 8 dims of one key for the QK MFMA,
+    so with 64-byte FP8 rows the lanes of keys ``j``, ``j + 4``, ``j + 8``,
+    ``j + 12`` hit the same LDS banks (4-way conflicts: two thirds of a full
+    layer's attention time at 200k). The FP8 rows' 16-byte blocks are
+    XOR-swizzled by ``(key // 4) % 4``; the copies place them so. A BF16 row
+    is 128 bytes and keeps the plain layout (its whole-page copies)."""
+    if bits == 8:
+        return gl.SwizzledSharedLayout(16, 4, 4, [1, 0])
+    return gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+
+
+@gluon.constexpr_function
 def _page_copy_layout(nw):
     """A ``[PAGE, 64]`` BF16 tile of one page: 16 bytes a thread."""
     return gl.BlockedLayout([1, 8], [64 // nw, 8], [nw, 1], [1, 0])
@@ -683,7 +696,9 @@ def attn_stage(
     # this launch, and they arrive while the projections run.
     kv_dtype: gl.constexpr = k_cache.dtype.element_ty
     plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
-    k_ring = gl.allocate_shared_memory(kv_dtype, [NBUF, BN, HEAD], plain)
+    k_ring = gl.allocate_shared_memory(
+        kv_dtype, [NBUF, BN, HEAD], _k_ring_layout(kv_dtype.primitive_bitwidth)
+    )
     v_ring = gl.allocate_shared_memory(kv_dtype, [NBUF, BN, HEAD], plain)
     cl: gl.constexpr = _copy_layout(nw, kv_dtype.primitive_bitwidth)
     dv = gl.arange(0, HEAD, gl.SliceLayout(0, cl))
