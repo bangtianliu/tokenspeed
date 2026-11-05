@@ -81,13 +81,26 @@ def moe_tail_kernel(
         moe_tail.rnorm_stage(mb, task, "rnorm")
     task, active = schedule.stage_task(PLAN, "unpool")
     if active:
-        # No draft tap (TAP false): the tap arguments are unused.
-        moe_tail.unpool_stages(
-            mb, task, w_post, post_gain, alpha, beta, h_next, h_next, 0, 0, RANK, False
-        )
+        moe_tail.unpool_stages(mb, task, w_post, post_gain, alpha, beta, RANK)
     task, active = schedule.stage_task(PLAN, "out")
     if active:
-        moe_tail.out_stage(mb, task, beta, in_gain, a_out, "out")
+        # No draft tap (TAP false): the tap arguments are unused. The owned
+        # residual columns (WHOLE_ROWS false); the layer test covers whole rows.
+        moe_tail.out_stage(
+            mb,
+            task,
+            beta,
+            in_gain,
+            a_out,
+            h_next,
+            h_next,
+            0,
+            0,
+            RANK,
+            False,
+            False,
+            "out",
+        )
 
 
 def _inputs(launch: int, rows: int):

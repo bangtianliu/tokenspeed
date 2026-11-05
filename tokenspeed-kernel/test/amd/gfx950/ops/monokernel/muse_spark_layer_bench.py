@@ -299,7 +299,8 @@ def worker(rank: int, port: int, args) -> None:
             args.full,
             args.rows,
             args.rows,
-            False,
+            False,  # whole_rows: the owned residual columns
+            False,  # compile_only
         )
 
     def run(cold: bool) -> None:
