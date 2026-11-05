@@ -66,6 +66,7 @@ from collections.abc import Callable
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.monokernel import (
+    MUSE_SPARK_PROJ_WORDS,
     FusedDecodeLayer,
     muse_spark_layer_decode,
     prepare_muse_spark_experts,
@@ -388,6 +389,23 @@ def takes_monokernels(rows: int, ctx: ForwardContext) -> bool:
     )
 
 
+def projection_hand_off(
+    index: int, rows: int, fused, proj: torch.Tensor
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """``(proj_in, proj_out)`` of layer ``index``'s launch in a forward of
+    ``rows`` token rows: past one row, a launch whose next layer is fused
+    (``fused``: the fused layer indices) ends with that layer's q | k | v
+    projection, into copy ``(index + 1) & 1`` of ``proj`` (int32 ``[2, rows+,
+    words]``), and a launch whose previous layer is fused reads its own from
+    copy ``index & 1`` instead of projecting it."""
+    if rows == 1:
+        return None, None
+    return (
+        proj[index & 1] if index - 1 in fused else None,
+        proj[(index + 1) & 1] if index + 1 in fused else None,
+    )
+
+
 class MonokernelSteps:
     """Model-wide monokernel state: the mailbox scratch on the Iris symmetric
     heap, the heap bases of the TP8 group and the step counter."""
@@ -421,6 +439,12 @@ class MonokernelSteps:
             else None
         )
         self.bases = iris_group.bases.to(device)
+        # The q | k | v projection a launch hands to the next one (past one
+        # row, between two fused layers): launch ``i`` writes copy
+        # ``(i + 1) & 1`` at its end, launch ``i + 1`` reads it at its start.
+        self.proj = torch.zeros(
+            (2, MAX_ROWS, MUSE_SPARK_PROJ_WORDS), dtype=torch.int32, device=device
+        )
         # The launches' tag base: it moves once per forward, inside the graph.
         self.step = torch.zeros(1, dtype=torch.int32, device=device)
         iris_group.finish_prepare()
@@ -623,9 +647,13 @@ class MonokernelStep:
             whole_rows=whole_rows,
             tap=None,
             tap_slot=None,
-            # The next fused layer's QKVG weights, warmed into the MALL after
-            # this launch's experts.
+            # The next fused layer's launch: past one row this launch ends
+            # with its q | k | v projection (and that launch starts at its
+            # attention); for one row it warms its QKVG weights into the MALL.
             warm_next=monokernels.fused.get(index + 1),
+        )
+        operands["proj_in"], operands["proj_out"] = projection_hand_off(
+            index, rows, monokernels.fused, steps.proj
         )
         slot_of_next = monokernels.tap_slots.get(index + 1)
         if self._store_taps and slot_of_next is not None:
@@ -710,5 +738,6 @@ __all__ = [
     "model_reasons",
     "prepare_ep8_experts",
     "prepare_layer",
+    "projection_hand_off",
     "takes_monokernels",
 ]

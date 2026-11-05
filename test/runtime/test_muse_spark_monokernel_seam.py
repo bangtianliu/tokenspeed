@@ -61,6 +61,7 @@ from tokenspeed.runtime.models.muse_spark_monokernel import (  # noqa: E402
     _rank_slices,
     kv_reasons,
     model_reasons,
+    projection_hand_off,
     takes_monokernels,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict  # noqa: E402
@@ -93,6 +94,28 @@ def test_decode_steps_of_up_to_two_requests_take_the_kernels() -> None:
     assert not takes_monokernels(3, _ctx(ForwardMode.DECODE, 3, 3))
     assert not takes_monokernels(1, _ctx(ForwardMode.EXTEND, 1, 1))
     assert not takes_monokernels(1, _ctx(ForwardMode.IDLE, 1, 1))
+
+
+def test_launches_between_fused_layers_hand_the_projection_on() -> None:
+    """Past one row a launch whose next layer is fused writes that layer's
+    q | k | v projection into the copy the next launch reads, and a launch
+    after a fused layer reads its own there: layers 1 and 60 border the
+    regular layers 0 and 61. One row keeps every projection in its launch."""
+    fused = set(range(1, 61))
+    proj = torch.arange(2 * 8 * 4, dtype=torch.int32).view(2, 8, 4)
+    first_in, first_out = projection_hand_off(1, 8, fused, proj)
+    assert first_in is None and first_out.data_ptr() == proj[0].data_ptr()
+    mid_in, mid_out = projection_hand_off(2, 8, fused, proj)
+    assert mid_in.data_ptr() == proj[0].data_ptr()
+    assert mid_out.data_ptr() == proj[1].data_ptr()
+    last_in, last_out = projection_hand_off(60, 8, fused, proj)
+    assert last_in.data_ptr() == proj[0].data_ptr() and last_out is None
+    # Every launch reads the copy the launch before it wrote.
+    for i in range(2, 61):
+        assert projection_hand_off(i, 8, fused, proj)[0].data_ptr() == (
+            projection_hand_off(i - 1, 8, fused, proj)[1].data_ptr()
+        )
+    assert projection_hand_off(30, 1, fused, proj) == (None, None)
 
 
 def test_a_verify_step_gives_each_row_its_token_length() -> None:

@@ -72,6 +72,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import (
     QKVG,
     V_ROW,
 )
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.qkvg import PROJ_WORDS
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Stage, placement
 
 cdna4 = gl.amd.cdna4
@@ -109,18 +110,21 @@ def regions(splits: int) -> tuple[tuple[str, int], ...]:
 
 
 def stages(
-    bases: dict[str, int], splits: int, rows: int, chain: int
+    bases: dict[str, int], splits: int, rows: int, chain: int, own: bool
 ) -> tuple[Stage, ...]:
     """Head, attn and merge of ``rows`` token rows (requests of ``chain``
-    tokens), placed by ``bases``."""
+    tokens), placed by ``bases``. Head and attn poll the launch's qkvg
+    tasks (``own``), or read the projection that the previous launch's
+    qnext tasks stored."""
     head, attn, merge = placement(bases, ("head", "attn", "merge"))
+    proj = ("qkvg",) if own else ()
     return (
-        Stage("head", int(HEAD_TASKS) * rows, head, reads=("qkvg",)),
+        Stage("head", int(HEAD_TASKS) * rows, head, reads=proj),
         Stage(
             "attn",
             rows // chain * int(KV_HEADS) * splits,
             attn,
-            reads=("qkvg",),
+            reads=proj,
             writes=("part", "lse", "pflag"),
         ),
         Stage(
@@ -184,11 +188,15 @@ def head_stage(
     k_cache,
     v_cache,
     cos_sin,
+    proj,
     ROPE: gl.constexpr,
+    OWN: gl.constexpr,
     STAGE: gl.constexpr,
 ):
     """Head task ``task``: k head ``task % 2`` of row ``task // 2`` to the KV
-    cache.
+    cache. The projection comes from the launch's qkvg tasks (``OWN``), or
+    from ``proj`` (int32 ``[rows, PROJ_WORDS]``: the previous launch's
+    qnext tasks stored it).
 
     Args:
         seq_len: int32 ``[rows]``: ``L + 1`` for the row's token at position
@@ -207,13 +215,13 @@ def head_stage(
     e = gl.arange(0, 4, gl.SliceLayout(0, pl))[None, :]
     pos = gl.load(seq_len + row) - 1
     slot_at = gl.load(slot + row).to(gl.int64) * KV_STRIDE + 2 * j
-    kw, vw = mb.poll_many(
-        ("qkvg", "qkvg"),
-        (
-            _pair_index(j[:, None], e, GATE_ROW, K_ROW + g * HEAD),
-            _pair_index(j[:, None], e, GATE_ROW, V_ROW + g * HEAD),
-        ),
-    )
+    k_at = _pair_index(j[:, None], e, GATE_ROW, K_ROW + g * HEAD)
+    v_at = _pair_index(j[:, None], e, GATE_ROW, V_ROW + g * HEAD)
+    if OWN:
+        kw, vw = mb.poll_many(("qkvg", "qkvg"), (k_at, v_at))
+    else:
+        kw = gl.load(proj + row * PROJ_WORDS + k_at)
+        vw = gl.load(proj + row * PROJ_WORDS + v_at)
     mb.stamp(STAGE, trace.READY)
     lo, hi = _pair_values(kw, e, 1)
     lo, hi = _norm_rope(lo, hi, 1.0, cos_sin, pos, j, ROPE)
@@ -629,13 +637,16 @@ def attn_stage(
     k_cache,
     v_cache,
     cos_sin,
+    proj,
     ROPE: gl.constexpr,
+    OWN: gl.constexpr,
     SPLITS: gl.constexpr,
     WINDOW: gl.constexpr,
     STAGE: gl.constexpr,
 ):
     """Attn task ``task`` = (request ``task // (2 SPLITS)``, KV head, split)
-    of every row of the request.
+    of every row of the request. The projection comes as head_stage takes
+    it (``proj``, ``OWN``).
 
     Args:
         seq_len: int32 ``[rows]``, as head_stage takes it (the request's
@@ -766,22 +777,24 @@ def attn_stage(
         sq = gl.load(cos_sin + (L0 + q_tok) * HEAD + HEAD // 2 + qp)
         ck = gl.load(cos_sin + (L0 + k_tok) * HEAD + qp)
         sk = gl.load(cos_sin + (L0 + k_tok) * HEAD + HEAD // 2 + qp)
-    got_q, got_k, got_v = mb.poll_many(
-        ("qkvg", "qkvg", "qkvg"),
-        (
-            mb.row_offset(base + q_tok)[:, :, None]
-            + _pair_index(
-                qp[:, :, None],
-                eq,
-                GATE_ROW,
-                ((g * GROUP + q_head) * HEAD)[:, :, None],
-            ),
-            mb.row_offset(base + k_tok)[:, :, None]
-            + _pair_index(qp[:, :, None], eq, GATE_ROW, K_ROW + g * HEAD),
-            mb.row_offset(base + k_tok)[:, :, None]
-            + _pair_index(qp[:, :, None], eq, GATE_ROW, V_ROW + g * HEAD),
-        ),
+    q_at = _pair_index(
+        qp[:, :, None], eq, GATE_ROW, ((g * GROUP + q_head) * HEAD)[:, :, None]
     )
+    k_at = _pair_index(qp[:, :, None], eq, GATE_ROW, K_ROW + g * HEAD)
+    v_at = _pair_index(qp[:, :, None], eq, GATE_ROW, V_ROW + g * HEAD)
+    if OWN:
+        got_q, got_k, got_v = mb.poll_many(
+            ("qkvg", "qkvg", "qkvg"),
+            (
+                mb.row_offset(base + q_tok)[:, :, None] + q_at,
+                mb.row_offset(base + k_tok)[:, :, None] + k_at,
+                mb.row_offset(base + k_tok)[:, :, None] + v_at,
+            ),
+        )
+    else:
+        got_q = gl.load(proj + ((base + q_tok) * PROJ_WORDS)[:, :, None] + q_at)
+        got_k = gl.load(proj + ((base + k_tok) * PROJ_WORDS)[:, :, None] + k_at)
+        got_v = gl.load(proj + ((base + k_tok) * PROJ_WORDS)[:, :, None] + v_at)
     mb.stamp(STAGE, trace.READY)
     q_lo, q_hi = _pair_values(got_q, eq, 2)
     inv_q = gl.rsqrt(gl.sum(q_lo * q_lo + q_hi * q_hi, axis=1) / HEAD + EPS)[:, None]

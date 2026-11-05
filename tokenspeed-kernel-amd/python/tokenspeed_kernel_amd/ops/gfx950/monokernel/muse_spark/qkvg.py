@@ -28,6 +28,13 @@ as fast as the memory can, so the q | k | v blocks spread over 160 CTAs.
 * gate, 128 tasks: the output-gate blocks (rows 1280 .. 2303), on CTAs
   that run a qkvg task first. Attention does not wait for the gate, so its
   weights load after the q | k | v weights.
+* qnext, 160 tasks (a launch whose next layer is fused too, see
+  ``layer.layer_plan``): the next layer's qkvg tasks at the end of this
+  launch. Their input is this launch's output rows, which the out tasks
+  publish as plain words (``moe_tail``); their partial sums go to global
+  memory, where the next launch's head and attention tasks read them with
+  plain loads instead of polling ``qkvg``. That launch has no qkvg stage:
+  its attention starts at once.
 
 A task issues its weight loads first, then reads its K half of the
 attention input rows that the previous launch wrote, and publishes its 16
@@ -57,13 +64,26 @@ REGIONS = (
 )
 
 
-def stages(bases: dict[str, int]) -> tuple[Stage, ...]:
-    """QKVG and gate, placed by ``bases``."""
+# A projection row in global memory (qnext's output, the next launch's input):
+# the qkvg region's FP32 partial sums of one token row, [K half][q | k | v].
+PROJ_WORDS = gl.constexpr(int(KSPLIT) * int(GATE_ROW))
+
+
+def stages(bases: dict[str, int], own: bool) -> tuple[Stage, ...]:
+    """QKVG (when the launch computes its own projection: ``own``) and gate,
+    placed by ``bases``."""
     qkv, gate = placement(bases, ("qkvg", "gate"))
     return (
-        Stage("qkvg", int(KSPLIT * QKV_BLOCKS), qkv, writes=("qkvg",)),
+        (Stage("qkvg", int(KSPLIT * QKV_BLOCKS), qkv, writes=("qkvg",)),) if own else ()
+    ) + (
         Stage("gate", int(KSPLIT * GATE_BLOCKS), gate, writes=("gate",)),
     )
+
+
+def next_stages(bases: dict[str, int]) -> tuple[Stage, ...]:
+    """The next layer's qkvg tasks (qnext), placed by ``bases``."""
+    (qnext,) = placement(bases, ("qnext",))
+    return (Stage("qnext", int(KSPLIT * QKV_BLOCKS), qnext, reads=("anx", "anxf")),)
 
 
 @gluon.jit
@@ -131,6 +151,59 @@ def gate_stage(mb, task, w, a, a_stride, STAGE: gl.constexpr):
     )
     mb.stamp(STAGE, trace.COMPUTED)
     _put_rows(mb, "gate", out, at)
+    mb.stamp(STAGE, trace.END)
+
+
+@gluon.jit
+def qnext_stage(mb, task, w, proj, OUT_PER_ROW: gl.constexpr, STAGE: gl.constexpr):
+    """Qnext task ``task``: :func:`qkvg_stage` of the next layer, from this
+    launch's output rows.
+
+    It issues its weight loads, polls the flags of the out tasks of its K
+    half in every row, reads their words (``anx``), and stores its 16 FP32
+    partial sums per row at ``proj`` + row * ``PROJ_WORDS``, as the qkvg
+    region holds them.
+
+    Args:
+        w: The next layer's fused weight, BF16 ``[2304, 8192]``.
+        proj: int32 ``[rows, PROJ_WORDS]``: the next launch's projection.
+        OUT_PER_ROW: Out tasks a row; each publishes ``8192 / OUT_PER_ROW``
+            values of its row and raises flag ``task`` of ``anxf``.
+    """
+    R: gl.constexpr = schedule.rows(mb.plan)
+    mb.stamp(STAGE, trace.START)
+    blk = task // KSPLIT
+    half = task % KSPLIT
+    KITS: gl.constexpr = HIDDEN // 32 // KSPLIT
+    tiles = bf16.load_weight_tiles(
+        w,
+        nb0=blk,
+        K=HIDDEN,
+        kit0=half * KITS,
+        KITS=KITS,
+        SPLIT=8,
+        NW=1,
+        GROUP=1,
+        GROUP_STRIDE=0,
+    )
+    # The out tasks of this K half, in every row: one flag each.
+    F: gl.constexpr = OUT_PER_ROW // KSPLIT
+    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
+    n = gl.arange(0, 64 * gl.num_warps(), lanes)
+    flag = mb.row_offset(gl.minimum(n // F, R - 1)) + half * F + n % F
+    mb.poll_many(("anxf",), (flag,))
+    gl.barrier()
+    mb.stamp(STAGE, trace.READY)
+    x_smem = bf16.load_local_word_rows(
+        mb, "anx", half * (HIDDEN // KSPLIT), HIDDEN // KSPLIT, R
+    )
+    out = bf16.gemv(x_smem, tiles, FIRST=0, ROWS=R)  # FP32 [RP, 16]
+    mb.stamp(STAGE, trace.COMPUTED)
+    ol: gl.constexpr = out.type.layout
+    r = gl.arange(0, out.shape[0], gl.SliceLayout(1, ol))[:, None]
+    i = gl.arange(0, 16, gl.SliceLayout(0, ol))[None, :]
+    at = r * PROJ_WORDS + half * GATE_ROW + blk * 16 + i
+    gl.store(proj + at, out.to(gl.int32, bitcast=True), mask=(r < R) & (i >= 0))
     mb.stamp(STAGE, trace.END)
 
 
