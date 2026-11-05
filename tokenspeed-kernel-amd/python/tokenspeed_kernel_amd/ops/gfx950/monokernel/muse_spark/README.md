@@ -81,7 +81,7 @@ docstring gives its math and task split):
 | Module | Stages | Work |
 |---|---|---|
 | `qkvg.py` | qkvg, gate | The fused q / k / v / output-gate projection, in two K halves. |
-| `attention.py` | head, attn, merge | k norm, RoPE and the KV write; split attention with an online softmax (on a full layer, each warp group over its own keys of a chunk, combined once a split); the LSE merge and the gated head norm. |
+| `attention.py` | head, attn, merge | k norm, RoPE and the KV write; split attention with an online softmax, its K and V copied to an LDS ring two chunks ahead (on a full layer at long context, each warp group over its own keys of a chunk, combined once a split; a BF16 cache copied a page at a time); the LSE merge and the gated head norm. |
 | `attn_tail.py` | oproj, tail1, tail2 | `o_proj` reduce-scattered to the owners; the post-attention norm, residual gate and pre-FFN norm. |
 | `moe_route.py` | router, topk | Partial router logits of the owned columns; the sum, sigmoid scores and top 8. |
 | `moe_pool.py` | pool | The pre-expert projection, gathered on every rank. |

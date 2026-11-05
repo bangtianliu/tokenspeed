@@ -72,18 +72,20 @@ def _online(state, scores, values):
 
 
 def verify_attention(
-    q, keys, values, own_k, own_v, t, first, L0, row_first, splits, chunk
+    q, keys, values, own_k, own_v, t, first, L0, row_first, splits, chunk, align
 ):
     """The monokernel's split attention of row ``t``'s q heads ``q [heads,
     64]`` (of one KV head): the splits share the cached keys ``first .. L0 -
     1`` (``keys`` / ``values`` ``[L0 - first, 64]``) in chunks of ``chunk``, the
     keys before ``row_first`` masked; the last split then takes the launch's
     keys ``0 .. t`` (``own_k`` / ``own_v``) as one more chunk. Then the LSE
-    merge. Returns ``[heads, 64]``."""
+    merge. A split's keys are a multiple of ``align`` (whole pages when 64).
+    Returns ``[heads, 64]``."""
     scale = 0.125 * math.log2(math.e)
     heads = q.shape[0]
     n = L0 - first
     per = -(-n // splits)
+    per = -(-per // align) * align
     pos = torch.arange(first, L0)
     scores = (q.float() @ keys.T) * scale
     scores = torch.where(pos >= row_first, scores, float("-inf"))
@@ -168,6 +170,19 @@ def attention_z(qkvg, k_cache, v_cache, table, length, window, splits, cs):
                 row_first,
                 splits,
                 128,
+                # Full layers with 8 rows (64 MFMA rows) on a BF16 cache split
+                # on whole pages from LONG_KEYS cached keys (attention.py's key
+                # groups).
+                (
+                    64
+                    if (
+                        window == 0
+                        and rows == 8
+                        and kv_dtype == torch.bfloat16
+                        and L0 >= 32768
+                    )
+                    else 1
+                ),
             )
             a = a.to(torch.bfloat16).float()
             inv = torch.rsqrt(a.pow(2).mean(-1, keepdim=True) + 1e-5)

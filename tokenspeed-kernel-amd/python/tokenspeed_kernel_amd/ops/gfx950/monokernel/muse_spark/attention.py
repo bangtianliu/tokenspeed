@@ -42,9 +42,14 @@ token at position ``L0 + t``, where ``L0`` is the request's own.
   ``max(0, L0 + t - WINDOW + 1) .. L0 + t`` (from 0 on a full layer). The
   splits share the cached keys before ``L0``, ``ceil(n / SPLITS)`` each
   (from the first key that row 0 attends), in chunks of 128 with an online
-  base-2 softmax. The last split then also takes the launch's tokens, as one
-  more chunk. A task publishes FP32 ``acc / l`` and the LSE of the 8 q heads
-  of its KV head of each row (an empty split publishes ``-inf``) as plain
+  base-2 softmax; a ring in LDS keeps two chunks' K and V copying while one
+  is computed. On a full layer with 8 token rows from ``LONG_KEYS`` cached
+  keys, the warps instead take 16 rows each in two key groups with their own
+  softmax state (:func:`_group_keys`), and a BF16 cache's splits are whole
+  pages, copied a page at a time. The last split then also takes the
+  launch's tokens, as one more chunk. A task publishes FP32 ``acc / l`` and
+  the LSE of the 8 q heads of its KV head of each row (an empty split
+  publishes ``-inf``) as plain
   words, then one flag (``Mailbox.store_words`` / ``raise_flag``): at 8 rows
   a task writes 64 x 64 values, which as tagged pairs took ~8 us to publish.
 * merge, 16 tasks per row, one per q head: after the splits' flags, the LSE
@@ -55,7 +60,8 @@ token at position ``L0 + t``, where ``L0`` is the request's own.
 
 from __future__ import annotations
 
-from tokenspeed_kernel_amd._triton import gl, gluon, triton
+from tokenspeed_kernel_amd._scheduling import wave_uniform_i32
+from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import mx, schedule, trace
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import (
     GATE_ROW,
@@ -68,6 +74,8 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import (
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Stage, placement
 
+cdna4 = gl.amd.cdna4
+
 HEAD = HEAD_DIM
 GROUP = gl.constexpr(8)  # q heads per KV head
 PAGE = gl.constexpr(64)  # tokens a KV page
@@ -75,6 +83,12 @@ KV_STRIDE = gl.constexpr(128)  # cache elements a slot: 2 KV heads x 64
 # Keys a chunk, for either cache dtype: 256 FP8 keys (the bytes of 128 BF16
 # ones) made a full layer slower below ~200k cached keys (8-GPU bench).
 BN = gl.constexpr(128)
+# Chunks of K and V in LDS: two in flight while one is computed.
+NBUF = gl.constexpr(3)
+# Cached keys from which a full layer's splits take the key-group loop
+# (_group_keys): below, its whole-page splits and once-a-split combine cost
+# more than they save (8.7k keys: +4 us a full layer, 8 GPUs).
+LONG_KEYS = gl.constexpr(32768)
 WINDOW = 2048  # a sliding layer attends the last 2048 positions, its own included
 EPS = gl.constexpr(1e-5)
 Q_GAIN = gl.constexpr(5.473006248474121)  # qk_scale_factor as an FP32 norm gain
@@ -215,13 +229,14 @@ def head_stage(
 
 @gluon.constexpr_function
 def _layouts(nw, QM):
-    """(qk MFMA, pv MFMA, K operand, V load) layouts for ``QM`` MFMA rows:
-    the launch's own keys, a sliding layer's cached keys and the output (a
-    full layer's cached keys use :func:`_warp_layouts`).
+    """(qk MFMA, pv MFMA, K operand, V load) layouts for ``QM`` MFMA rows.
 
     With 32 rows or more (3+ token rows) the warps split the rows in two and
-    the keys in ``nw / 2``; one or two token rows are 16 MFMA rows, a single
-    row tile. Splitting the rows in four lost to the duplicated key loads."""
+    the chunk's keys in ``nw / 2``: the softmax's row max and sum then cross
+    half the warps, for keys loaded by two warps each. At 8 rows and 340k
+    keys this takes a full layer from 167.5 to 156.2 us (8 GPUs); splitting
+    the rows in four loses (172.6 us) to the duplicated key loads. One
+    or two token rows are 16 MFMA rows, a single row tile."""
     rw = 2 if QM >= 32 else 1
     qk_mma = gl.amd.AMDMFMALayout(
         version=4,
@@ -240,183 +255,355 @@ def _layouts(nw, QM):
     return qk_mma, pv_mma, k_layout, v_load
 
 
-@gluon.jit
-def _load_row_pages(table, c0, hi, k_layout: gl.constexpr, v_load: gl.constexpr):
-    """:func:`_load_pages` for the layouts of :func:`_layouts` (a sliding
-    layer's chunk): the pages of chunk ``c0 ..``'s keys, in the key and value layouts.
-    They load a chunk ahead of the keys they locate, so a chunk's cache loads
-    do not wait for a page table load."""
-    jk = c0 + gl.arange(0, BN, gl.SliceLayout(0, k_layout))
-    jv = c0 + gl.arange(0, BN, gl.SliceLayout(1, v_load))
-    page_k = gl.load(table + jk // PAGE, mask=jk < hi, other=0)
-    page_v = gl.load(table + jv // PAGE, mask=jv < hi, other=0)
-    return page_k, page_v
+@gluon.constexpr_function
+def _copy_layout(nw, bits):
+    """Rows of a ``[BN, 64]`` chunk of K or V for the direct-to-LDS copies:
+    16 bytes a thread, the widest copy gfx950 has (it has no 8-byte one,
+    which 8 FP8 elements would need)."""
+    per = 128 // bits
+    return gl.BlockedLayout(
+        [1, per], [64 // (HEAD // per), HEAD // per], [nw, 1], [1, 0]
+    )
 
 
 @gluon.jit
-def _load_row_kv(
-    pages,
-    k_cache,
-    v_cache,
-    g,
-    c0,
-    hi,
-    dk,
-    dv,
-    k_layout: gl.constexpr,
-    v_load: gl.constexpr,
+def _chunk_keys(c0, hi, v_load: gl.constexpr):
+    """Key positions of chunk ``c0 ..``, one per row of ``v_load``. Positions
+    from ``hi`` repeat the split's last key (or key 0): an async copy leaves
+    masked lanes' LDS unwritten, and stale bits could be NaN in V, where
+    ``0 * NaN`` would poison the sum. Their scores are masked to -inf."""
+    j = c0 + gl.arange(0, BN, gl.SliceLayout(1, v_load))
+    return gl.maximum(gl.minimum(j, hi - 1), 0)
+
+
+@gluon.jit
+def _load_pages(table, c0, hi, v_load: gl.constexpr):
+    """The pages of chunk ``c0 ..``'s keys.
+
+    A wave's loads, the copies to LDS included, retire in issue order
+    (``vmcnt``): reading a page loaded after some chunk's copies would wait
+    for those copies too. So the pages load before the copies of the chunk
+    ahead of the one they locate, and a chunk's copies wait only for older
+    loads. A plain load: a volatile one waited for every outstanding load
+    (``vmcnt(0)``) right after it."""
+    return gl.load(table + _chunk_keys(c0, hi, v_load) // PAGE)
+
+
+@gluon.jit
+def _issue_kv(
+    k_ring, v_ring, slot, page, k_cache, v_cache, g, c0, hi, dv, v_load: gl.constexpr
 ):
-    """Keys ``[64, BN]`` and values ``[BN, 64]`` of chunk ``c0 ..`` from the
-    cache (zero from ``hi``), in BF16 (an FP8 cache's widen exactly), at the
-    chunk's ``pages`` (:func:`_load_row_pages`)."""
-    page_k, page_v = pages
-    jk = c0 + gl.arange(0, BN, gl.SliceLayout(0, k_layout))
-    jv = c0 + gl.arange(0, BN, gl.SliceLayout(1, v_load))
-    old_k = jk < hi
-    old_v = jv < hi
-    slot_k = page_k.to(gl.int64) * PAGE + jk % PAGE
-    slot_v = page_v.to(gl.int64) * PAGE + jv % PAGE
-    keys = gl.load(
-        k_cache + g * HEAD + slot_k[None, :] * KV_STRIDE + dk[:, None],
-        mask=old_k[None, :],
-        other=0.0,
-    )
-    values = gl.load(
-        v_cache + g * HEAD + slot_v[:, None] * KV_STRIDE + dv[None, :],
-        mask=old_v[:, None],
-        other=0.0,
-    )
-    return keys.to(gl.bfloat16), values.to(gl.bfloat16)
+    """Copy chunk ``c0 ..``'s keys and values ``[BN, 64]`` (the cache's dtype)
+    at ``page`` (:func:`_load_pages`) into ring slot ``slot``, as one commit
+    group, straight to LDS: the compiler's waits for register loads do not
+    drain it, so the ring keeps two chunks in flight across the loop."""
+    # A chunk past the split's end copies the split's last key again (its
+    # scores are masked) instead of skipping its copies: a copy under a branch
+    # would make the compiler wait for every outstanding load after it.
+    j = _chunk_keys(c0, hi, v_load)
+    row = (page.to(gl.int64) * PAGE + j % PAGE) * KV_STRIDE + g * HEAD
+    at = row[:, None] + dv[None, :]
+    cdna4_async_copy.global_load_to_shared(k_ring.index(slot), k_cache + at)
+    cdna4_async_copy.global_load_to_shared(v_ring.index(slot), v_cache + at)
+    cdna4_async_copy.commit_group()
 
 
 @gluon.jit
 def _softmax_step(q, keys, values, valid, m, l, acc, p_layout: gl.constexpr):
     """One chunk of the online base-2 softmax: ``keys [64, N]`` and
-    ``values [N, 64]`` (an operand layout and LDS), where ``valid [QM, N]``;
-    or the same with a leading batch dimension (the per-warp key groups)."""
+    ``values [N, 64]`` (an operand layout and LDS), where ``valid [QM, N]``."""
     pv_mma: gl.constexpr = acc.type.layout
-    K: gl.constexpr = len(q.shape) - 1  # the key axis of the scores
-    if K == 1:
-        scores = gl.zeros([q.shape[0], keys.shape[1]], gl.float32, valid.type.layout)
-    else:
-        scores = gl.zeros(
-            [q.shape[0], q.shape[1], keys.shape[2]], gl.float32, valid.type.layout
-        )
+    scores = gl.zeros([q.shape[0], keys.shape[1]], gl.float32, valid.type.layout)
     scores = gl.amd.cdna4.mfma(q, keys, scores)
     scores = gl.where(valid, scores * QK_SCALE, float("-inf"))
-    m_new = gl.maximum(m, gl.max(scores, axis=K))
+    m_new = gl.maximum(m, gl.max(scores, axis=1))
     m_safe = gl.where(m_new == float("-inf"), 0.0, m_new)
     alpha = gl.exp2(m - m_safe)
-    p = gl.exp2(scores - gl.expand_dims(m_safe, K))
-    l = l * alpha + gl.sum(p, axis=K)
+    p = gl.exp2(scores - m_safe[:, None])
+    l = l * alpha + gl.sum(p, axis=1)
     pv = gl.zeros(acc.shape, gl.float32, pv_mma)
     pv = gl.amd.cdna4.mfma(gl.convert_layout(p.to(gl.bfloat16), p_layout), values, pv)
-    acc = (
-        acc * gl.expand_dims(gl.convert_layout(alpha, gl.SliceLayout(K, pv_mma)), K)
-        + pv
-    )
+    acc = acc * gl.convert_layout(alpha, gl.SliceLayout(1, pv_mma))[:, None] + pv
     return m_new, l, acc
 
 
 @gluon.constexpr_function
-def _warp_layouts(nw, QM):
-    """(qk MFMA, pv MFMA, K operand) layouts of a full layer's cached keys:
-    the warps split each chunk's keys in ``W = nw / rw`` groups (a batch
-    dimension) and the rows in ``rw`` as :func:`_layouts`. A group keeps its
-    own running max, sum and output (flash-decoding within the CTA), so a
-    chunk's softmax and P x V stay inside its warps: the only barriers of a
-    chunk stage V. The groups combine once (:func:`_combine`): at 340k keys
-    and 8 rows a full layer takes 170.8 us instead of 182.7 (FP8 KV, 8 GPUs).
-    A sliding split is a single chunk, where the combine costs more than it
-    saves, so sliding layers keep :func:`_layouts`."""
-    rw = 2 if QM >= 32 else 1
-    qk_mma = gl.amd.AMDMFMALayout(
+def _group_layouts(nw):
+    """(qk MFMA, pv MFMA) layouts of ``[key group, row, ...]`` tensors for
+    :func:`_group_keys`: two key groups (the batch dimension) of ``nw / 2``
+    warps, each warp 16 MFMA rows, so a warp's softmax max, sum and
+    probabilities stay in the warp: no LDS round trip or barrier a chunk."""
+    qk3 = gl.amd.AMDMFMALayout(
         version=4,
         instr_shape=[16, 16, 32],
         transposed=True,
-        warps_per_cta=[nw // rw, rw, 1],
+        warps_per_cta=[2, nw // 2, 1],
     )
-    pv_mma = gl.amd.AMDMFMALayout(
+    pv3 = gl.amd.AMDMFMALayout(
         version=4,
         instr_shape=[16, 16, 16],
         transposed=True,
-        warps_per_cta=[nw // rw, rw, 1],
+        warps_per_cta=[2, nw // 2, 1],
     )
-    return qk_mma, pv_mma, gl.DotOperandLayout(1, qk_mma, 8)
+    return qk3, pv3
+
+
+@gluon.jit
+def _group_softmax_step(
+    q, keys, values, valid, m, l, acc, p_layout: gl.constexpr, MASK: gl.constexpr
+):
+    """:func:`_softmax_step` of every key group's own keys: ``q [G, QM, 64]``,
+    ``keys [G, 64, KW]``, ``values [G, KW, 64]``, ``valid [G, QM, KW]`` (used
+    only when ``MASK``)."""
+    pv3: gl.constexpr = acc.type.layout
+    scores = gl.zeros(
+        [q.shape[0], q.shape[1], keys.shape[2]], gl.float32, valid.type.layout
+    )
+    scores = gl.amd.cdna4.mfma(q, keys, scores)
+    if MASK:
+        scores = gl.where(valid, scores * QK_SCALE, float("-inf"))
+    else:
+        scores = scores * QK_SCALE
+    m_new = gl.maximum(m, gl.max(scores, axis=2))
+    m_safe = gl.where(m_new == float("-inf"), 0.0, m_new)
+    alpha = gl.exp2(m - m_safe)
+    p = gl.exp2(scores - m_safe[:, :, None])
+    l = l * alpha + gl.sum(p, axis=2)
+    pv = gl.zeros(acc.shape, gl.float32, pv3)
+    pv = gl.amd.cdna4.mfma(gl.convert_layout(p.to(gl.bfloat16), p_layout), values, pv)
+    acc = acc * gl.convert_layout(alpha, gl.SliceLayout(2, pv3))[:, :, None] + pv
+    return m_new, l, acc
 
 
 @gluon.constexpr_function
-def _groups(layout):
-    """The key groups ``W`` of a :func:`_warp_layouts` layout (or its operand)."""
-    mma = layout.parent if isinstance(layout, gl.DotOperandLayout) else layout
-    return mma.warps_per_cta[0]
+def _page_copy_layout(nw):
+    """A ``[PAGE, 64]`` BF16 tile of one page: 16 bytes a thread."""
+    return gl.BlockedLayout([1, 8], [64 // nw, 8], [nw, 1], [1, 0])
 
 
 @gluon.jit
-def _group_keys(c0, layout: gl.constexpr):
-    """Key positions ``[W, BN / W]`` of chunk ``c0 ..`` (axis 1 of the 3-D
-    ``layout`` sliced away): group ``w`` holds keys ``c0 + w BN / W ..``."""
-    W: gl.constexpr = _groups(layout)
-    pl: gl.constexpr = gl.SliceLayout(1, layout)
-    w = gl.arange(0, W, gl.SliceLayout(1, pl))[:, None]
-    n = gl.arange(0, BN // W, gl.SliceLayout(0, pl))[None, :]
-    return c0 + w * (BN // W) + n
+def _page_of(table, c, hi):
+    """The page-table entry of key ``c``, clamped to the split's last key
+    (or key 0)."""
+    return gl.load(table + gl.maximum(gl.minimum(c, hi - 1), 0) // PAGE)
 
 
 @gluon.jit
-def _load_pages(table, c0, hi, k_layout: gl.constexpr, v_load: gl.constexpr):
-    """The pages of chunk ``c0 ..``'s keys, in the key (:func:`_group_keys`)
-    and value layouts. They load a chunk ahead of the keys they locate, so a
-    chunk's cache loads do not wait for a page table load."""
-    jk = _group_keys(c0, k_layout)
-    jv = c0 + gl.arange(0, BN, gl.SliceLayout(1, v_load))
-    page_k = gl.load(table + jk // PAGE, mask=jk < hi, other=0)
-    page_v = gl.load(table + jv // PAGE, mask=jv < hi, other=0)
-    return page_k, page_v
+def _issue_page(ring, cache, page, c, hi, g, offs, half: gl.constexpr, slot):
+    """Copy the page of keys ``c .. c + 64`` (entry ``page``) into half
+    ``half`` of ring slot ``slot``, through a descriptor at the page: the
+    page's address stays in SGPRs and ``offs`` is the same for every page.
+    The descriptor ends at key ``hi``, so later keys read as zero (their
+    scores are masked) at no cost."""
+    # The clamp compiles to a VALU v_med3: back to an SGPR, or every copy
+    # would loop over the lanes' descriptors.
+    n = wave_uniform_i32(gl.minimum(gl.maximum(hi - c, 0), PAGE))
+    at = cache + wave_uniform_i32(page).to(gl.int64) * (PAGE * KV_STRIDE)
+    desc = cdna4.buffer.make_buffer_descriptor(at, n * (KV_STRIDE * 2))
+    cdna4.buffer.load_to_shared(
+        ring.index(slot).slice(half * PAGE, PAGE), desc, offs, soffset=g * HEAD
+    )
 
 
 @gluon.jit
-def _load_kv(
-    pages, k_cache, v_cache, g, c0, hi, dv, k_layout: gl.constexpr, v_load: gl.constexpr
+def _issue_chunk(k_ring, v_ring, slot, pa, pb, k_cache, v_cache, g, c0, hi, offs):
+    """Chunk ``c0 ..``'s two pages (entries ``pa``, ``pb``) of K and V into
+    ring slot ``slot``, as one commit group."""
+    _issue_page(k_ring, k_cache, pa, c0, hi, g, offs, 0, slot)
+    _issue_page(v_ring, v_cache, pa, c0, hi, g, offs, 0, slot)
+    _issue_page(k_ring, k_cache, pb, c0 + PAGE, hi, g, offs, 1, slot)
+    _issue_page(v_ring, v_cache, pb, c0 + PAGE, hi, g, offs, 1, slot)
+    cdna4_async_copy.commit_group()
+
+
+@gluon.jit
+def _group_keys(
+    q,
+    k_ring,
+    v_ring,
+    table,
+    k_cache,
+    v_cache,
+    g,
+    lo,
+    hi,
+    pa,
+    pb,
+    offs,
+    pages,
+    dv,
+    cl: gl.constexpr,
+    m,
+    l,
+    acc,
+    PAGES: gl.constexpr,
 ):
-    """Keys ``[W, 64, BN / W]`` of the per-warp groups (in the operand
-    layout) and values ``[BN, 64]`` of chunk ``c0 ..`` from the cache (zero
-    from ``hi``), in BF16 (an FP8 cache's widen exactly), at the chunk's
-    ``pages`` (:func:`_load_pages`)."""
-    page_k, page_v = pages
-    jk = _group_keys(c0, k_layout)
-    jv = c0 + gl.arange(0, BN, gl.SliceLayout(1, v_load))
-    dk = gl.arange(0, HEAD, gl.SliceLayout(0, gl.SliceLayout(2, k_layout)))
-    slot_k = page_k.to(gl.int64) * PAGE + jk % PAGE
-    slot_v = page_v.to(gl.int64) * PAGE + jv % PAGE
-    keys = gl.load(
-        k_cache + g * HEAD + slot_k[:, None, :] * KV_STRIDE + dk[None, :, None],
-        mask=(jk < hi)[:, None, :],
-        other=0.0,
+    """A full layer's cached keys ``lo .. hi`` from ``LONG_KEYS`` (the ring
+    holds chunks 0 and 1; ``pa``, ``pb`` (``PAGES``) or ``pages`` locate chunk
+    2). Key group ``w`` takes keys ``KW w ..`` of each chunk with its own
+    softmax state; the groups combine once at the end. A BF16 cache's chunks
+    copy a page at a time (``PAGES``, whole-page splits); an FP8 page's ``[64,
+    64]`` tile is half of what 8 warps copy at 16 bytes a thread, so FP8 keeps
+    the per-key copies. Only the split's last chunk is masked. Returns ``m``,
+    ``l`` and ``acc`` (in the layouts of the arguments) with the keys folded
+    in."""
+    nw: gl.constexpr = gl.num_warps()
+    QM: gl.constexpr = q.shape[0]
+    G: gl.constexpr = 2
+    KW: gl.constexpr = BN // G
+    qk3: gl.constexpr = _group_layouts(nw)[0]
+    pv3: gl.constexpr = _group_layouts(nw)[1]
+    q3l: gl.constexpr = gl.DotOperandLayout(0, qk3, 8)
+    k3: gl.constexpr = gl.DotOperandLayout(1, qk3, 8)
+    p3: gl.constexpr = gl.DotOperandLayout(0, pv3, 4)
+    v3: gl.constexpr = gl.DotOperandLayout(1, pv3, 4)
+    # Every group's copy of q: one conversion, then a broadcast in registers.
+    q_w = gl.convert_layout(q, gl.SliceLayout(0, q3l))
+    q_w = q_w[None, :, :] + gl.zeros([G, QM, HEAD], gl.bfloat16, q3l)
+    ww = gl.arange(0, G, gl.SliceLayout(1, gl.SliceLayout(2, qk3)))[:, None, None]
+    jw = gl.arange(0, KW, gl.SliceLayout(0, gl.SliceLayout(1, qk3)))[None, None, :]
+    m_w = gl.full([G, QM], float("-inf"), gl.float32, gl.SliceLayout(2, qk3))
+    l_w = gl.zeros([G, QM], gl.float32, gl.SliceLayout(2, qk3))
+    acc_w = gl.zeros([G, QM, HEAD], gl.float32, pv3)
+    i = 0
+    for c0 in range(lo, hi, BN):
+        valid = c0 + ww * KW + jw < hi  # [G, 1, KW]: every row attends every key
+        # As attn_stage's loop: every wave is done with the slot the next
+        # copy refills, then chunk i + 3's pages and chunk i + 2's copies.
+        gl.barrier()
+        if PAGES:
+            na = _page_of(table, c0 + 3 * BN, hi)
+            nb = _page_of(table, c0 + 3 * BN + PAGE, hi)
+            _issue_chunk(
+                k_ring,
+                v_ring,
+                (i + 2) % NBUF,
+                pa,
+                pb,
+                k_cache,
+                v_cache,
+                g,
+                c0 + 2 * BN,
+                hi,
+                offs,
+            )
+            pa = na
+            pb = nb
+        else:
+            pages3 = _load_pages(table, c0 + 3 * BN, hi, cl)
+            _issue_kv(
+                k_ring,
+                v_ring,
+                (i + 2) % NBUF,
+                pages,
+                k_cache,
+                v_cache,
+                g,
+                c0 + 2 * BN,
+                hi,
+                dv,
+                cl,
+            )
+            pages = pages3
+        cdna4_async_copy.wait_group(2)
+        gl.barrier()
+        keys = k_ring.index(i % NBUF).reshape([G, KW, HEAD]).permute([0, 2, 1]).load(k3)
+        values = v_ring.index(i % NBUF).reshape([G, KW, HEAD]).load(v3)
+        keys = keys.to(gl.bfloat16)  # an FP8 cache's widen exactly
+        values = values.to(gl.bfloat16)
+        # Only the split's last chunk has keys past its end.
+        if c0 + BN > hi:
+            m_w, l_w, acc_w = _group_softmax_step(
+                q_w, keys, values, valid, m_w, l_w, acc_w, p3, True
+            )
+        else:
+            m_w, l_w, acc_w = _group_softmax_step(
+                q_w, keys, values, valid, m_w, l_w, acc_w, p3, False
+            )
+        i += 1
+    cdna4_async_copy.wait_group(0)
+    # The groups' states into one: their LSE merge, once.
+    m_max = gl.max(m_w, axis=0)
+    m_safe = gl.where(m_max == float("-inf"), 0.0, m_max)
+    scale = gl.exp2(m_w - m_safe[None, :])
+    l_sum = gl.sum(l_w * scale, axis=0)
+    acc_w = acc_w * gl.convert_layout(scale, gl.SliceLayout(2, pv3))[:, :, None]
+    acc_sum = gl.sum(acc_w, axis=0)
+    return (
+        gl.convert_layout(m_max, m.type.layout),
+        gl.convert_layout(l_sum, l.type.layout),
+        gl.convert_layout(acc_sum, acc.type.layout),
     )
-    values = gl.load(
-        v_cache + g * HEAD + slot_v[:, None] * KV_STRIDE + dv[None, :],
-        mask=(jv < hi)[:, None],
-        other=0.0,
-    )
-    return keys.to(gl.bfloat16), values.to(gl.bfloat16)
 
 
 @gluon.jit
-def _combine(m, l, acc, qk2: gl.constexpr, pv2: gl.constexpr):
-    """The per-warp groups' softmax states ``m, l [W, QM]``, ``acc [W, QM,
-    64]`` as one state in the layouts of :func:`_layouts` (``qk2``, ``pv2``)."""
-    pv3: gl.constexpr = acc.type.layout
-    top = gl.max(m, axis=0)
-    safe = gl.where(top == float("-inf"), 0.0, top)
-    f = gl.exp2(m - safe[None, :])
-    l = gl.sum(l * f, axis=0)
-    acc = gl.sum(acc * gl.convert_layout(f, gl.SliceLayout(2, pv3))[:, :, None], axis=0)
-    return (
-        gl.convert_layout(top, gl.SliceLayout(1, qk2)),
-        gl.convert_layout(l, gl.SliceLayout(1, qk2)),
-        gl.convert_layout(acc, pv2),
-    )
+def _ring_keys(
+    q,
+    k_ring,
+    v_ring,
+    table,
+    k_cache,
+    v_cache,
+    g,
+    lo,
+    hi,
+    pages,
+    dv,
+    cl: gl.constexpr,
+    row_first,
+    m,
+    l,
+    acc,
+    k_layout: gl.constexpr,
+    v_layout: gl.constexpr,
+    p_layout: gl.constexpr,
+):
+    """The cached keys ``lo .. hi`` in chunks of ``BN`` through the ring (it
+    holds chunks 0 and 1, ``pages`` locates chunk 2), every warp on its share
+    of each chunk. Returns ``m``, ``l`` and ``acc`` with the keys folded in."""
+    qk_mma: gl.constexpr = row_first.type.layout.parent
+    i = 0
+    for c0 in range(lo, hi, BN):
+        js = c0 + gl.arange(0, BN, gl.SliceLayout(0, qk_mma))
+        valid = (js[None, :] < hi) & (js[None, :] >= row_first[:, None])
+        # Every wave is done with the slot the next copy refills (chunk
+        # i - 1's); then the pages of chunk i + 3 and chunk i + 2's copies
+        # (at pages loaded before chunk i + 1's) go before this chunk's math.
+        gl.barrier()
+        pages3 = _load_pages(table, c0 + 3 * BN, hi, cl)
+        _issue_kv(
+            k_ring,
+            v_ring,
+            (i + 2) % NBUF,
+            pages,
+            k_cache,
+            v_cache,
+            g,
+            c0 + 2 * BN,
+            hi,
+            dv,
+            cl,
+        )
+        pages = pages3
+        # Chunk i's group is complete once at most two are outstanding.
+        cdna4_async_copy.wait_group(2)
+        gl.barrier()
+        keys = k_ring.index(i % NBUF).permute([1, 0]).load(k_layout)
+        values = v_ring.index(i % NBUF).load(v_layout)
+        m, l, acc = _softmax_step(
+            q,
+            keys.to(gl.bfloat16),
+            values.to(gl.bfloat16),
+            valid,
+            m,
+            l,
+            acc,
+            p_layout,
+        )
+        i += 1
+    # No copy may still write LDS when the launch moves on.
+    cdna4_async_copy.wait_group(0)
+    return m, l, acc
 
 
 @gluon.jit
@@ -460,15 +647,11 @@ def attn_stage(
     nw: gl.constexpr = gl.num_warps()
     qk_mma: gl.constexpr = _layouts(nw, QM)[0]
     pv_mma: gl.constexpr = _layouts(nw, QM)[1]
+    k_layout: gl.constexpr = _layouts(nw, QM)[2]
     v_load: gl.constexpr = _layouts(nw, QM)[3]
     q_layout: gl.constexpr = gl.DotOperandLayout(0, qk_mma, 8)
     p_layout: gl.constexpr = gl.DotOperandLayout(0, pv_mma, 4)
     v_layout: gl.constexpr = gl.DotOperandLayout(1, pv_mma, 4)
-    # The cached keys' per-warp softmax (_warp_layouts).
-    qk3: gl.constexpr = _warp_layouts(nw, QM)[0]
-    pv3: gl.constexpr = _warp_layouts(nw, QM)[1]
-    k3: gl.constexpr = _warp_layouts(nw, QM)[2]
-    W: gl.constexpr = qk3.warps_per_cta[0]
 
     L0 = gl.load(seq_len + base) - 1
     # The cached keys of the splits: from row 0's first key, before L0.
@@ -477,43 +660,78 @@ def attn_stage(
     else:
         first = gl.maximum(L0 - WINDOW + 1, 0)
     per = (L0 - first + SPLITS - 1) // SPLITS
+    # Key groups (_group_keys): 16 MFMA rows a warp, so 64 rows (8 token
+    # rows) at 8 warps, on a full layer.
+    GROUPED: gl.constexpr = (WINDOW == 0) and (QM == 16 * (nw // 2))
+    # A BF16 cache's chunks copy a page at a time (whole-page splits).
+    PAGES: gl.constexpr = k_cache.dtype.element_ty.primitive_bitwidth == 16
+    if GROUPED:
+        # A long context takes the key groups (a BF16 cache with whole pages
+        # a split, so a chunk is two whole pages). Uniform (an SGPR), so the
+        # paths branch on a scalar.
+        long = wave_uniform_i32((L0 >= LONG_KEYS).to(gl.int32)) != 0
+        if PAGES:
+            per = gl.where(long, (per + PAGE - 1) // PAGE * PAGE, per)
     lo = first + s * per
     hi = gl.minimum(lo + per, L0)
+    if GROUPED:
+        # In SGPRs: the copies' descriptors derive from them.
+        lo = wave_uniform_i32(lo)
+        hi = wave_uniform_i32(hi)
 
-    # The first chunk's cache loads go before the poll: they do not depend
-    # on this launch, and they arrive while the projections run.
-    dv = gl.arange(0, HEAD, gl.SliceLayout(0, v_load))
-    if WINDOW == 0:
-        keys, values = _load_kv(
-            _load_pages(table, lo, hi, k3, v_load),
-            k_cache,
-            v_cache,
-            g,
-            lo,
-            hi,
-            dv,
-            k3,
-            v_load,
+    # The first two chunks' copies go before the poll: they do not depend on
+    # this launch, and they arrive while the projections run.
+    kv_dtype: gl.constexpr = k_cache.dtype.element_ty
+    plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    k_ring = gl.allocate_shared_memory(kv_dtype, [NBUF, BN, HEAD], plain)
+    v_ring = gl.allocate_shared_memory(kv_dtype, [NBUF, BN, HEAD], plain)
+    cl: gl.constexpr = _copy_layout(nw, kv_dtype.primitive_bitwidth)
+    dv = gl.arange(0, HEAD, gl.SliceLayout(0, cl))
+    if GROUPED:
+        pcl: gl.constexpr = _page_copy_layout(nw)
+        offs = (
+            gl.arange(0, PAGE, gl.SliceLayout(1, pcl))[:, None] * KV_STRIDE
+            + gl.arange(0, HEAD, gl.SliceLayout(0, pcl))[None, :]
         )
-        pages = _load_pages(table, lo + BN, hi, k3, v_load)
+        pa = hi * 0
+        pb = hi * 0
+        pages = gl.zeros([BN], gl.int32, gl.SliceLayout(1, cl))
+        if PAGES:
+            if long:
+                p0a = _page_of(table, lo, hi)
+                p0b = _page_of(table, lo + PAGE, hi)
+                p1a = _page_of(table, lo + BN, hi)
+                p1b = _page_of(table, lo + BN + PAGE, hi)
+                pa = _page_of(table, lo + 2 * BN, hi)
+                pb = _page_of(table, lo + 2 * BN + PAGE, hi)
+                _issue_chunk(
+                    k_ring, v_ring, 0, p0a, p0b, k_cache, v_cache, g, lo, hi, offs
+                )
+                _issue_chunk(
+                    k_ring, v_ring, 1, p1a, p1b, k_cache, v_cache, g, lo + BN, hi, offs
+                )
+            else:
+                page0 = _load_pages(table, lo, hi, cl)
+                page1 = _load_pages(table, lo + BN, hi, cl)
+                pages = _load_pages(table, lo + 2 * BN, hi, cl)
+                _issue_kv(k_ring, v_ring, 0, page0, k_cache, v_cache, g, lo, hi, dv, cl)
+                _issue_kv(
+                    k_ring, v_ring, 1, page1, k_cache, v_cache, g, lo + BN, hi, dv, cl
+                )
+        else:
+            page0 = _load_pages(table, lo, hi, cl)
+            page1 = _load_pages(table, lo + BN, hi, cl)
+            pages = _load_pages(table, lo + 2 * BN, hi, cl)
+            _issue_kv(k_ring, v_ring, 0, page0, k_cache, v_cache, g, lo, hi, dv, cl)
+            _issue_kv(
+                k_ring, v_ring, 1, page1, k_cache, v_cache, g, lo + BN, hi, dv, cl
+            )
     else:
-        # A sliding split is one chunk: the per-warp groups' combine would
-        # cost more than the chunk's reductions it saves (+4 us a layer).
-        k_layout: gl.constexpr = _layouts(nw, QM)[2]
-        dk = gl.arange(0, HEAD, gl.SliceLayout(1, k_layout))
-        keys, values = _load_row_kv(
-            _load_row_pages(table, lo, hi, k_layout, v_load),
-            k_cache,
-            v_cache,
-            g,
-            lo,
-            hi,
-            dk,
-            dv,
-            k_layout,
-            v_load,
-        )
-        pages = _load_row_pages(table, lo + BN, hi, k_layout, v_load)
+        page0 = _load_pages(table, lo, hi, cl)
+        page1 = _load_pages(table, lo + BN, hi, cl)
+        pages = _load_pages(table, lo + 2 * BN, hi, cl)
+        _issue_kv(k_ring, v_ring, 0, page0, k_cache, v_cache, g, lo, hi, dv, cl)
+        _issue_kv(k_ring, v_ring, 1, page1, k_cache, v_cache, g, lo + BN, hi, dv, cl)
 
     # q of the 8 heads of every row, and the launch's k and v. A thread
     # holds one pair, 32 lanes a head: the norm sums in head_stage's order.
@@ -567,20 +785,9 @@ def attn_stage(
         q,
         0.0,
     )
-    q = q.to(gl.bfloat16)
-    if WINDOW == 0:
-        # Every key group multiplies all of q (each group's warps hold a copy).
-        qb: gl.constexpr = gl.BlockedLayout([1, 1, 8], [1, 8, 8], [1, nw, 1], [2, 1, 0])
-        q_groups = gl.convert_layout(
-            gl.convert_layout(q, gl.SliceLayout(0, qb))[None, :, :]
-            + gl.zeros([W, QM, HEAD], gl.bfloat16, qb),
-            gl.DotOperandLayout(0, qk3, 8),
-        )
-    q = gl.convert_layout(q, q_layout)
+    q = gl.convert_layout(q.to(gl.bfloat16), q_layout)
     v_lo, v_hi = _pair_values(got_v, eq, 2)
     # The launch's k and v as the cache holds them: rounded once to its dtype.
-    kv_dtype: gl.constexpr = k_cache.dtype.element_ty
-    plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     cur_k = gl.allocate_shared_memory(gl.bfloat16, [KT, HEAD], plain)
     cur_v = gl.allocate_shared_memory(gl.bfloat16, [KT, HEAD], plain)
     cur_k.store(
@@ -597,58 +804,76 @@ def attn_stage(
         row_first = gl.zeros_like(qi_tok)
     else:
         row_first = L0 + qi_tok - WINDOW + 1
-    if WINDOW == 0:
-        m = gl.full([W, QM], float("-inf"), gl.float32, gl.SliceLayout(2, qk3))
-        l = gl.zeros([W, QM], gl.float32, gl.SliceLayout(2, qk3))
-        acc = gl.zeros([W, QM, HEAD], gl.float32, pv3)
-        first3 = gl.convert_layout(row_first, gl.SliceLayout(0, gl.SliceLayout(2, qk3)))
-        v_smem = gl.allocate_shared_memory(gl.bfloat16, [BN, HEAD], plain)
-        v_groups = v_smem.reshape([W, BN // W, HEAD])
-        for c0 in range(lo, hi, BN):
-            js = _group_keys(c0, qk3)[:, None, :]
-            valid = (js < hi) & (js >= first3[None, :, None])
-            # The next chunk's loads (at pages already loaded) and the pages of
-            # the one after go before this chunk's math.
-            next_keys, next_values = _load_kv(
-                pages, k_cache, v_cache, g, c0 + BN, hi, dv, k3, v_load
-            )
-            pages = _load_pages(table, c0 + 2 * BN, hi, k3, v_load)
-            gl.barrier()
-            v_smem.store(values)
-            gl.barrier()
-            m, l, acc = _softmax_step(
-                q_groups,
-                keys,
-                v_groups.load(gl.DotOperandLayout(1, pv3, 4)),
-                valid,
+    m = gl.full([QM], float("-inf"), gl.float32, gl.SliceLayout(1, qk_mma))
+    l = gl.zeros([QM], gl.float32, gl.SliceLayout(1, qk_mma))
+    acc = gl.zeros([QM, HEAD], gl.float32, pv_mma)
+    if GROUPED:
+        if long:
+            m, l, acc = _group_keys(
+                q,
+                k_ring,
+                v_ring,
+                table,
+                k_cache,
+                v_cache,
+                g,
+                lo,
+                hi,
+                pa,
+                pb,
+                offs,
+                pages,
+                dv,
+                cl,
                 m,
                 l,
                 acc,
-                gl.DotOperandLayout(0, pv3, 4),
+                PAGES,
             )
-            keys = next_keys
-            values = next_values
-        m, l, acc = _combine(m, l, acc, qk_mma, pv_mma)
+        else:
+            m, l, acc = _ring_keys(
+                q,
+                k_ring,
+                v_ring,
+                table,
+                k_cache,
+                v_cache,
+                g,
+                lo,
+                hi,
+                pages,
+                dv,
+                cl,
+                row_first,
+                m,
+                l,
+                acc,
+                k_layout,
+                v_layout,
+                p_layout,
+            )
     else:
-        m = gl.full([QM], float("-inf"), gl.float32, gl.SliceLayout(1, qk_mma))
-        l = gl.zeros([QM], gl.float32, gl.SliceLayout(1, qk_mma))
-        acc = gl.zeros([QM, HEAD], gl.float32, pv_mma)
-        v_smem = gl.allocate_shared_memory(gl.bfloat16, [BN, HEAD], plain)
-        for c0 in range(lo, hi, BN):
-            js = c0 + gl.arange(0, BN, gl.SliceLayout(0, qk_mma))
-            valid = (js[None, :] < hi) & (js[None, :] >= row_first[:, None])
-            next_keys, next_values = _load_row_kv(
-                pages, k_cache, v_cache, g, c0 + BN, hi, dk, dv, k_layout, v_load
-            )
-            pages = _load_row_pages(table, c0 + 2 * BN, hi, k_layout, v_load)
-            gl.barrier()
-            v_smem.store(values)
-            gl.barrier()
-            m, l, acc = _softmax_step(
-                q, keys, v_smem.load(v_layout), valid, m, l, acc, p_layout
-            )
-            keys = next_keys
-            values = next_values
+        m, l, acc = _ring_keys(
+            q,
+            k_ring,
+            v_ring,
+            table,
+            k_cache,
+            v_cache,
+            g,
+            lo,
+            hi,
+            pages,
+            dv,
+            cl,
+            row_first,
+            m,
+            l,
+            acc,
+            k_layout,
+            v_layout,
+            p_layout,
+        )
     # The launch's tokens: token u is the key at L0 + u; row t attends u <= t.
     gl.barrier()
     u = gl.arange(0, KT, gl.SliceLayout(0, qk_mma))
