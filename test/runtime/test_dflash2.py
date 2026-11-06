@@ -642,3 +642,40 @@ def test_the_context_write_monokernel_takes_the_column_parallel_fc(
         ),
     )
     assert (dflash2_monokernel.context_reasons(model) == []) is served
+
+
+@pytest.mark.parametrize("fused_reduce_norm", [False, True])
+def test_preparing_the_draft_prepares_its_monokernels(fused_reduce_norm: bool) -> None:
+    """With --decode-monokernel the draft's collectives include the
+    monokernels' mailbox scratch, whether or not the regular layers' fused
+    reduce + norm is also prepared: unprepared, the monokernels never serve and
+    every draft step falls back to the layers."""
+    from tokenspeed.runtime.models import dflash2 as dflash2_model
+
+    group = [0, 1, 2, 3, 4, 5, 6, 7]
+    prepared = []
+    model = DFlash2DraftModel.__new__(DFlash2DraftModel)
+    torch.nn.Module.__init__(model)
+    model.mapping = SimpleNamespace(attn=SimpleNamespace(tp_group=group))
+    # A prepared fused reduce + norm answers at once. Declining it needs an
+    # Iris group this test lacks, so that case declines without the device.
+    model.fused_reduce_norm = object() if fused_reduce_norm else None
+    if not fused_reduce_norm:
+        model._prepare_fused_reduce_norm = lambda max_num_tokens: False
+    model.monokernels = SimpleNamespace(prepare=lambda *args: prepared.append(args))
+    with (
+        mock.patch.object(
+            dflash2_model.process_group_manager,
+            "get_device_process_group",
+            return_value="device",
+        ),
+        mock.patch.object(
+            dflash2_model.process_group_manager,
+            "get_process_group",
+            return_value="gloo",
+        ),
+        mock.patch.object(dflash2_model.dist, "get_rank", return_value=3),
+    ):
+        assert model.prepare_communication_runtime(64)
+
+    assert prepared == [("device", "gloo", 3)]

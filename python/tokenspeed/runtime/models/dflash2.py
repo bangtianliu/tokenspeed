@@ -500,19 +500,6 @@ class DFlash2DraftModel(DFlashDraftModel):
             return self.monokernels.forward(positions, hidden_states, residual, ctx)
         return super().run_decoder(positions, hidden_states, residual, ctx)
 
-    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
-        """Allocate the draft monokernels' mailbox scratch on the Iris heap,
-        before graph capture."""
-        if self.monokernels is None:
-            return False
-        group = self.mapping.attn.tp_group
-        self.monokernels.prepare(
-            process_group_manager.get_device_process_group(group),
-            process_group_manager.get_process_group("gloo", group),
-            group.index(dist.get_rank()),
-        )
-        return True
-
     def configure_target(self, target_model, target_config) -> None:
         """Install the capture inputs, and the FP8 head copy if quantized.
 
@@ -553,6 +540,30 @@ class DFlash2DraftModel(DFlashDraftModel):
         return hidden_states
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        """Prepare the draft's collectives, before cache sizing and graph
+        capture: the fused reduce + norm of the regular layers' boundaries,
+        then the draft monokernels' mailbox scratch on the Iris heap
+        (--decode-monokernel). The fused reduce + norm goes first: its
+        mailboxes are sized against the heap's headroom.
+
+        Args:
+            max_num_tokens: Most rows a forward carries.
+
+        Returns:
+            Whether the draft prepared anything.
+        """
+        prepared = self._prepare_fused_reduce_norm(max_num_tokens)
+        if self.monokernels is None:
+            return prepared
+        group = self.mapping.attn.tp_group
+        self.monokernels.prepare(
+            process_group_manager.get_device_process_group(group),
+            process_group_manager.get_process_group("gloo", group),
+            group.index(dist.get_rank()),
+        )
+        return True
+
+    def _prepare_fused_reduce_norm(self, max_num_tokens: int) -> bool:
         """Prepare the fused reduce + norm of the draft's layer boundaries.
 
         Collective: every rank prepares or declines alike, before cache
