@@ -117,6 +117,16 @@ def _reference_b(launch: int, rows: int):
     return b.to(torch.bfloat16).float()
 
 
+def _rank_order_sum(red: torch.Tensor) -> torch.Tensor:
+    """FP32 of the BF16-rounded sum, in rank order, of the 8 ranks' BF16
+    partials of the owned columns (``red``'s int32 pairs, source-rank major)."""
+    parts = red.view(torch.bfloat16).float().view(WORLD, OWNED)
+    total = torch.zeros(OWNED)
+    for p in range(WORLD):
+        total = total + parts[p]
+    return total.to(torch.bfloat16).float()
+
+
 def _reference_tail(launch: int, b: torch.Tensor):
     """``(h', u)`` of ``b [rows, 8192]``."""
     h, alpha, beta, pre_gain = _shared_inputs(launch, b.shape[0])
@@ -173,15 +183,24 @@ def _worker(rank: int, port: int, rows: int) -> None:
             )
             torch.cuda.synchronize()
             tag = launch_tag(step, 0)
-            # The router's input: the reduced, BF16-rounded o_proj columns.
-            # A rank's BF16 partial can be one step off the reference's (its
-            # FP32 sums run in another order); with the final rounding the
-            # sum is then up to two BF16 steps off.
+            # b, the reduced, BF16-rounded o_proj columns: the 8 ranks'
+            # BF16 partials this rank received, summed in rank order as tail1
+            # (and the router) sum them. A rank's BF16 partial can be one step
+            # off the reference's (its FP32 sums run in another order); with
+            # the final rounding the sum is then up to two BF16 steps off.
             b = torch.stack(
                 [
-                    payloads(scratch, plan, "bq", OWNED, tag, row=row)
-                    .view(torch.float32)
-                    .cpu()
+                    _rank_order_sum(
+                        payloads(
+                            scratch,
+                            plan,
+                            "red",
+                            WORLD * OWNED // 2,
+                            tag,
+                            row=row,
+                            copy=step & 1,
+                        ).cpu()
+                    )
                     for row in range(rows)
                 ]
             )
