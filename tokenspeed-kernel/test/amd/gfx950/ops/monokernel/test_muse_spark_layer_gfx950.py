@@ -253,7 +253,9 @@ def _worker(
         dev = torch.device(f"cuda:{rank}")
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
-        plan = layer.layer_plan(full, rows, rows, True, True, False, bf16_experts)
+        plan = layer.layer_plan(
+            full, rows, rows, True, True, False, bf16_experts, False
+        )
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         # A draft's taps: the launch stores its residual into slot 3 of
         # every rank's copy.
@@ -301,6 +303,10 @@ def _worker(
                 proj_in=None,
                 proj_out=None,
                 trace_buf=None,
+                # Launches repeat a layer between barriers, which the check
+                # cannot tell from overlapping launches (the qnext chain
+                # test checks).
+                check_parity=False,
                 compile_only=compile_only,
             )
 
@@ -441,7 +447,7 @@ def _two_requests_worker(rank: int, port: int, full: bool) -> None:
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
         rows = 8  # a verify of 7 draft tokens a request
-        plan = layer.layer_plan(full, 2 * rows, rows, False, True, False, False)
+        plan = layer.layer_plan(full, 2 * rows, rows, False, True, False, False, False)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         lengths = (3000, 3100)
@@ -501,6 +507,8 @@ def _two_requests_worker(rank: int, port: int, full: bool) -> None:
                 proj_in=None,
                 proj_out=None,
                 trace_buf=None,
+                # Repeats one layer between barriers (see _worker).
+                check_parity=False,
                 compile_only=False,
             )
             torch.cuda.synchronize()
@@ -558,7 +566,7 @@ def _shift_worker(rank: int, port: int, kinds: tuple[bool, ...]) -> None:
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
         rows, length = 8, 3000
         end = length + rows - 1
-        plan = layer.layer_plan(False, rows, rows, False, True, False, False)
+        plan = layer.layer_plan(False, rows, rows, False, True, False, False, True)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         sh = _shared(42, length, rows)
         w = _rank_weights(rank, end)
@@ -580,7 +588,9 @@ def _shift_worker(rank: int, port: int, kinds: tuple[bool, ...]) -> None:
         cos_sin = ref.rope_table(end + 1).to(dev)
         proj = torch.zeros(2, rows, int(PROJ_WORDS), dtype=torch.int32, device=dev)
 
-        def launch(i, h, a, step, caches, proj_in, proj_out):
+        # Layer index ``index`` (the tag and the peer copy) moves on every
+        # launch, as in serving: the second pass goes on from the first.
+        def launch(i, index, h, a, step, caches, proj_in, proj_out):
             h_out = torch.empty(rows, OWNED, device=dev)
             a_out = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
             layer.launch_gluon_muse_spark_layer_gfx950(
@@ -598,7 +608,7 @@ def _shift_worker(rank: int, port: int, kinds: tuple[bool, ...]) -> None:
                 scratch=scratch,
                 step=torch.full((1,), step, dtype=torch.int32, device=dev),
                 peer_bases=group.bases,
-                layer=i + 1,
+                layer=index,
                 chain=rows,
                 whole_rows=False,
                 tap=None,
@@ -607,6 +617,7 @@ def _shift_worker(rank: int, port: int, kinds: tuple[bool, ...]) -> None:
                 proj_in=proj_in,
                 proj_out=proj_out,
                 trace_buf=None,
+                check_parity=True,
                 compile_only=False,
             )
             torch.cuda.synchronize()
@@ -621,7 +632,7 @@ def _shift_worker(rank: int, port: int, kinds: tuple[bool, ...]) -> None:
         h, a = sh["h"][:, own].contiguous().to(dev), sh["a_in"].to(dev)
         want = []
         for i in range(n):
-            h, a = launch(i, h, a, 3, regular[i], None, None)
+            h, a = launch(i, i + 1, h, a, 3, regular[i], None, None)
             want.append((h.cpu(), a.cpu()))
         # The first launch projects its own q | k | v and the next layer's;
         # the others read theirs from the previous launch; the last projects
@@ -630,6 +641,7 @@ def _shift_worker(rank: int, port: int, kinds: tuple[bool, ...]) -> None:
         for i in range(n):
             h, a = launch(
                 i,
+                n + i + 1,
                 h,
                 a,
                 4,
@@ -672,7 +684,7 @@ def _graph_worker(rank: int, port: int, length: int) -> None:
         dev = torch.device(f"cuda:{rank}")
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
-        plan = layer.layer_plan(False, 1, 1, False, True, False, False)
+        plan = layer.layer_plan(False, 1, 1, False, True, False, False, False)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         sh = _shared(42, length, 1)
         weights = _pack(rank, dev, sh, length, False)
@@ -716,6 +728,8 @@ def _graph_worker(rank: int, port: int, length: int) -> None:
                 proj_in=None,
                 proj_out=None,
                 trace_buf=None,
+                # Graph replays and eager launches repeat layer 2 between barriers.
+                check_parity=False,
                 compile_only=False,
             )
             # The seam moves the tag base once per forward, in the graph.
@@ -780,9 +794,10 @@ _VARIANTS = [
 
 @pytest.mark.parametrize("variants", _VARIANTS)
 @pytest.mark.parametrize("bf16_experts", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("check_parity", [False, True])
 @pytest.mark.parametrize("rows", range(1, layer.MAX_ROWS + 1))
 def test_both_kinds_of_layer_lay_the_scratch_out_alike(
-    rows: int, variants, bf16_experts
+    rows: int, variants, bf16_experts, check_parity
 ):
     """Sliding and full launches share one scratch and alternate the peer
     regions' copies. A rank a launch ahead must then put only into the copy
@@ -792,8 +807,12 @@ def test_both_kinds_of_layer_lay_the_scratch_out_alike(
     experts have one)."""
     if rows == 1 and any(v[2] for v in variants):
         pytest.skip("qnext runs past one row")
-    sliding = layer.layer_plan(False, rows, rows, *variants[0], bf16_experts[0])
-    full = layer.layer_plan(True, rows, rows, *variants[1], bf16_experts[1])
+    sliding = layer.layer_plan(
+        False, rows, rows, *variants[0], bf16_experts[0], check_parity
+    )
+    full = layer.layer_plan(
+        True, rows, rows, *variants[1], bf16_experts[1], check_parity
+    )
     assert sliding.regions == full.regions
     assert sliding.peers == full.peers
     assert sliding.row_pairs == full.row_pairs

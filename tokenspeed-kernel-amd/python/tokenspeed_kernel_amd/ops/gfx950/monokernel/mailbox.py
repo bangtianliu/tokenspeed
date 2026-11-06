@@ -189,6 +189,12 @@ def _poll_asm(outputs, inputs, cache):
 
 
 @gluon.jit
+def _trap():
+    """The fail-stop of a stuck poll (``s_trap 2``), for a broken invariant."""
+    gl.inline_asm("s_trap 2\ns_mov_b32 $0, 0", "=s", [], gl.int32, is_pure=False)
+
+
+@gluon.jit
 def _spin_all():
     lanes = gl.arange(0, 64 * gl.num_warps(), lane_layout(gl.num_warps()))
     return gl.full_like(lanes, 1)
@@ -447,6 +453,25 @@ class Mailbox:
             self.trace,
             self.peers,
         )
+
+    @gluon.jit
+    def check_parity(self, parity):
+        """Fail-stop (``s_trap 2``) unless ``parity`` differs from the last
+        launch's on this rank: the peer regions' copy must alternate from one
+        launch to the next (:class:`Peers`). The plan's one-pair region
+        ``parity`` keeps it (plus one; 0: no launch yet). Call it from CTA 0
+        before any put. Serving may let a regular layer's collectives order
+        two same-parity launches, so only tests and benches turn it on."""
+        at = self.scratch + schedule.region(self.plan, "parity")
+        prev = gl.load(at)
+        # Every wave reads the last launch's value before any wave writes
+        # this launch's.
+        gl.barrier()
+        if prev == parity + 1:
+            _trap()
+        # prev * 0: an int64 value whether ``parity`` is a tensor or a
+        # specialized constant.
+        gl.store(at, prev * 0 + parity + 1)
 
     @gluon.jit
     def stamp(self, stage: gl.constexpr, point: gl.constexpr):
