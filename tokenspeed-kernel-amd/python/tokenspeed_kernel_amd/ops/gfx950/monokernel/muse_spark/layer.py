@@ -166,6 +166,7 @@ def layer_plan(
     own_qkvg: bool,
     next_qkvg: bool,
     bf16_experts: bool,
+    check_parity: bool,
 ) -> Plan:
     """The plan of a full-attention (``full``) or sliding-window layer for
     ``rows`` token rows: requests of ``chain`` tokens each, 1 for decode,
@@ -177,7 +178,9 @@ def layer_plan(
     starts at once). ``next_qkvg``: the launch ends with the next layer's
     projection (qnext), which replaces the warm stage; past one row only.
     ``bf16_experts``: the layer's experts are BF16 (``moe_experts_bf16``),
-    which run no xq stage."""
+    which run no xq stage. ``check_parity``: the scratch keeps the last
+    launch's parity (``Mailbox.check_parity``); without it, serving's layout
+    is the same as with no check at all."""
     if not 1 <= rows <= MAX_ROWS or rows % chain:
         raise ValueError(
             f"a launch serves 1 to {MAX_ROWS} rows of requests of {chain}, got {rows}"
@@ -199,6 +202,7 @@ def layer_plan(
         + moe_pool.regions()
         + moe_experts.regions()
         + moe_tail.regions()
+        + ((("parity", 1),) if check_parity else ())
     )
     nq = next_qkvg
     stages = (
@@ -274,6 +278,7 @@ def gluon_muse_spark_layer_gfx950(
     TAP: gl.constexpr,
     WHOLE_ROWS: gl.constexpr,
     BF16_EXPERTS: gl.constexpr,
+    CHECK_PARITY: gl.constexpr,
 ):
     """One decode step of one layer on rank ``RANK``.
 
@@ -289,7 +294,8 @@ def gluon_muse_spark_layer_gfx950(
     after the layer also goes, BF16 on every rank (``moe_tail.out_stage``).
     ``WHOLE_ROWS``: the residual output holds whole FP32 rows, not the owned
     columns. ``BF16_EXPERTS``: the experts are BF16 (``moe_experts_bf16``;
-    the scale operands are unused).
+    the scale operands are unused). ``CHECK_PARITY``: fail-stop when this
+    launch's parity repeats the last one's (``Mailbox.check_parity``).
     ``warm_ptr``, ``warm_quads``: the next launch's packed QKVG weights, read
     (``4 * warm_quads`` int32 words) only when ``PLAN`` has the warm stage.
     ``code_offset``, ``code_quads``: this binary's ``code_warm.text_range``.
@@ -301,6 +307,9 @@ def gluon_muse_spark_layer_gfx950(
     table = trace.allocate(trace_buf)
     peers = mailbox.load_peers(bases, RANK, layer & 1, WORLD)
     mb = mailbox.Mailbox(scratch, mailbox.launch_tag(step, layer), PLAN, table, peers)
+    if CHECK_PARITY:
+        if gl.program_id(0) == 0:
+            mb.check_parity(layer & 1)
     task, active = schedule.stage_task(PLAN, "code")
     if active:
         code_warm.code_warm_stage(
@@ -576,6 +585,7 @@ def launch_layer(
     chain: int,
     whole_rows: bool,
     bf16_experts: bool,
+    check_parity: bool,
     compile_only: bool,
 ):
     """Launch one layer step of ``rows`` token rows, requests of ``chain``
@@ -587,6 +597,9 @@ def launch_layer(
     weights) is warmed into the memory-side cache after the experts. With
     ``whole_rows`` the residual output (in ``moe_ops``) is whole FP32
     ``[rows, 8192]`` rows, else the rank's owned ``[rows, 1024]`` columns.
+    With ``check_parity`` the launch traps when its peer-region parity
+    (``layer & 1``) repeats the last launch's (``Mailbox.check_parity``):
+    for tests and benches, which must alternate.
     ``proj_in`` (None: the launch projects its own q | k | v) is the
     projection that the previous launch's qnext tasks stored; with
     ``proj_out`` (and the next layer's fused weight ``next_qkvg``) this
@@ -599,6 +612,7 @@ def launch_layer(
         proj_in is None,
         proj_out is not None,
         bf16_experts,
+        check_parity,
     )
     if tap is None:
         tap_args = (attn_ops[0], 0, 0)
@@ -640,6 +654,7 @@ def launch_layer(
             tap is not None,
             whole_rows,
             bf16_experts,
+            check_parity,
         )
 
     # The device library of _scheduling.wave_uniform_i32 (attention.py).
@@ -684,6 +699,7 @@ def launch_gluon_muse_spark_layer_gfx950(
     proj_in,
     proj_out,
     trace_buf,
+    check_parity: bool,
     compile_only: bool,
 ):
     """One step of a packed layer (``weights.LayerWeights``) for the rows of
@@ -733,6 +749,9 @@ def launch_gluon_muse_spark_layer_gfx950(
             q | k | v projection of its output rows, stored there for the
             next launch's ``proj_in``.
         trace_buf: None, or a trace buffer (``trace.py``).
+        check_parity: Trap when this launch's parity (``layer & 1``) repeats
+            the last launch's on this rank (tests and benches; serving may
+            run a regular layer between two same-parity launches).
         compile_only: Only compile the launch for these operands. A rank's
             launch polls its peers' values for a few seconds before it traps,
             so the ranks compile before any of them launches.
@@ -840,6 +859,7 @@ def launch_gluon_muse_spark_layer_gfx950(
         chain,
         whole_rows,
         weights.bf16_experts,
+        check_parity,
         compile_only,
     )
 
