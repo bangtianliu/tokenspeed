@@ -121,7 +121,9 @@ def test_launches_between_fused_layers_hand_the_projection_on() -> None:
 def test_a_verify_step_gives_each_row_its_token_length() -> None:
     """Verify metadata holds each request's length after the step; row t of
     a request's rows is its token at position seq - chain + t."""
-    monokernels = SimpleNamespace()
+    # MonokernelSteps' row offsets (its other state needs the Iris heap).
+    offsets = torch.arange(1 - MAX_ROWS, 1, dtype=torch.int32)
+    monokernels = SimpleNamespace(steps=SimpleNamespace(row_offsets=offsets))
     seq_lens = torch.tensor([100, 7], dtype=torch.int32)
     verify = MonokernelStep(monokernels, 8, 1, [], False)
     assert verify._row_lengths(0, seq_lens).tolist() == list(range(93, 101))

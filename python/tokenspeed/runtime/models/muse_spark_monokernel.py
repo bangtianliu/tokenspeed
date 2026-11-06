@@ -447,6 +447,12 @@ class MonokernelSteps:
         )
         # The launches' tag base: it moves once per forward, inside the graph.
         self.step = torch.zeros(1, dtype=torch.int32, device=device)
+        # Row t of a request of c rows is c - 1 - t tokens short of the
+        # request's length: the last c values (MonokernelStep._row_lengths),
+        # made once instead of an arange every step.
+        self.row_offsets = torch.arange(
+            1 - MAX_ROWS, 1, dtype=torch.int32, device=device
+        )
         iris_group.finish_prepare()
 
     def advance(self) -> None:
@@ -685,10 +691,8 @@ class MonokernelStep:
             if self._chain == 1:
                 lengths = seq_lens[:n]
             else:
-                steps = torch.arange(
-                    1 - self._chain, 1, dtype=seq_lens.dtype, device=seq_lens.device
-                )
-                lengths = (seq_lens[:n, None] + steps[None, :]).reshape(-1)
+                offsets = self._monokernels.steps.row_offsets[MAX_ROWS - self._chain :]
+                lengths = (seq_lens[:n, None] + offsets[None, :]).reshape(-1)
             self._seq_lens[group_id] = lengths
         return lengths
 
