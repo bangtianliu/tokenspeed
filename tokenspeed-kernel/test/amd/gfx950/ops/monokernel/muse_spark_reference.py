@@ -72,7 +72,19 @@ def _online(state, scores, values):
 
 
 def verify_attention(
-    q, keys, values, own_k, own_v, t, first, L0, row_first, splits, chunk, align
+    q,
+    q_cached,
+    keys,
+    values,
+    own_k,
+    own_v,
+    t,
+    first,
+    L0,
+    row_first,
+    splits,
+    chunk,
+    align,
 ):
     """The monokernel's split attention of row ``t``'s q heads ``q [heads,
     64]`` (of one KV head): the splits share the cached keys ``first .. L0 -
@@ -80,14 +92,19 @@ def verify_attention(
     keys before ``row_first`` masked; the last split then takes the launch's
     keys ``0 .. t`` (``own_k`` / ``own_v``) as one more chunk. Then the LSE
     merge. A split's keys are a multiple of ``align`` (whole pages when 64).
-    Returns ``[heads, 64]``."""
+    ``q_cached`` scores the cached keys (``q``, or q rounded once to an FP8
+    cache's dtype where the kernel's long full-layer path multiplies in FP8);
+    ``q`` scores the launch's keys. That path is not the regular path's math
+    exactly: the regular path scores every key of an FP8 cache with the FP8
+    q, and here the launch's own keys still take the BF16 q, and P x V stays
+    BF16. Returns ``[heads, 64]``."""
     scale = 0.125 * math.log2(math.e)
     heads = q.shape[0]
     n = L0 - first
     per = -(-n // splits)
     per = -(-per // align) * align
     pos = torch.arange(first, L0)
-    scores = (q.float() @ keys.T) * scale
+    scores = (q_cached.float() @ keys.T) * scale
     scores = torch.where(pos >= row_first, scores, float("-inf"))
     outs, lses = [], []
     for s in range(splits):
@@ -146,20 +163,23 @@ def attention_z(qkvg, k_cache, v_cache, table, length, window, splits, cs):
     cached_slots = table[cached // PAGE].long() * PAGE + cached % PAGE
     keys, values = k_cache[cached_slots].float(), v_cache[cached_slots].float()
     z = torch.empty(rows, HEADS, HEAD)
+    # Full layers with 8 rows (64 MFMA rows) take attention.py's key groups
+    # from LONG_KEYS cached keys: a BF16 cache splits on whole pages, an FP8
+    # cache scores its keys with q rounded once from FP32 to the cache's
+    # dtype (the regular path's FP8 query).
+    groups = window == 0 and rows == 8 and L0 >= 32768
+    fp8_qk = groups and kv_dtype != torch.bfloat16
     for t in range(rows):
-        q = norm_rope(
-            qkvg[t, :K_ROW].view(HEADS, HEAD),
-            5.473006248474121,
-            cs[L0 + t],
-            rope,
-            torch.bfloat16,
-        )
+        q_args = (qkvg[t, :K_ROW].view(HEADS, HEAD), 5.473006248474121, cs[L0 + t])
+        q = norm_rope(*q_args, rope, torch.bfloat16)
+        q_cached = norm_rope(*q_args, rope, kv_dtype) if fp8_qk else q
         gate = qkvg[t, GATE_ROW:].view(HEADS, HEAD).float()
         row_first = L0 + t - window + 1 if window else 0
         for kv in range(KV_HEADS):
             heads = slice(kv * GROUP, (kv + 1) * GROUP)
             a = verify_attention(
                 q[heads],
+                q_cached[heads],
                 keys[:, kv],
                 values[:, kv],
                 k[:, kv].float(),
@@ -170,19 +190,7 @@ def attention_z(qkvg, k_cache, v_cache, table, length, window, splits, cs):
                 row_first,
                 splits,
                 128,
-                # Full layers with 8 rows (64 MFMA rows) on a BF16 cache split
-                # on whole pages from LONG_KEYS cached keys (attention.py's key
-                # groups).
-                (
-                    64
-                    if (
-                        window == 0
-                        and rows == 8
-                        and kv_dtype == torch.bfloat16
-                        and L0 >= 32768
-                    )
-                    else 1
-                ),
+                64 if groups and not fp8_qk else 1,
             )
             a = a.to(torch.bfloat16).float()
             inv = torch.rsqrt(a.pow(2).mean(-1, keepdim=True) + 1e-5)

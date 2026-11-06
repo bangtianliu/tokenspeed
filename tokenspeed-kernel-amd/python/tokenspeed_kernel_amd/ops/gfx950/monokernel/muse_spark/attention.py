@@ -38,7 +38,11 @@ token at position ``L0 + t``, where ``L0`` is the request's own.
   launch's k and v from there, not from the cache: a CTA never reads
   another CTA's plain store of the same launch; it rounds them to the
   cache's dtype as head does, so they are the cached values. An FP8 cache's
-  keys and values widen to BF16 (exactly) for the BF16 MFMAs. Row ``t`` attends keys
+  keys and values widen to BF16 (exactly) for the BF16 MFMAs, except on a
+  full layer at long context (the key groups, from ``LONG_KEYS`` cached
+  keys): there q rounds once from FP32 to the cache's FP8, as the regular
+  path's prologue does, and scores the cached keys as stored with FP8 MFMAs
+  (FP32 sums); P x V stays BF16. Row ``t`` attends keys
   ``max(0, L0 + t - WINDOW + 1) .. L0 + t`` (from 0 on a full layer). The
   splits share the cached keys before ``L0``, ``ceil(n / SPLITS)`` each
   (from the first key that row 0 attends), in chunks of 128 with an online
@@ -440,6 +444,7 @@ def _issue_chunk(k_ring, v_ring, slot, pa, pb, k_cache, v_cache, g, c0, hi, offs
 @gluon.jit
 def _group_keys(
     q,
+    q8,
     k_ring,
     v_ring,
     table,
@@ -474,13 +479,23 @@ def _group_keys(
     KW: gl.constexpr = BN // G
     qk3: gl.constexpr = _group_layouts(nw)[0]
     pv3: gl.constexpr = _group_layouts(nw)[1]
-    q3l: gl.constexpr = gl.DotOperandLayout(0, qk3, 8)
-    k3: gl.constexpr = gl.DotOperandLayout(1, qk3, 8)
+    FP8QK: gl.constexpr = k_ring.dtype.primitive_bitwidth == 8
+    QKW: gl.constexpr = 16 if FP8QK else 8
+    q3l: gl.constexpr = gl.DotOperandLayout(0, qk3, QKW)
+    k3: gl.constexpr = gl.DotOperandLayout(1, qk3, QKW)
     p3: gl.constexpr = gl.DotOperandLayout(0, pv3, 4)
     v3: gl.constexpr = gl.DotOperandLayout(1, pv3, 4)
     # Every group's copy of q: one conversion, then a broadcast in registers.
-    q_w = gl.convert_layout(q, gl.SliceLayout(0, q3l))
-    q_w = q_w[None, :, :] + gl.zeros([G, QM, HEAD], gl.bfloat16, q3l)
+    if FP8QK:
+        # q rounded once from FP32 to the cache's FP8 (as the regular path's
+        # prologue does for an FP8 cache), for FP8 x FP8 products.
+        q_w = gl.convert_layout(q8, gl.SliceLayout(0, q3l))
+        q_w, _ = gl.broadcast(
+            q_w[None, :, :], gl.zeros([G, QM, HEAD], k_ring.dtype, q3l)
+        )
+    else:
+        q_w = gl.convert_layout(q, gl.SliceLayout(0, q3l))
+        q_w = q_w[None, :, :] + gl.zeros([G, QM, HEAD], gl.bfloat16, q3l)
     ww = gl.arange(0, G, gl.SliceLayout(1, gl.SliceLayout(2, qk3)))[:, None, None]
     jw = gl.arange(0, KW, gl.SliceLayout(0, gl.SliceLayout(1, qk3)))[None, None, :]
     m_w = gl.full([G, QM], float("-inf"), gl.float32, gl.SliceLayout(2, qk3))
@@ -530,7 +545,8 @@ def _group_keys(
         gl.barrier()
         keys = k_ring.index(i % NBUF).reshape([G, KW, HEAD]).permute([0, 2, 1]).load(k3)
         values = v_ring.index(i % NBUF).reshape([G, KW, HEAD]).load(v3)
-        keys = keys.to(gl.bfloat16)  # an FP8 cache's widen exactly
+        if not FP8QK:
+            keys = keys.to(gl.bfloat16)  # a BF16 cache's keys as they are
         values = values.to(gl.bfloat16)
         # Only the split's last chunk has keys past its end.
         if c0 + BN > hi:
@@ -813,6 +829,7 @@ def attn_stage(
         q,
         0.0,
     )
+    q8 = q.to(kv_dtype)  # rounded once from FP32 (an FP8 cache's long path)
     q = gl.convert_layout(q.to(gl.bfloat16), q_layout)
     v_lo, v_hi = _pair_values(got_v, eq, 2)
     # The launch's k and v as the cache holds them: rounded once to its dtype.
@@ -839,6 +856,7 @@ def attn_stage(
         if long:
             m, l, acc = _group_keys(
                 q,
+                q8,
                 k_ring,
                 v_ring,
                 table,
