@@ -219,7 +219,7 @@ def _reference(rank: int, pooled, gain, ids, cols, device):
     return out.to(torch.bfloat16).cpu()
 
 
-def _worker(rank: int, port: int, rows: int) -> None:
+def _worker(rank: int, port: int, rows: int, exr: int, exr_parts: int) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "gloo",
@@ -234,17 +234,12 @@ def _worker(rank: int, port: int, rows: int) -> None:
         group = IrisGroup(ctx, dist.group.WORLD, rank, device)
         plan = Plan(
             grid=256,
-            # The layer's placement: exr over every CTA past one row.
+            # The layer's placements of exr (layer.BASES, CHAINED_BASES and
+            # NEXT_BASES).
             stages=moe_experts.stages(
-                {
-                    "slt": 255,
-                    "xq": 240,
-                    "ex1": 0,
-                    "exr": 192 if rows == 1 else 0,
-                    "ex2": 0,
-                },
+                {"slt": 255, "xq": 240, "ex1": 0, "exr": exr, "ex2": 0},
                 rows,
-                1 if rows == 1 else int(moe_experts.EXR_PARTS),
+                exr_parts,
             ),
             regions=(("route", 2 * TOP_K), ("cg", POOLED // 2)) + moe_experts.regions(),
             rows=rows,
@@ -322,11 +317,13 @@ def _worker(rank: int, port: int, rows: int) -> None:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("rows", [1, 8])
-def test_experts_match_the_regular_path_math_on_its_weight_layout(rows: int):
+@pytest.mark.parametrize("rows, exr, exr_parts", [(1, 192, 1), (8, 0, 4), (8, 128, 2)])
+def test_experts_match_the_regular_path_math_on_its_weight_layout(
+    rows: int, exr: int, exr_parts: int
+):
     if torch.cuda.device_count() < WORLD:
         pytest.skip(f"requires {WORLD} GPUs")
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port, rows), nprocs=WORLD, join=True)
+    mp.spawn(_worker, args=(port, rows, exr, exr_parts), nprocs=WORLD, join=True)

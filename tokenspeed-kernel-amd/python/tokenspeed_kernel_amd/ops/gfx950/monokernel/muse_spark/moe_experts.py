@@ -118,7 +118,8 @@ EX1_TASKS = gl.constexpr(256)  # LANES * NB1 * KSPLIT
 # CTA's ex2 task back by about one slot, whatever the slot count. On CTAs
 # 192-255 alone, the lanes there ran a round of exr, and when they also had
 # the most slots (slots % 8 = 7 or 0, a fifth of served launches) every ex2
-# lane waited ~6 us longer. One row has one slot a lane: one part.
+# lane waited ~6 us longer. One row has one slot a lane: one part. A launch
+# that ends with qnext splits exr in 2 parts instead (layer.NEXT_BASES).
 EXR_PARTS = gl.constexpr(4)
 EXR_LANE_TASKS = gl.constexpr(64)  # LANES * NB1: one part
 # An intermediate row in MXFP4 words: 64 of E2M1 values, then a word per
@@ -177,10 +178,10 @@ def xq_tasks(rows: int) -> int:
 
 def stages(bases: dict[str, int], rows: int, exr_parts: int) -> tuple[Stage, ...]:
     """slt, xq, ex1, exr and ex2 of ``rows`` token rows, placed by ``bases``;
-    each lane's slots split over ``exr_parts`` exr tasks (1, or EXR_PARTS to
-    spread exr over every CTA)."""
-    if exr_parts not in (1, int(EXR_PARTS)):
-        raise ValueError(f"exr parts: 1 or {int(EXR_PARTS)}, got {exr_parts}")
+    each lane's slots split over ``exr_parts`` exr tasks (1, 2, or EXR_PARTS
+    to spread exr over every CTA)."""
+    if exr_parts not in (1, 2, int(EXR_PARTS)):
+        raise ValueError(f"exr parts: 1, 2 or {int(EXR_PARTS)}, got {exr_parts}")
     slt, xq, ex1, exr, ex2 = placement(bases, ("slt", "xq", "ex1", "exr", "ex2"))
     return (
         Stage("slt", 1, slt, reads=("route",), writes=("slt", "sltf")),
