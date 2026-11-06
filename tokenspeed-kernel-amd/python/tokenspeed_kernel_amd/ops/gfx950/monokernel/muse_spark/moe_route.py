@@ -28,7 +28,9 @@ and every rank adds the 8 partial logits. ``u`` is not rounded on this path,
 and ``h' = beta b inv + alpha h`` (see attn_tail) is linear in the
 post-attention norm's ``inv``. So the router multiplies ``beta b g`` and
 ``alpha h g``, and top-8 applies the scalars ``inv`` and ``s``: the router
-waits for neither norm exchange, only for ``b``.
+waits for neither norm exchange, only for ``b``, which it sums itself from
+the ranks' o_proj partials (``red``) in rank order, as tail1 does: the same
+bits, without a hop through tail1.
 
 * router, 16 tasks of 16 experts (past one row, 16 per pair of rows): this
   rank's partial logits of ``alpha h g`` (from the launch's inputs, at once)
@@ -81,11 +83,33 @@ def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
             "router",
             int(ROUTER_TASKS) * (1 if rows == 1 else -(-rows // int(ROW_PAIR))),
             router,
-            reads=("bq",),
+            reads=("red",),
             writes=("lg", "lg2"),
         ),
         Stage("topk", rows, topk, reads=("lg", "lg2", "ss1"), writes=("route",)),
     )
+
+
+@gluon.jit
+def _owned_b(mb, row, src, j):
+    """``b`` of the rank's owned columns ``2 j`` and ``2 j + 1`` (FP32 of the
+    BF16 rounding) of rows ``row``: the 8 ranks' o_proj partials in ``red``
+    (``src`` along the axis before ``j``) summed in rank order, as
+    :func:`attn_tail.tail_stages` sums them. ``row``, ``src`` and ``j``
+    broadcast to the poll's shape; returns ``(lo, hi)`` without the ``src``
+    axis."""
+    (got,) = mb.poll_many(("red",), (mb.row_offset(row) + src * (OWNED // 2) + j,))
+    lo_all = (got << 16).to(gl.float32, bitcast=True)
+    hi_all = (got & -65536).to(gl.float32, bitcast=True)
+    AX: gl.constexpr = len(got.shape) - 2
+    # tail1 starts from zeros; 0 + x is x (and +0 for -0), as is rank 0's
+    # sum with zeros, so rank 0's term starts the sum here.
+    lo = gl.sum(gl.where(src == 0, lo_all, 0.0), axis=AX)
+    hi = gl.sum(gl.where(src == 0, hi_all, 0.0), axis=AX)
+    for p in gl.static_range(1, WORLD):
+        lo += gl.sum(gl.where(src == p, lo_all, 0.0), axis=AX)
+        hi += gl.sum(gl.where(src == p, hi_all, 0.0), axis=AX)
+    return lo.to(gl.bfloat16).to(gl.float32), hi.to(gl.bfloat16).to(gl.float32)
 
 
 @gluon.jit
@@ -134,9 +158,12 @@ def _router_row(
     word2 = gl.sum(weights * ahg[None, :], axis=1).to(gl.int32, bitcast=True)
     for p in gl.static_range(WORLD):
         mb.put_peer("lg2", p, RANK * EXPERTS + e, word2)
-    (got,) = mb.poll_many(("bq",), (k,))
+    # b of each column in the columns' own layout (wl's): every column polls
+    # its pair of red and takes its half, so b needs no layout change.
+    src = gl.arange(0, WORLD, gl.SliceLayout(1, wl))[:, None]
+    lo, hi = _owned_b(mb, 0, src, k[None, :] // 2)
     mb.stamp(STAGE, trace.READY)
-    v = got.to(gl.float32, bitcast=True) * bg
+    v = gl.where(k % 2 == 0, lo, hi) * bg
     word = gl.sum(weights * v[None, :], axis=1).to(gl.int32, bitcast=True)
     for p in gl.static_range(WORLD):
         mb.put_peer("lg", p, RANK * EXPERTS + e, word)
@@ -177,15 +204,19 @@ def _router_rows(
     word2 = gl.convert_layout(lg2.to(gl.int32, bitcast=True), cl)
     for p in gl.static_range(WORLD):
         mb.put_peer("lg2", p, at_c, word2, mask=put_c)
-    # Every row's b in one poll, through LDS into the column layout.
-    bl: gl.constexpr = gl.BlockedLayout([1, 4], [1, 64], [nw, 1], [1, 0])
-    br = gl.arange(0, RP, gl.SliceLayout(1, bl))[:, None]
-    bk = gl.arange(0, OWNED, gl.SliceLayout(0, bl))[None, :]
-    (got,) = mb.poll_many(("bq",), (mb.row_offset(first + br) + bk,))
+    # Every row's b, summed here from the ranks' partials (one poll), through
+    # LDS into the column layout.
+    bl: gl.constexpr = gl.BlockedLayout([1, 1, 1], [1, 1, 64], [1, 1, nw], [2, 1, 0])
+    br = gl.arange(0, RP, gl.SliceLayout(1, gl.SliceLayout(2, bl)))[:, None, None]
+    bs = gl.arange(0, WORLD, gl.SliceLayout(0, gl.SliceLayout(2, bl)))[None, :, None]
+    bj = gl.arange(0, OWNED // 2, gl.SliceLayout(0, gl.SliceLayout(1, bl)))[
+        None, None, :
+    ]
+    lo, hi = _owned_b(mb, first + br, bs, bj)
     mb.stamp(STAGE, trace.READY)
     flat: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
     b_smem = gl.allocate_shared_memory(gl.float32, [RP * OWNED], flat)
-    b_smem.store(gl.reshape(got.to(gl.float32, bitcast=True), [RP * OWNED]))
+    b_smem.store(gl.reshape(gl.join(lo, hi), [RP * OWNED]))
     gl.barrier()
     lg = gl.zeros([ROUTER_ROWS, RP], gl.float32, wl)
     for r in gl.static_range(RP):
