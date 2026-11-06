@@ -675,7 +675,9 @@ def context_reasons(model: torch.nn.Module) -> list[str]:
     if (
         not isinstance(fc.quant_method, UnquantizedLinearMethod)
         or fc.weight.dtype != torch.bfloat16
-        or tuple(fc.weight.shape) != (HIDDEN, 5 * HIDDEN)
+        # fc is column-parallel: each rank holds the rows of its output columns.
+        or fc.tp_size != 8
+        or tuple(fc.weight.shape) != (HIDDEN // 8, 5 * HIDDEN)
         or norm.weight.dtype != torch.bfloat16
         or abs(norm.variance_epsilon - RMS_NORM_EPS) >= 1e-12
     ):
