@@ -83,6 +83,8 @@ def moe_tail_kernel(
     if active:
         # No draft tap (TAP false): the tap arguments are unused. The owned
         # residual columns (WHOLE_ROWS false); the layer test covers whole rows.
+        # 16 out tasks a row and no anx publish: a launch without qnext (the
+        # layer test covers qnext's 8 a row).
         moe_tail.out_stage(
             mb,
             task,
@@ -96,6 +98,8 @@ def moe_tail_kernel(
             0,
             RANK,
             False,
+            False,
+            16,
             False,
             "out",
         )
@@ -149,7 +153,9 @@ def _worker(rank: int, port: int, rows: int) -> None:
         group = IrisGroup(ctx, dist.group.WORLD, rank, device)
         plan = Plan(
             grid=256,
-            stages=moe_tail.stages({"comb": 0, "unpool": 64, "out": 128}, rows),
+            stages=moe_tail.stages(
+                {"comb": 0, "unpool": 64, "out": 128}, rows, 16, False
+            ),
             regions=(
                 ("route", 2 * TOP_K),
                 ("hp", OWNED),
