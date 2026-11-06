@@ -29,7 +29,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from monokernel_testing import fill, payloads
+from monokernel_testing import fill, fill_words, payloads
 from utils import is_cdna4
 
 if not is_cdna4():
@@ -53,6 +53,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import (  # noqa: E402
 )
 
 WORLD, HIDDEN, POOLED, ROWS = 8, 8192, 4096, 512
+FLAGS = WORLD * 8  # the attention tail's flags a row: [rank][task]
 
 
 @gluon.jit
@@ -80,12 +81,12 @@ def _worker(rank: int, port: int, rows: int) -> None:
         plan = Plan(
             grid=256,
             stages=moe_pool.stages({"pool": 0}),
-            regions=(("xin", HIDDEN // 2),) + moe_pool.regions(),
+            regions=(("xin", HIDDEN // 4), ("xflag", FLAGS)) + moe_pool.regions(),
             rows=rows,
             chain=rows,
-            external=("xin",),
+            external=("xin", "xflag"),
             world=WORLD,
-            peers=("xin",) + moe_pool.PEERS,
+            peers=("xin", "xflag") + moe_pool.PEERS,
         )
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         group.finish_prepare()
@@ -96,12 +97,21 @@ def _worker(rank: int, port: int, rows: int) -> None:
                 torch.bfloat16
             )
             tag = launch_tag(step, 0)
+            # The attention tail's words, then its flags.
             for row in range(rows):
-                fill(
+                fill_words(
                     scratch,
                     plan,
                     "xin",
                     x[row].view(torch.int32).to(device),
+                    copy=step & 1,
+                    row=row,
+                )
+                fill(
+                    scratch,
+                    plan,
+                    "xflag",
+                    torch.ones(FLAGS, dtype=torch.int32, device=device),
                     tag,
                     copy=step & 1,
                     row=row,

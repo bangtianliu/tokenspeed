@@ -228,6 +228,55 @@ def _poll_group_rows(RP, KP, num_warps):
 
 
 @gluon.jit
+def load_word_rows(
+    mb,
+    region: gl.constexpr,
+    flags: gl.constexpr,
+    FLAGS: gl.constexpr,
+    KS: gl.constexpr,
+    R: gl.constexpr,
+):
+    """:func:`load_rows` of rows ``0 .. R - 1`` whose producers publish BF16
+    pairs as plain words in ``region`` (word ``k / 2`` of a row holds values
+    ``k, k + 1``; :meth:`Mailbox.store_words_peer`) and each raise one of
+    the ``FLAGS`` flags of the row in ``flags``. The flags are polled first,
+    then the words are loaded past the caches: half the bytes of tagged
+    pairs.
+
+    Returns:
+        ``x_smem [RP, KP, 32] bf16``, as :func:`load_rows` with ``k0 = 0``.
+    """
+    gl.static_assert(KS % 32 == 0)
+    KI: gl.constexpr = KS // 32
+    KP: gl.constexpr = triton.next_power_of_2(KI)
+    RP: gl.constexpr = triton.next_power_of_2(R)
+    nw: gl.constexpr = gl.num_warps()
+    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
+    f = gl.arange(0, triton.next_power_of_2(R * FLAGS), lanes)
+    mb.poll_many((flags,), (mb.row_offset(gl.minimum(f // FLAGS, R - 1)) + f % FLAGS,))
+    # No load may issue before every wave's poll returned.
+    gl.barrier()
+    G: gl.constexpr = _poll_group_rows(RP, KP, nw)
+    p = gl.arange(0, G * KP * 16, lanes)
+    at = p % (KP * 16)
+    word = gl.minimum(at, KS // 2 - 1)
+    stride: gl.constexpr = schedule.row_pairs(mb.plan)
+    words = gl.allocate_shared_memory(
+        gl.int32, [RP, KP, 16], mx._padded_rows([RP, KP, 16], KP * 16, 8)
+    )
+    for g in gl.static_range(RP // G):
+        row = gl.minimum(g * G + p // (KP * 16), R - 1)
+        got = mb.load_words(region, 2 * row * stride + word)
+        words.slice(g * G, G, 0).store(
+            gl.reshape(gl.where(at < KS // 2, got, 0), [G, KP, 16])
+        )
+    gl.barrier()
+    return words.reinterpret(
+        gl.bfloat16, [RP, KP, 32], mx._padded_rows([RP, KP, 32], KP * 32, 16)
+    )
+
+
+@gluon.jit
 def load_global_rows(x, row_stride, k0, KS: gl.constexpr, R: gl.constexpr):
     """:func:`load_rows` of BF16 rows in global memory that an earlier launch
     wrote (row ``r`` at ``x + r * row_stride``), values ``k0 .. k0 + KS - 1``.

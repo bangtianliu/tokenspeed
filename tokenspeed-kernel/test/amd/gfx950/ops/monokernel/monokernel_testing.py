@@ -100,8 +100,38 @@ def payloads(
     return (pairs & 0xFFFFFFFF).to(torch.int32)
 
 
+def fill_words(
+    scratch: torch.Tensor,
+    plan: Plan,
+    region: str,
+    payload: torch.Tensor,
+    copy: int = 0,
+    row: int = 0,
+) -> None:
+    """Store ``payload`` (32-bit words) as plain words in row ``row`` of
+    ``region``, as a producer's ``store_words`` would (2 words a pair)."""
+    start = 2 * (_start(plan, region, copy) + row * plan.row_pairs)
+    words = payload.reshape(-1).view(torch.int32)
+    scratch.view(torch.int32)[start : start + words.numel()] = words
+
+
+def words(
+    scratch: torch.Tensor,
+    plan: Plan,
+    region: str,
+    count: int,
+    row: int = 0,
+    copy: int = 0,
+) -> torch.Tensor:
+    """The first ``count`` plain words of row ``row`` of ``region``."""
+    start = 2 * (_start(plan, region, copy) + row * plan.row_pairs)
+    return scratch.view(torch.int32)[start : start + count].clone()
+
+
 __all__ = [
     "fill",
+    "fill_words",
+    "words",
     "mxfp4",
     "payloads",
     "random_mxfp4",
