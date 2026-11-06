@@ -381,6 +381,16 @@ def attn_stage(
     dk = gl.arange(0, HEAD, gl.SliceLayout(1, k_layout))
     dv = gl.arange(0, HEAD, gl.SliceLayout(0, v_load))
     keys, values = _load_kv(table, k_cache, v_cache, lo, hi, dk, dv, k_layout, v_load)
+    # The values go to LDS before the poll too: the poll's loads return only
+    # after the cache loads (loads complete in order), so the store waits for
+    # nothing the poll would not, and leaves the path after the poll.
+    plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    v_smem = gl.allocate_shared_memory(gl.bfloat16, [BN, HEAD], plain)
+    v_smem.store(values)
+    js = lo + gl.arange(0, BN, gl.SliceLayout(0, qk_mma))
+    valid = (js[None, :] < hi) & (gl.arange(0, QM, gl.SliceLayout(1, qk_mma)) >= 0)[
+        :, None
+    ]
 
     # q of the 8 heads of every row, and the block's keys and values.
     pl: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [nw, 1], [1, 0])
@@ -405,23 +415,16 @@ def attn_stage(
         0.0,
     )
     q = gl.convert_layout(q.to(gl.bfloat16), q_layout)
-    plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     cur_k = gl.allocate_shared_memory(gl.bfloat16, [KT, HEAD], plain)
     cur_v = gl.allocate_shared_memory(gl.bfloat16, [KT, HEAD], plain)
     cur_k.store(_bf16_rows(got_k).to(gl.bfloat16))
     cur_v.store(_bf16_rows(got_v).to(gl.bfloat16))
-    v_smem = gl.allocate_shared_memory(gl.bfloat16, [BN, HEAD], plain)
 
     m = gl.full([QM], float("-inf"), gl.float32, gl.SliceLayout(1, qk_mma))
     l = gl.zeros([QM], gl.float32, gl.SliceLayout(1, qk_mma))
     acc = gl.zeros([QM, HEAD], gl.float32, pv_mma)
     # A split's cached keys fit one chunk (see the static assert): no loop,
     # and no second chunk's registers.
-    js = lo + gl.arange(0, BN, gl.SliceLayout(0, qk_mma))
-    valid = (js[None, :] < hi) & (gl.arange(0, QM, gl.SliceLayout(1, qk_mma)) >= 0)[
-        :, None
-    ]
-    v_smem.store(values)
     gl.barrier()
     m, l, acc = _softmax_step(
         q, keys, v_smem.load(v_layout), valid, m, l, acc, p_layout
