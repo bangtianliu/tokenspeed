@@ -59,7 +59,8 @@ def qkvg_kernel(scratch, step, w, a, a_stride, PLAN: gl.constexpr):
 def _plan(rows: int) -> Plan:
     return Plan(
         grid=256,
-        stages=qkvg.stages({"qkvg": 0, "gate": 0}),
+        # The launch projects its own q | k | v (no previous launch's qnext).
+        stages=qkvg.stages({"qkvg": 0, "gate": 0}, True),
         regions=qkvg.REGIONS,
         rows=rows,
         chain=1,
