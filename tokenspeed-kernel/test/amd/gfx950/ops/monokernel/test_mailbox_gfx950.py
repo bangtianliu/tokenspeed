@@ -192,6 +192,21 @@ if is_cdna4():
         print("the poll returned")
         """)
 
+    def _trapped(stderr: str) -> bool:
+        """Whether a process's stderr reports a GPU trap. The trap reaches the
+        host as a failed launch; some runtimes report it as an illegal memory
+        access (hipErrorIllegalAddress). Where the runtime handles GPU
+        exceptions itself (with GPU core dumps on), it aborts the queue and
+        the process instead."""
+        return any(
+            m in stderr
+            for m in (
+                "launch failure",
+                "illegal memory access",
+                "HSA_STATUS_ERROR_EXCEPTION",
+            )
+        )
+
     def test_a_poll_that_never_completes_stops_the_process(tmp_path):
         """Fail-stop: a missing producer makes the poll trap, and the process
         gets a GPU error instead of hanging."""
@@ -205,13 +220,7 @@ if is_cdna4():
         )
         assert result.returncode != 0
         assert "the poll returned" not in result.stdout
-        # The trap reaches the host as a failed launch. Where the runtime
-        # handles GPU exceptions itself (with GPU core dumps on), it aborts
-        # the queue and the process instead.
-        assert (
-            "launch failure" in result.stderr
-            or "HSA_STATUS_ERROR_EXCEPTION" in result.stderr
-        ), result.stderr
+        assert _trapped(result.stderr), result.stderr
 
     # Mailbox.check_parity: a launch fails stop when its peer-region parity
     # repeats the last launch's (the copies must alternate, see Peers).
@@ -277,7 +286,4 @@ if is_cdna4():
         )
         assert result.returncode != 0
         assert "the repeated parity passed" not in result.stdout
-        assert (
-            "launch failure" in result.stderr
-            or "HSA_STATUS_ERROR_EXCEPTION" in result.stderr
-        ), result.stderr
+        assert _trapped(result.stderr), result.stderr
