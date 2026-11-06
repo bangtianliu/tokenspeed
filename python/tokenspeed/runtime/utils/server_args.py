@@ -637,6 +637,9 @@ class ServerArgs:
     # Run each decoder layer's small decode steps as one persistent
     # monokernel launch (DECODE_MONOKERNEL_ARCHITECTURES). Off by default.
     decode_monokernel: bool = False
+    # A directory for each rank's decode monokernel stuck-poll record file
+    # (None: the records stay in pinned memory).
+    monokernel_stuck_record_dir: str | None = None
 
     # Grammar backend. None means the checkpoint default has not been resolved.
     grammar_backend: str | None = None
@@ -3894,6 +3897,20 @@ class ServerArgs:
                 "without attention or expert parallelism. Startup fails when "
                 "a layer cannot be packed for its monokernel. Larger steps "
                 "keep the regular path."
+            ),
+        )
+        parser.add_argument(
+            "--monokernel-stuck-record-dir",
+            type=str,
+            default=ServerArgs.monokernel_stuck_record_dir,
+            help=(
+                "With --decode-monokernel: a directory where each rank keeps "
+                "its stuck-poll record file (stuck-rank<N>-pid<P>.bin and a "
+                ".json sidecar). A launch poll that gives up writes what it "
+                "waited for there before the launch traps, so the record "
+                "outlives the process; a run without a stuck poll removes the "
+                "files at exit. Without it the records stay in pinned memory "
+                "and are logged when the failure reaches Python."
             ),
         )
         parser.add_argument(

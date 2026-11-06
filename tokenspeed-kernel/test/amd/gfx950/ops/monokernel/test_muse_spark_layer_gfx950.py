@@ -303,6 +303,7 @@ def _worker(
                 proj_in=None,
                 proj_out=None,
                 trace_buf=None,
+                stuck_rec=None,
                 # Launches repeat a layer between barriers, which the check
                 # cannot tell from overlapping launches (the qnext chain
                 # test checks).
@@ -507,6 +508,7 @@ def _two_requests_worker(rank: int, port: int, full: bool) -> None:
                 proj_in=None,
                 proj_out=None,
                 trace_buf=None,
+                stuck_rec=None,
                 # Repeats one layer between barriers (see _worker).
                 check_parity=False,
                 compile_only=False,
@@ -617,6 +619,7 @@ def _shift_worker(rank: int, port: int, kinds: tuple[bool, ...]) -> None:
                 proj_in=proj_in,
                 proj_out=proj_out,
                 trace_buf=None,
+                stuck_rec=None,
                 check_parity=True,
                 compile_only=False,
             )
@@ -728,6 +731,7 @@ def _graph_worker(rank: int, port: int, length: int) -> None:
                 proj_in=None,
                 proj_out=None,
                 trace_buf=None,
+                stuck_rec=None,
                 # Graph replays and eager launches repeat layer 2 between barriers.
                 check_parity=False,
                 compile_only=False,

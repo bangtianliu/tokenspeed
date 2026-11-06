@@ -156,8 +156,12 @@ Memory rules on gfx950 (coarse-grained VRAM):
   plain or `sc0` load, which can then spin on a stale line forever.
 - The 64-bit store and load are single-copy atomic. Thus a pair never holds
   an old payload with a new tag.
-- A poll traps (`s_trap 2`) after `MAX_RETRIES` retries (at least about
-  8 s). A deadlock then stops the process with a GPU error, not a hang.
+- A poll traps (`s_trap 2`) after about a minute of waiting, timed with the
+  realtime clock (read every `POLL_CHECK` retries only). A deadlock then
+  stops the process with a GPU error, not a hang, while a rank whose host
+  submits a launch seconds late only stalls its peers. Given a stuck-poll
+  record buffer, the poll first writes what it waited for (tag, address,
+  observed pair, clocks) for the host to decode.
 - A CTA never reads another CTA's plain global store from the same launch.
   For example, the current token's K and V come from mailboxes, not from the
   KV cache that another CTA writes in the same launch.
