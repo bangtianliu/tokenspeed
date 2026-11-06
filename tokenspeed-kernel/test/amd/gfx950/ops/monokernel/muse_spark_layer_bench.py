@@ -520,11 +520,18 @@ def worker(rank: int, port: int, args) -> None:
 
 
 def compare(a_path: str, b_path: str) -> bool:
+    """Whether two --out-save files hold the same outputs and the same values
+    in every scratch region both plans have. A region only one plan has (a
+    change that adds or drops one) is printed, not compared."""
     a, b = torch.load(a_path), torch.load(b_path)
     same = all(torch.equal(a[k], b[k]) for k in ("h_next", "a_out", "ids", "weights"))
-    return same and all(
-        torch.equal(a["regions"][r], b["regions"][r]) for r in a["regions"]
-    )
+    ra, rb = a["regions"], b["regions"]
+    for name in sorted(set(ra) ^ set(rb)):
+        print(f"region {name} only in {'the first' if name in ra else 'the second'}")
+    differ = [r for r in ra if r in rb and not torch.equal(ra[r], rb[r])]
+    for name in differ:
+        print(f"region {name} differs")
+    return same and not differ
 
 
 def main() -> None:
