@@ -294,6 +294,7 @@ def worker(rank: int, port: int, args) -> None:
         not args.shift,
         args.shift,
         args.bf16_experts,
+        True,  # check_parity, as the launches
     )
     proj = torch.zeros(2, args.rows, int(PROJ_WORDS), dtype=torch.int32, device=dev)
     scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
@@ -367,6 +368,7 @@ def worker(rank: int, port: int, args) -> None:
             args.rows,
             False,  # whole_rows: the owned residual columns
             args.bf16_experts,
+            True,  # check_parity: the bench's launches alternate
             False,  # compile_only
         )
 
@@ -413,6 +415,11 @@ def worker(rank: int, port: int, args) -> None:
             std = std * 2 if sum(seen) / len(seen) > args.distinct else std / 2
         if not found:
             raise SystemExit(f"no seed gives {args.distinct} distinct experts")
+        if lay == 1:
+            # The timed runs start at layer 1: keep the parity alternating.
+            step.add_(1)
+            launch(2)
+            torch.cuda.synchronize()
         dist.barrier()
         if rank == 0:
             print(
@@ -499,7 +506,8 @@ def worker(rank: int, port: int, args) -> None:
     torch.cuda.synchronize()
     dist.barrier()
     step.add_(1)
-    launch(1, trace)
+    # After the out-save launch (layer 1) the parity alternates with layer 2.
+    launch(2 if args.out_save else 1, trace)
     torch.cuda.synchronize()
     t = trace.cpu()
     names = [s.name for s in plan.stages]

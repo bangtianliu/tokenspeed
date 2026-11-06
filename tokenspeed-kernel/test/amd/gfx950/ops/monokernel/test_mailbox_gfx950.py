@@ -212,3 +212,72 @@ if is_cdna4():
             "launch failure" in result.stderr
             or "HSA_STATUS_ERROR_EXCEPTION" in result.stderr
         ), result.stderr
+
+    # Mailbox.check_parity: a launch fails stop when its peer-region parity
+    # repeats the last launch's (the copies must alternate, see Peers).
+    def _parity_plan():
+        return Plan(
+            grid=1,
+            stages=(Stage("s", 1, 0),),
+            regions=(("pad", 3), ("parity", 1)),
+            rows=1,
+            chain=1,
+        )
+
+    @gluon.jit
+    def _parity_kernel(scratch, step_ptr, parity, PLAN: gl.constexpr):
+        mb = mailbox.Mailbox(scratch, mailbox.launch_tag(step_ptr, 0), PLAN, None)
+        mb.check_parity(parity)
+
+    def test_alternating_launches_pass_the_parity_check():
+        plan = _parity_plan()
+        scratch = torch.zeros(plan.scratch_pairs, dtype=torch.int64, device="cuda")
+        step = torch.zeros(1, dtype=torch.int32, device="cuda")
+        for parity in (0, 1, 0, 1):
+            _parity_kernel[(1,)](scratch, step, parity, plan.key, num_warps=4)
+            torch.cuda.synchronize()
+            # The region keeps the last parity plus one.
+            assert int(scratch[plan.offset("parity")]) == parity + 1
+
+    _REPEATED_PARITY = textwrap.dedent("""
+        import torch
+        from tokenspeed_kernel_amd._triton import gl, gluon
+        from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox
+        from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Plan, Stage
+
+        @gluon.jit
+        def _parity_kernel(scratch, step_ptr, parity, PLAN: gl.constexpr):
+            mb = mailbox.Mailbox(scratch, mailbox.launch_tag(step_ptr, 0), PLAN, None)
+            mb.check_parity(parity)
+
+        plan = Plan(
+            grid=1,
+            stages=(Stage("s", 1, 0),),
+            regions=(("pad", 3), ("parity", 1)),
+            rows=1,
+            chain=1,
+        )
+        scratch = torch.zeros(plan.scratch_pairs, dtype=torch.int64, device="cuda")
+        step = torch.zeros(1, dtype=torch.int32, device="cuda")
+        for parity in (1, 1):
+            _parity_kernel[(1,)](scratch, step, parity, plan.key, num_warps=4)
+            torch.cuda.synchronize()
+        print("the repeated parity passed")
+        """)
+
+    def test_a_repeated_parity_stops_the_process(tmp_path):
+        """Two launches of the same parity in a row trap, as a stuck poll does."""
+        script = tmp_path / "repeated_parity.py"  # a JIT function needs a file
+        script.write_text(_REPEATED_PARITY)
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert result.returncode != 0
+        assert "the repeated parity passed" not in result.stdout
+        assert (
+            "launch failure" in result.stderr
+            or "HSA_STATUS_ERROR_EXCEPTION" in result.stderr
+        ), result.stderr
