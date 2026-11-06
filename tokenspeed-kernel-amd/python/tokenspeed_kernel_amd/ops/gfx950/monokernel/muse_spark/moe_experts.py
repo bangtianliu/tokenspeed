@@ -70,11 +70,12 @@ routing (:func:`slot_table_stage`), and published in ``slt``; built on all
 256 CTAs it took ~5 us of each ex1 task's prelude.
 
 Expert weights cannot load before routing picks the experts. So a CTA runs
-the first slot of its ex1 and ex2 tasks in parts: :func:`ex1_poll` (one
-poll for the pooled rows, the first slots' experts and the slot table),
-:func:`ex1_issue`, then :func:`union_of` and :func:`ex1_operand` (the norm
-and quantization of the A operand, while the weights stream), :func:`ex1_finish`, then :func:`ex2_issue` and
-:func:`ex2_finish` at ex2's place in the plan. ex2's first weights issue
+the first slot of its ex1 and ex2 tasks in parts: :func:`ex1_poll_routes`
+(the first slots' experts and the slot table), :func:`ex1_issue`, then
+:func:`union_of` and :func:`ex1_xq` (the A operand from xq, while the
+weights stream), :func:`ex1_finish`, then :func:`ex2_issue` and
+:func:`ex2_finish` at ex2's place in the plan (the BF16 experts:
+:func:`ex1_poll` with the pooled rows, then their own operand). ex2's first weights issue
 after ex1's products: issued with ex1's they sat on ex1's critical path (a
 full layer at 200k keys took 148.6 us instead of 145.9), and they still
 arrive before ex2's poll returns. The loads come before the polls: a poll
@@ -547,18 +548,6 @@ def _mma_rows(packed_smem, scale_smem, tiles):
     return acc
 
 
-@gluon.jit
-def _stage_a(packed, scales):
-    """MXFP4 A rows (``[16, N / 2]`` bytes, ``[16, N / 32]`` scales) to LDS."""
-    plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
-    p_smem = gl.allocate_shared_memory(gl.uint8, packed.shape, plain)
-    s_smem = gl.allocate_shared_memory(gl.uint8, scales.shape, plain)
-    p_smem.store(packed)
-    s_smem.store(scales)
-    gl.barrier()
-    return p_smem, s_smem
-
-
 @gluon.constexpr_function
 def _cg_layout(num_warps):
     """``[rows, K quarter, pair]`` of polled pooled rows."""
@@ -575,7 +564,7 @@ def ex1_poll(mb, task, task2, active, pre_gain, STAGE: gl.constexpr):
     (low and high values of the pairs), the polled slot table (for
     :func:`union_of`), then the experts of
     the first slots of ex1 task ``task`` and ex2 task ``task2`` (row 0's
-    picks), for :func:`ex1_operand`.
+    picks), for the BF16 experts' ``ex1_operand``.
 
     Every CTA calls it (Gluon cannot carry values out of a branch); an
     inactive CTA (``active`` false) stamps nothing.
@@ -631,50 +620,34 @@ def ex1_poll(mb, task, task2, active, pre_gain, STAGE: gl.constexpr):
 
 
 @gluon.jit
-def ex1_operand(task, rows, gain_lo, gain_hi):
-    """The A operand of ex1 task ``task`` from :func:`ex1_poll`'s rows and
-    gains: apply each row's pre-expert RMS norm and quantize the task's K
-    quarter of every row to MXFP4 in LDS (MFMA row ``r`` is row ``r``; the
-    rows past the launch's are zero). Returns the LDS (values, scales).
+def _xq_quantize(got, ks, gain_lo, gain_hi):
+    """K quarter ``ks`` of the polled pooled rows ``got`` (``[G, KSPLIT,
+    K_SLICE / 2]`` BF16 pairs, :func:`_cg_layout`) with each row's
+    pre-expert RMS norm, quantized to MXFP4 as the regular path does (BF16
+    input, groups of 32 along K). Returns the words: E2M1 ``[G, K_SLICE /
+    8]`` and E8M0 scales ``[G, K_SLICE / 128]``.
 
-    It issues no global load, and its LDS barriers wait only for LDS, so it
-    runs while the weight loads that :func:`ex1_issue` issued before it are
-    in flight. The normed rows go through LDS once, in
-    BF16 (the quantizer's input precision), into the quantizer's layout: a
-    register relayout a row costs two barriers of all the CTA's waves.
-    """
-    ks = task % KSPLIT
+    Only the G rows quantize: groups are per row, so the bytes are the ones
+    of a 16-row MFMA tile (which took 2 us of xq's ~3, at 4 rows)."""
+    G: gl.constexpr = got.shape[0]
     nw: gl.constexpr = gl.num_warps()
     cl: gl.constexpr = _cg_layout(nw)
-    G: gl.constexpr = rows[0].shape[0]
     q = gl.arange(0, KSPLIT, gl.SliceLayout(0, gl.SliceLayout(2, cl)))[None, :, None]
-    plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
-    x_smem = gl.allocate_shared_memory(gl.bfloat16, [M_DUP, K_SLICE], plain)
-    for g in gl.static_range(len(rows)):
-        got = rows[g]
-        lo = (got << 16).to(gl.float32, bitcast=True)
-        hi = (got & -65536).to(gl.float32, bitcast=True)
-        inv = gl.rsqrt(
-            gl.sum(gl.sum(lo * lo + hi * hi, axis=1), axis=1) / POOLED + PRE_EPS
-        )[:, None]
-        mine = q == ks
-        lo = gl.sum(gl.where(mine, lo, 0.0), axis=1) * inv * gain_lo[None, :]
-        hi = gl.sum(gl.where(mine, hi, 0.0), axis=1) * inv * gain_hi[None, :]
-        x = gl.reshape(gl.join(lo, hi), [G, K_SLICE])
-        x_smem.slice(g * G, G, dim=0).store(x.to(gl.bfloat16))
-    # Zero the rows past the launch's in power-of-two blocks: [RP, 2 RP),
-    # [2 RP, 4 RP), ... up to M_DUP.
-    zl: gl.constexpr = gl.BlockedLayout([1, 8], [1, 64], [1, nw], [1, 0])
-    RP: gl.constexpr = G * len(rows)
-    for b in gl.static_range(4):  # M_DUP = 16 rows
-        if (RP << b) < M_DUP:
-            x_smem.slice(RP << b, RP << b, dim=0).store(
-                gl.zeros([RP << b, K_SLICE], gl.bfloat16, zl)
-            )
-    gl.barrier()
-    dl: gl.constexpr = scaled_downcast_layout(M_DUP, K_SLICE, nw)
-    packed, scales = _mxfp4_quantize_tile_in_layout(x_smem.load(dl))
-    return _stage_a(packed, scales)
+    lo = (got << 16).to(gl.float32, bitcast=True)
+    hi = (got & -65536).to(gl.float32, bitcast=True)
+    inv = gl.rsqrt(
+        gl.sum(gl.sum(lo * lo + hi * hi, axis=1), axis=1) / POOLED + PRE_EPS
+    )[:, None]
+    mine = q == ks
+    lo = gl.sum(gl.where(mine, lo, 0.0), axis=1) * inv * gain_lo[None, :]
+    hi = gl.sum(gl.where(mine, hi, 0.0), axis=1) * inv * gain_hi[None, :]
+    x = gl.reshape(gl.join(lo, hi), [G, K_SLICE]).to(gl.bfloat16)
+    dl: gl.constexpr = scaled_downcast_layout(G, K_SLICE, nw)
+    packed, scales = _mxfp4_quantize_tile_in_layout(gl.convert_layout(x, dl))
+    # A word takes 4 consecutive bytes in a thread; the scales come one a
+    # thread.
+    sl: gl.constexpr = gl.BlockedLayout([1, 4], [8, 8], [nw, 1], [1, 0])
+    return _words(packed), _words(gl.convert_layout(scales, sl))
 
 
 @gluon.constexpr_function
@@ -688,9 +661,8 @@ def _words_layout(cols, num_warps):
 def xq_stage(mb, task, pre_gain, STAGE: gl.constexpr):
     """xq task ``task``: K quarter ``task % KSPLIT`` of the rows of group
     ``task // KSPLIT`` (``G = min(RP, XQ_ROWS)`` rows), normed and quantized
-    by :func:`ex1_operand` (the same polls, layouts and math, so the MXFP4
-    bytes are the ones each ex1 task computed itself), published as plain
-    words in each row's copy of xq under one flag (xqf)."""
+    by :func:`_xq_quantize`, published as plain words in each row's copy of
+    xq under one flag (xqf)."""
     mb.stamp(STAGE, trace.START)
     R: gl.constexpr = schedule.rows(mb.plan)
     RP: gl.constexpr = triton.next_power_of_2(R)
@@ -708,32 +680,25 @@ def xq_stage(mb, task, pre_gain, STAGE: gl.constexpr):
     pair = q * (K_SLICE // 2) + j[None, None, :]
     (got,) = mb.poll_many(("cg",), (mb.row_offset(grp * G + gr) + pair,))
     mb.stamp(STAGE, trace.READY)
-    p_smem, s_smem = ex1_operand(task, (got,), gain_lo, gain_hi)
+    words, scales = _xq_quantize(got, ks, gain_lo, gain_hi)
     mb.stamp(STAGE, trace.COMPUTED)
-    plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
-    PW: gl.constexpr = K_SLICE // 8
-    SW: gl.constexpr = K_SLICE // 128
-    pl: gl.constexpr = _words_layout(PW, nw)
-    sl: gl.constexpr = _words_layout(SW, nw)
-    words = p_smem.reinterpret(gl.int32, [M_DUP, PW], plain).slice(0, G, dim=0)
-    pr = gl.arange(0, G, gl.SliceLayout(1, pl))[:, None]
-    pw = gl.arange(0, PW, gl.SliceLayout(0, pl))[None, :]
-    prow = grp * G + pr
+    wl: gl.constexpr = words.type.layout
+    pr = grp * G + gl.arange(0, G, gl.SliceLayout(1, wl))[:, None]
+    pw = gl.arange(0, K_SLICE // 8, gl.SliceLayout(0, wl))[None, :]
     mb.store_words(
         "xq",
-        2 * mb.row_offset(prow) + ks * XQ_QUARTER_WORDS + pw,
-        words.load(pl),
-        mask=(prow < R) & (pw >= 0),
+        2 * mb.row_offset(pr) + ks * XQ_QUARTER_WORDS + pw,
+        words,
+        mask=(pr < R) & (pw >= 0),
     )
-    scales = s_smem.reinterpret(gl.int32, [M_DUP, SW], plain).slice(0, G, dim=0)
-    sr = gl.arange(0, G, gl.SliceLayout(1, sl))[:, None]
-    sw = gl.arange(0, SW, gl.SliceLayout(0, sl))[None, :]
-    srow = grp * G + sr
+    sl: gl.constexpr = scales.type.layout
+    sr = grp * G + gl.arange(0, G, gl.SliceLayout(1, sl))[:, None]
+    sw = gl.arange(0, K_SLICE // 128, gl.SliceLayout(0, sl))[None, :]
     mb.store_words(
         "xq",
-        2 * mb.row_offset(srow) + ks * XQ_QUARTER_WORDS + PW + sw,
-        scales.load(sl),
-        mask=(srow < R) & (sw >= 0),
+        2 * mb.row_offset(sr) + ks * XQ_QUARTER_WORDS + K_SLICE // 8 + sw,
+        scales,
+        mask=(sr < R) & (sw >= 0),
     )
     mb.raise_flag("xqf", ks * XQ_GROUPS + grp)
     mb.stamp(STAGE, trace.END)
@@ -770,9 +735,9 @@ def ex1_poll_routes(mb, task, task2, active, STAGE: gl.constexpr):
 @gluon.jit
 def ex1_xq(mb, task, active, STAGE: gl.constexpr):
     """ex1 task ``task``'s A operand from xq: poll its K quarter's flags (one
-    a row group), then load the quarter's words of every row into LDS, as
-    :func:`ex1_operand` leaves them (rows past the launch's rows repeat its
-    last row, rows past ``RP`` are zero). Returns the LDS (values, scales)."""
+    a row group), then load the quarter's words of every row into LDS, one
+    MFMA row each (rows past the launch's rows repeat its last row, rows
+    past ``RP`` are zero). Returns the LDS (values, scales)."""
     R: gl.constexpr = schedule.rows(mb.plan)
     RP: gl.constexpr = triton.next_power_of_2(R)
     NG: gl.constexpr = RP // min(RP, XQ_ROWS)
@@ -874,7 +839,7 @@ def ex1_finish(
     stride_snb,
     STAGE: gl.constexpr,
 ):
-    """Ex1 task ``task`` after :func:`ex1_operand` (``a``) and :func:`ex1_issue`
+    """Ex1 task ``task`` after :func:`ex1_xq` (``a``) and :func:`ex1_issue`
     (``tiles``, of the lane's first slot, ``expert``) and :func:`slots`
     (``union``): multiply and publish the FP32 partial sums, then the same
     for the lane's other slots."""
