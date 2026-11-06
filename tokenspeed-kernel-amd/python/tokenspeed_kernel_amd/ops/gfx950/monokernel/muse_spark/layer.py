@@ -84,6 +84,9 @@ BASES = {
     "pool": 192,
     # The slot table, once, on a topk CTA (after its topk task).
     "slt": 152,
+    # The expert input, once (up to 16 tasks): on ex1's last lane, which runs
+    # the fewest slots, past pool's CTAs (past one row, pool's own).
+    "xq": 240,
     "ex1": 0,
     # The K sums on the CTAs of ex1's last lanes, which run the fewest slots
     # at one row (8 slots: one each). Past one row they spread over every CTA
@@ -172,7 +175,7 @@ def layer_plan(full: bool, rows: int, chain: int, warm_next: bool) -> Plan:
         + attn_tail.stages(_bases(rows, "oproj", "tail"), rows)
         + moe_route.stages(_bases(rows, "router", "topk"), rows)
         + moe_pool.stages(_bases(rows, "pool"))
-        + moe_experts.stages(_bases(rows, "slt", "ex1", "exr", "ex2"), rows)
+        + moe_experts.stages(_bases(rows, "slt", "xq", "ex1", "exr", "ex2"), rows)
         + ((Stage("warm", WARM_TASKS, 0),) if warm_next else ())
         + moe_tail.stages(_bases(rows, "comb", "unpool", "out"), rows)
     )
@@ -351,17 +354,22 @@ def gluon_muse_spark_layer_gfx950(
     task, active = schedule.stage_task(PLAN, "slt")
     if active:
         moe_experts.slot_table_stage(mb, "slt")
+    if not BF16_EXPERTS:
+        task, active = schedule.stage_task(PLAN, "xq")
+        if active:
+            moe_experts.xq_stage(mb, task, pre_exp_gain, "xq")
     # A CTA's ex1 and ex2 tasks run in parts (see moe_experts): ex1's weights
-    # once routing names the experts, the A operand meanwhile, ex1's products,
-    # the K sums (exr), then ex2's weights ahead of ex2's poll.
+    # once routing names the experts, the A operand meanwhile (from xq, or
+    # normed here for the BF16 experts), ex1's products, the K sums (exr),
+    # then ex2's weights ahead of ex2's poll.
     task1, active1 = schedule.stage_task(PLAN, "ex1")
     task1 = gl.where(active1, task1, 0)
     task2, active2 = schedule.stage_task(PLAN, "ex2")
     task2 = gl.where(active2, task2, 0)
-    got1, gain_lo, gain_hi, ids, e1, e2 = moe_experts.ex1_poll(
-        mb, task1, task2, active1, pre_exp_gain, "ex1"
-    )
     if BF16_EXPERTS:
+        got1, gain_lo, gain_hi, ids, e1, e2 = moe_experts.ex1_poll(
+            mb, task1, task2, active1, pre_exp_gain, "ex1"
+        )
         loads1 = moe_experts_bf16.ex1_issue(task1, active1, e1, w13, s13_we)
         union = moe_experts.union_of(ids)
         a1 = moe_experts_bf16.ex1_operand(task1, got1, gain_lo, gain_hi)
@@ -378,11 +386,12 @@ def gluon_muse_spark_layer_gfx950(
                 mb, task2, loads2, union, w2, s2_we, RANK, "ex2"
             )
     else:
+        ids, e1, e2 = moe_experts.ex1_poll_routes(mb, task1, task2, active1, "ex1")
         loads1 = moe_experts.ex1_issue(
             task1, active1, e1, w13, w13s, s13_we, s13_se, s13_lin, s13_nb
         )
         union = moe_experts.union_of(ids)
-        a1 = moe_experts.ex1_operand(task1, got1, gain_lo, gain_hi)
+        a1 = moe_experts.ex1_xq(mb, task1, active1, "ex1")
         if active1:
             moe_experts.ex1_finish(
                 mb,

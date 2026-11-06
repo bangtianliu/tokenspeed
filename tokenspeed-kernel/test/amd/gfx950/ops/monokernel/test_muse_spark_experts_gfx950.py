@@ -91,17 +91,18 @@ def experts_kernel(
     peers = mailbox.load_peers(bases, RANK, gl.load(step) & 1, 8)
     mb = mailbox.Mailbox(scratch, mailbox.launch_tag(step, 0), PLAN, None, peers)
     # A CTA's ex1 and ex2 tasks run in parts (see moe_experts): both weight
-    # streams once routing names the experts, then the A operand meanwhile.
+    # streams once routing names the experts, then the A operand (xq).
     task, active = schedule.stage_task(PLAN, "slt")
     if active:
         moe_experts.slot_table_stage(mb, "slt")
+    task, active = schedule.stage_task(PLAN, "xq")
+    if active:
+        moe_experts.xq_stage(mb, task, pre_gain, "xq")
     task1, active1 = schedule.stage_task(PLAN, "ex1")
     task1 = gl.where(active1, task1, 0)
     task2, active2 = schedule.stage_task(PLAN, "ex2")
     task2 = gl.where(active2, task2, 0)
-    got1, gain_lo, gain_hi, ids, e1, e2 = moe_experts.ex1_poll(
-        mb, task1, task2, active1, pre_gain, "ex1"
-    )
+    ids, e1, e2 = moe_experts.ex1_poll_routes(mb, task1, task2, active1, "ex1")
     loads1 = moe_experts.ex1_issue(
         task1, active1, e1, w13, w13s, s13_we, s13_se, s13_lin, s13_nb
     )
@@ -109,7 +110,7 @@ def experts_kernel(
         mb, task2, active2, e2, w2, w2s, s2_we, s2_se, s2_lin, s2_nb, "ex2"
     )
     union = moe_experts.union_of(ids)
-    a1 = moe_experts.ex1_operand(task1, got1, gain_lo, gain_hi)
+    a1 = moe_experts.ex1_xq(mb, task1, active1, "ex1")
     if active1:
         moe_experts.ex1_finish(
             mb,
@@ -235,7 +236,14 @@ def _worker(rank: int, port: int, rows: int) -> None:
             grid=256,
             # The layer's placement: exr over every CTA past one row.
             stages=moe_experts.stages(
-                {"slt": 255, "ex1": 0, "exr": 192 if rows == 1 else 0, "ex2": 0}, rows
+                {
+                    "slt": 255,
+                    "xq": 240,
+                    "ex1": 0,
+                    "exr": 192 if rows == 1 else 0,
+                    "ex2": 0,
+                },
+                rows,
             ),
             regions=(("route", 2 * TOP_K), ("cg", POOLED // 2)) + moe_experts.regions(),
             rows=rows,
