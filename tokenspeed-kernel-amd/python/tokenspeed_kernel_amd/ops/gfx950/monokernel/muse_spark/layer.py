@@ -270,6 +270,7 @@ def gluon_muse_spark_layer_gfx950(
     proj_out,
     w_next,
     trace_buf,
+    stuck_rec,
     PLAN: gl.constexpr,
     RANK: gl.constexpr,
     SPLITS: gl.constexpr,
@@ -306,7 +307,9 @@ def gluon_muse_spark_layer_gfx950(
     """
     table = trace.allocate(trace_buf)
     peers = mailbox.load_peers(bases, RANK, layer & 1, WORLD)
-    mb = mailbox.Mailbox(scratch, mailbox.launch_tag(step, layer), PLAN, table, peers)
+    mb = mailbox.Mailbox(
+        scratch, mailbox.launch_tag(step, layer), PLAN, table, peers, stuck_rec
+    )
     if CHECK_PARITY:
         if gl.program_id(0) == 0:
             mb.check_parity(layer & 1)
@@ -579,6 +582,7 @@ def launch_layer(
     proj_out,
     next_qkvg,
     trace_buf,
+    stuck_rec,
     rank: int,
     full: bool,
     rows: int,
@@ -646,6 +650,7 @@ def launch_layer(
             *code,
             *proj_args,
             trace_buf,
+            stuck_rec,
             plan.key,
             rank,
             FULL_SPLITS if full else SLIDING_SPLITS,
@@ -699,6 +704,7 @@ def launch_gluon_muse_spark_layer_gfx950(
     proj_in,
     proj_out,
     trace_buf,
+    stuck_rec,
     check_parity: bool,
     compile_only: bool,
 ):
@@ -749,11 +755,14 @@ def launch_gluon_muse_spark_layer_gfx950(
             q | k | v projection of its output rows, stored there for the
             next launch's ``proj_in``.
         trace_buf: None, or a trace buffer (``trace.py``).
+        stuck_rec: None, or a host-visible ``int64 [256, mailbox.STUCK_WORDS]``
+            stuck-poll record buffer: a poll that gives up writes what it
+            waited for there before it traps (``stuck.decode`` reads it).
         check_parity: Trap when this launch's parity (``layer & 1``) repeats
             the last launch's on this rank (tests and benches; serving may
             run a regular layer between two same-parity launches).
         compile_only: Only compile the launch for these operands. A rank's
-            launch polls its peers' values for a few seconds before it traps,
+            launch polls its peers' values for about a minute before it traps,
             so the ranks compile before any of them launches.
     """
     rows = h.shape[0] if h.dim() == 2 else 0
@@ -853,6 +862,7 @@ def launch_gluon_muse_spark_layer_gfx950(
         proj_out,
         None if proj_out is None else warm_next.qkvg,
         trace_buf,
+        stuck_rec,
         weights.rank,
         weights.full,
         rows,

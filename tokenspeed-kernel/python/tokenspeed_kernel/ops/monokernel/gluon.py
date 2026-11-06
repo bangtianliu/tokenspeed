@@ -296,6 +296,7 @@ if _muse_spark_layer is not None:
         warm_next: Any,
         proj_in: torch.Tensor | None,
         proj_out: torch.Tensor | None,
+        stuck_rec: torch.Tensor | None,
         compile_only: bool,
         **operands: torch.Tensor,
     ) -> None:
@@ -313,6 +314,7 @@ if _muse_spark_layer is not None:
             proj_in=proj_in,
             proj_out=proj_out,
             trace_buf=None,
+            stuck_rec=stuck_rec,
             # Serving may order two same-parity launches by a regular
             # layer's collectives in between (a layer that is not fused).
             check_parity=False,
