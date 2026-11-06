@@ -60,9 +60,10 @@ each row's 8 picks as for one row.
 * ex2, 256 tasks: lane ``l``, 128 of the 4096 output columns over the rank's
   512 intermediate values (32 KiB a slot). A task polls the MXFP4
   intermediates of its lane's first 8 slots at once (every row of each)
-  into LDS, then runs those slots with each slot's weights two slots ahead
-  and no poll between them. The BF16 partials go to the rank that owns
-  those columns (``rr``), which sums the 8 ranks' partials.
+  into LDS, its first 4 slots' weights issued before that poll, then runs
+  those slots with each slot's weights 4 slots ahead and no poll between
+  them. The BF16 partials go to the rank that owns those columns (``rr``),
+  which sums the 8 ranks' partials.
 
 The slot table (:func:`slots`: each pick's slot, whether it owns its
 expert, every row's pick of it) is built once, by one task after the
@@ -134,6 +135,11 @@ EX2_TASKS = gl.constexpr(256)  # LANES * NB2 // EX2_BLOCKS
 # An ex2 task's first slots (all of them up to 64 distinct experts) are
 # gathered in one poll and run unrolled (:func:`ex2_finish`).
 EX2_GATHER = gl.constexpr(8)
+# Slots whose weights an ex2 task issues before that gather (then one more
+# a slot). The gather waits for them anyway (vmcnt counts in order), and it
+# waits on exr too, so up to 4 slots a lane (32 distinct experts) stream
+# while exr finishes instead of after the gather. 3 gained about half as much.
+EX2_AHEAD = gl.constexpr(4)
 OWNED_OUT = gl.constexpr(512)  # output columns a rank reduces: POOLED / WORLD
 PRE_EPS = gl.constexpr(1e-5)
 
@@ -1303,9 +1309,10 @@ def ex2_finish(
 ):
     """Ex2 task ``task`` after :func:`ex2_issue` (``loads``, of the lane's
     first slot, ``expert``) and :func:`slots` (``union``): the lane's first
-    ``EX2_GATHER`` slots from one gather of their intermediates, each slot's
-    weights two slots ahead of its product; then (past 64 distinct experts)
-    the lane's other slots one at a time.
+    ``EX2_GATHER`` slots from one gather of their intermediates, the first
+    ``EX2_AHEAD`` slots' weights issued before the gather and each later
+    slot's that many slots ahead of its product; then (past 64 distinct
+    experts) the lane's other slots one at a time.
 
     A poll waits for every earlier load of its wave (``vmcnt`` counts in
     order): polled a slot at a time between the slots' weights, each slot
@@ -1315,22 +1322,24 @@ def ex2_finish(
     R: gl.constexpr = schedule.rows(mb.plan)
     RP: gl.constexpr = triton.next_power_of_2(R)
     S: gl.constexpr = min(RP, EX2_GATHER)
+    A: gl.constexpr = max(2, min(S, EX2_AHEAD))
     lane = task // (NB2 // EX2_BLOCKS)
     count = union[3]
-    tiles = (
-        loads,
-        _ex2_loads(
-            task,
-            True,
-            _slot_expert(union, lane + LANES),
-            w2,
-            w2s,
-            stride_we,
-            stride_se,
-            stride_slin,
-            stride_snb,
-        ),
-    )
+    tiles = (loads,)
+    for k in gl.static_range(1, A):
+        tiles += (
+            _ex2_loads(
+                task,
+                True,
+                _slot_expert(union, lane + k * LANES),
+                w2,
+                w2s,
+                stride_we,
+                stride_se,
+                stride_slin,
+                stride_snb,
+            ),
+        )
     p_smem, s_smem = _ex2_gather_lane(mb, union, lane, S)
     mb.stamp(STAGE, trace.READY)
     # MFMA row r is row r (rows that did not pick the slot's expert are zero).
@@ -1339,12 +1348,12 @@ def ex2_finish(
         rows += (r,)
     for k in gl.static_range(S):
         i = lane + k * LANES
-        if k + 2 < S:
+        if k + A < S:
             tiles += (
                 _ex2_loads(
                     task,
                     True,
-                    _slot_expert(union, i + 2 * LANES),
+                    _slot_expert(union, i + A * LANES),
                     w2,
                     w2s,
                     stride_we,
