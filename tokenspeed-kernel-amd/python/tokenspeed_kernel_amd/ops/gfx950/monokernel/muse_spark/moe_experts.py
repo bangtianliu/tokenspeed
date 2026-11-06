@@ -176,33 +176,50 @@ def xq_tasks(rows: int) -> int:
     return int(KSPLIT) * (rp // min(rp, int(XQ_ROWS)))
 
 
-def stages(bases: dict[str, int], rows: int, exr_parts: int) -> tuple[Stage, ...]:
+def stages(
+    bases: dict[str, int], rows: int, exr_parts: int, bf16_experts: bool
+) -> tuple[Stage, ...]:
     """slt, xq, ex1, exr and ex2 of ``rows`` token rows, placed by ``bases``;
     each lane's slots split over ``exr_parts`` exr tasks (1, 2, or EXR_PARTS
-    to spread exr over every CTA)."""
+    to spread exr over every CTA). With ``bf16_experts`` (moe_experts_bf16)
+    there is no xq: ex1 polls and norms the pooled rows itself."""
     if exr_parts not in (1, 2, int(EXR_PARTS)):
         raise ValueError(f"exr parts: 1, 2 or {int(EXR_PARTS)}, got {exr_parts}")
     slt, xq, ex1, exr, ex2 = placement(bases, ("slt", "xq", "ex1", "exr", "ex2"))
+    if bf16_experts:
+        head = (
+            Stage(
+                "ex1",
+                int(EX1_TASKS),
+                ex1,
+                reads=("slt", "sltf", "route", "cg"),
+                writes=("p1",),
+            ),
+        )
+    else:
+        head = (
+            Stage("xq", xq_tasks(rows), xq, reads=("cg",), writes=("xq", "xqf")),
+            Stage(
+                "ex1",
+                int(EX1_TASKS),
+                ex1,
+                reads=("slt", "sltf", "xq", "xqf", "route"),
+                writes=("p1",),
+            ),
+        )
     return (
-        Stage("slt", 1, slt, reads=("route",), writes=("slt", "sltf")),
-        # The layers with BF16 experts run no xq task: their ex1 norms the
-        # pooled rows itself (moe_experts_bf16).
-        Stage("xq", xq_tasks(rows), xq, reads=("cg",), writes=("xq", "xqf")),
-        Stage(
-            "ex1",
-            int(EX1_TASKS),
-            ex1,
-            reads=("slt", "sltf", "xq", "xqf", "route", "cg"),
-            writes=("p1",),
-        ),
-        Stage(
-            "exr",
-            int(EXR_LANE_TASKS) * exr_parts,
-            exr,
-            reads=("route", "p1"),
-            writes=("h1",),
-        ),
-        Stage("ex2", int(EX2_TASKS), ex2, reads=("route", "h1"), writes=("rr",)),
+        (Stage("slt", 1, slt, reads=("route",), writes=("slt", "sltf")),)
+        + head
+        + (
+            Stage(
+                "exr",
+                int(EXR_LANE_TASKS) * exr_parts,
+                exr,
+                reads=("route", "p1"),
+                writes=("h1",),
+            ),
+            Stage("ex2", int(EX2_TASKS), ex2, reads=("route", "h1"), writes=("rr",)),
+        )
     )
 
 
