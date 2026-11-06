@@ -259,7 +259,14 @@ if _muse_spark_layer is not None:
             # on the warm stage or on qnext (every plan lays out the same
             # regions).
             _muse_spark_layer.layer_plan(
-                weights.full, rows, rows, True, True, False, weights.bf16_experts
+                weights.full,
+                rows,
+                rows,
+                True,
+                True,
+                False,
+                weights.bf16_experts,
+                False,  # check_parity, off in serving (see the launch)
             ).scratch_pairs
             for rows in range(1, max_rows + 1)
         )
@@ -306,6 +313,9 @@ if _muse_spark_layer is not None:
             proj_in=proj_in,
             proj_out=proj_out,
             trace_buf=None,
+            # Serving may order two same-parity launches by a regular
+            # layer's collectives in between (a layer that is not fused).
+            check_parity=False,
             compile_only=compile_only,
             **operands,
         )
