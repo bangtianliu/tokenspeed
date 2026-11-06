@@ -117,6 +117,9 @@ CHAINED_BASES = {
     "pool": 224,
     "merge": 128,
     "exr": 0,
+    # 8 or 16 rows: 128 unpool tasks (moe_tail.unpool_halves); the first
+    # half on comb's CTAs, after their comb task.
+    "unpool": 64,
 }
 
 # A launch that ends with the next layer's qkvg tasks (qnext, 160 tasks of

@@ -30,8 +30,10 @@ columns ``1024 r ..`` of the residual.
   exchange of partial sums of squares per route), and the weighted sum of
   the 8 routes (a tree within a wave, not the regular path's pick order),
   rounded to BF16, put into every rank's ``cmb``.
-* unpool, 64 tasks of 16 owned hidden columns: the post-expert projection
-  (BF16 ``[1024, 4096]``, 128 KiB a task) of every whole combined row,
+* unpool, 64 tasks of 16 owned hidden columns (128 at 8 or 16 rows: each
+  column block's rows in two groups, so a task reads half the combined rows
+  for the same 128 KiB of weights): the post-expert projection (BF16
+  ``[1024, 4096]``) of every whole combined row,
   rounded to BF16 (``p``), and ``y = p`` times the post-FFN gain. For each
   row, a task puts ``p`` (two BF16 values a word: the out tasks apply the
   gain, so ``y`` is the same FP32 product) and ``alpha h'``, and four partial
@@ -116,7 +118,7 @@ def stages(
     if out_per_row not in (8, 16):
         raise ValueError(f"out tasks a row: 8 or 16, got {out_per_row}")
     comb, unpool, out = placement(bases, ("comb", "unpool", "out"))
-    c, u = int(COMB_TASKS) * rows, int(UNPOOL_TASKS)
+    c, u = int(COMB_TASKS) * rows, int(UNPOOL_TASKS) * unpool_halves(rows)
     return (
         Stage("comb1", c, comb, reads=("rr", "route"), writes=("ss3",)),
         Stage("comb2", c, comb, reads=("ss3",), writes=("cmb",)),
@@ -261,6 +263,16 @@ def _ffn_scales(got):
     return inv, gl.rsqrt(ss_h / HIDDEN + PRE_EPS)
 
 
+@gluon.constexpr_function
+def unpool_halves(rows):
+    """Row groups of unpool: past 4 rows (8 or 16), two tasks of each column
+    block take half the rows each, so a task reads half the combined rows
+    (the read is bytes-bound) with the same weights; the GEMV rows are
+    independent, so the values do not change."""
+    rows = int(rows)
+    return 2 if rows in (8, 16) else 1
+
+
 @gluon.jit
 def unpool_stages(
     mb,
@@ -271,7 +283,8 @@ def unpool_stages(
     beta,
     RANK: gl.constexpr,
 ):
-    """Unpool task ``task``: owned hidden columns ``16 task ..`` of every row.
+    """Unpool task ``task``: owned hidden columns ``16 (task % 64) ..`` of
+    row group ``task // 64`` (:func:`unpool_halves`).
 
     Args:
         w: This rank's post-expert projection rows, BF16 ``[1024, 4096]``
@@ -281,9 +294,13 @@ def unpool_stages(
         alpha: FP32 residual-gate coefficient of the FFN, owned columns.
         beta: FP32 residual-gate coefficient of the FFN, all 8192 columns.
     """
-    R: gl.constexpr = schedule.rows(mb.plan)
+    H: gl.constexpr = unpool_halves(schedule.rows(mb.plan))
+    R: gl.constexpr = schedule.rows(mb.plan) // H
     nw: gl.constexpr = gl.num_warps()
     mb.stamp("unpool", trace.START)
+    # The task's row group: the mailbox view of its first row.
+    mb = mb.row((task // UNPOOL_TASKS) * R)
+    task = task % UNPOOL_TASKS
     tiles = bf16.load_weight_tiles(
         w,
         nb0=task,
