@@ -161,6 +161,7 @@ def _worker(rank: int, port: int, rows: int) -> None:
                 },
                 rows,
                 1 if rows == 1 else int(moe_experts.EXR_PARTS),
+                True,
             ),
             regions=(("route", 2 * TOP_K), ("cg", POOLED // 2)) + moe_experts.regions(),
             rows=rows,

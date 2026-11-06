@@ -253,7 +253,7 @@ def _worker(
         dev = torch.device(f"cuda:{rank}")
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
-        plan = layer.layer_plan(full, rows, rows, True, True, False)
+        plan = layer.layer_plan(full, rows, rows, True, True, False, bf16_experts)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         # A draft's taps: the launch stores its residual into slot 3 of
         # every rank's copy.
@@ -441,7 +441,7 @@ def _two_requests_worker(rank: int, port: int, full: bool) -> None:
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
         rows = 8  # a verify of 7 draft tokens a request
-        plan = layer.layer_plan(full, 2 * rows, rows, False, True, False)
+        plan = layer.layer_plan(full, 2 * rows, rows, False, True, False, False)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         lengths = (3000, 3100)
@@ -558,7 +558,7 @@ def _shift_worker(rank: int, port: int, kinds: tuple[bool, ...]) -> None:
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
         rows, length = 8, 3000
         end = length + rows - 1
-        plan = layer.layer_plan(False, rows, rows, False, True, False)
+        plan = layer.layer_plan(False, rows, rows, False, True, False, False)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         sh = _shared(42, length, rows)
         w = _rank_weights(rank, end)
@@ -672,7 +672,7 @@ def _graph_worker(rank: int, port: int, length: int) -> None:
         dev = torch.device(f"cuda:{rank}")
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
-        plan = layer.layer_plan(False, 1, 1, False, True, False)
+        plan = layer.layer_plan(False, 1, 1, False, True, False, False)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         sh = _shared(42, length, 1)
         weights = _pack(rank, dev, sh, length, False)
@@ -779,17 +779,21 @@ _VARIANTS = [
 
 
 @pytest.mark.parametrize("variants", _VARIANTS)
+@pytest.mark.parametrize("bf16_experts", [(False, False), (True, False), (False, True)])
 @pytest.mark.parametrize("rows", range(1, layer.MAX_ROWS + 1))
-def test_both_kinds_of_layer_lay_the_scratch_out_alike(rows: int, variants):
+def test_both_kinds_of_layer_lay_the_scratch_out_alike(
+    rows: int, variants, bf16_experts
+):
     """Sliding and full launches share one scratch and alternate the peer
     regions' copies. A rank a launch ahead must then put only into the copy
     no slower rank still reads, which holds only if both plans place every
     region, and both copies of each peer region, at the same pairs, whatever
-    their stages (the warm stage, qkvg or qnext)."""
+    their stages (the warm stage, qkvg or qnext, and xq: only the MXFP4
+    experts have one)."""
     if rows == 1 and any(v[2] for v in variants):
         pytest.skip("qnext runs past one row")
-    sliding = layer.layer_plan(False, rows, rows, *variants[0])
-    full = layer.layer_plan(True, rows, rows, *variants[1])
+    sliding = layer.layer_plan(False, rows, rows, *variants[0], bf16_experts[0])
+    full = layer.layer_plan(True, rows, rows, *variants[1], bf16_experts[1])
     assert sliding.regions == full.regions
     assert sliding.peers == full.peers
     assert sliding.row_pairs == full.row_pairs

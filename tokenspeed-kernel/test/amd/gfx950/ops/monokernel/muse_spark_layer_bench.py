@@ -287,7 +287,13 @@ def worker(rank: int, port: int, args) -> None:
     # With --shift every launch reads the q | k | v projection that the one
     # before it stored, and ends with the next one's (qnext).
     plan = layer.layer_plan(
-        args.full, args.rows, args.rows, False, not args.shift, args.shift
+        args.full,
+        args.rows,
+        args.rows,
+        False,
+        not args.shift,
+        args.shift,
+        args.bf16_experts,
     )
     proj = torch.zeros(2, args.rows, int(PROJ_WORDS), dtype=torch.int32, device=dev)
     scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
