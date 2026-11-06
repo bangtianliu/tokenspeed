@@ -140,10 +140,15 @@ with `s_sleep`. A retry loads only the pairs whose tag differs, so a wide
 poll sees its last pairs one round trip after they land. `pre_poll` lets one
 wave spin on hint pairs before a wide poll.
 
-**A stuck poll stops the process.** A poll traps (`s_trap 2`) after
-`mailbox.MAX_RETRIES` retries, at least about 8 s, where a launch takes about
-100 us. A deadlock or a missing producer then gives a GPU error
-(`hipErrorLaunchFailure`) and the process stops, instead of a hang.
+**A stuck poll stops the process.** A poll traps (`s_trap 2`) after about a
+minute of waiting on the realtime clock, where a launch takes about 100 us. A
+deadlock or a missing producer then gives a GPU error
+(`hipErrorLaunchFailure`) and the process stops, instead of a hang. The
+timeout is time, not a retry count, and long: a rank whose host submits a
+launch seconds late (seen: 10 s) must only stall its peers. Given a
+stuck-poll record buffer, a poll that gives up first writes what it waited
+for (tag, pair address, observed pair, clocks) where the host can decode it
+after the process dies.
 
 **A launch first reads its own code into the L2s.** A layer kernel's code
 (~100 KB) is larger than the instruction cache, and the weights that stream

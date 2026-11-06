@@ -45,6 +45,9 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
     "FusedDecodeLayer",
+    "MonokernelStuckRecord",
+    "describe_muse_spark_stuck",
+    "muse_spark_layer_kinds",
     "muse_spark_draft_context_decode",
     "muse_spark_draft_head_decode",
     "muse_spark_draft_layer_decode",
@@ -424,6 +427,7 @@ def muse_spark_layer_decode(
     warm_next: FusedDecodeLayer | None,
     proj_in: torch.Tensor | None,
     proj_out: torch.Tensor | None,
+    stuck_rec: torch.Tensor | None,
     compile_only: bool,
 ) -> None:
     """One step of a packed Muse Spark layer for the rows of one or more
@@ -479,8 +483,11 @@ def muse_spark_layer_decode(
             the launch ends with ``warm_next``'s q | k | v projection of the
             rows it outputs, for the next launch's ``proj_in`` (in place of
             warming its weights). The results are the same bits either way.
+        stuck_rec: None, or a host-visible int64 ``[256, 8]`` buffer (pinned
+            or host-registered memory): a poll that gives up writes what it
+            waited for there before the launch traps.
         compile_only: Only compile the launch for these operands, without
-            running it. A launch polls its peers' values for a few seconds
+            running it. A launch polls its peers' values for about a minute
             before it traps, so a rank that compiles much longer than its
             peers stalls them: compile on every rank, synchronize the ranks,
             then launch.
@@ -508,6 +515,7 @@ def muse_spark_layer_decode(
         warm_next=None if warm_next is None else warm_next.weights,
         proj_in=proj_in,
         proj_out=proj_out,
+        stuck_rec=stuck_rec,
         compile_only=compile_only,
     )
 
@@ -788,7 +796,7 @@ def muse_spark_draft_layer_decode(
         layer_index: Draft layer index, below 5.
         compile_only: Only compile the launch for these operands, without
             running it: compile on every rank, synchronize the ranks, then
-            launch (a launch polls its peers for a few seconds before it
+            launch (a launch polls its peers for about a minute before it
             traps).
     """
     layer.decode(
@@ -878,3 +886,64 @@ def qwen4_exp_mtp_front(
 # Register the backends (side-effect imports).
 import tokenspeed_kernel.ops.monokernel.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.monokernel.triton  # noqa: E402,F401
+
+
+class MonokernelStuckRecord:
+    """A host-visible stuck-poll record buffer for decode monokernel
+    launches: a poll that gives up writes what it waited for there before
+    the launch traps (``tensor``, passed as the launches' ``stuck_rec``).
+
+    Args:
+        grid: The launches' CTAs (at most).
+        path: None (pinned memory: readable while the process lives), or a
+            file to map, which keeps the records after the process dies.
+        scratch: The launches' mailbox scratch (its address goes into the
+            buffer's header, for decoding).
+        rank: This process's rank.
+    """
+
+    def __init__(
+        self, grid: int, path: str | None, scratch: torch.Tensor, rank: int
+    ) -> None:
+        from tokenspeed_kernel_amd.ops.gfx950.monokernel import stuck
+
+        self._stuck = stuck
+        self._buf = stuck.stuck_buffer(grid, path, scratch.data_ptr(), rank)
+        self.path = path
+
+    @property
+    def tensor(self) -> torch.Tensor:
+        return self._buf.tensor
+
+    def any(self) -> bool:
+        """Whether some poll wrote a record."""
+        return bool(self._stuck.records(self._buf.tensor))
+
+    def close(self, remove: bool) -> None:
+        """Release a file-backed buffer; ``remove`` its file too."""
+        self._stuck.close(self._buf, remove)
+
+
+def describe_muse_spark_stuck(
+    record: MonokernelStuckRecord,
+    layers: dict[int, FusedDecodeLayer],
+    launches: list[tuple[int, int]],
+) -> list[str]:
+    """One line per stuck poll of Muse Spark layer launches in ``record``:
+    the stage, region, row and pair it waited for, the tags, the wait.
+    ``layers`` are the served layers by index, ``launches`` the ``(rows,
+    chain)`` of the launches they ran."""
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import stuck_report
+
+    return stuck_report.describe(
+        record.tensor, muse_spark_layer_kinds(layers), launches
+    )
+
+
+def muse_spark_layer_kinds(layers: dict[int, FusedDecodeLayer]) -> dict[int, dict]:
+    """Each served layer's kind for a stuck-record sidecar:
+    ``{"full": bool, "bf16_experts": bool}`` by layer index."""
+    return {
+        i: {"full": bool(f.weights.full), "bf16_experts": bool(f.weights.bf16_experts)}
+        for i, f in layers.items()
+    }
