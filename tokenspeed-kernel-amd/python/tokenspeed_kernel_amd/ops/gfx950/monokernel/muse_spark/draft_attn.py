@@ -41,7 +41,9 @@ layers' ``window_left`` of 2047 plus the row's own key).
   ``kb`` / ``vb``: attention tasks of this launch read the block's own keys
   from the mailbox, since a CTA never reads another CTA's store of the same
   launch.
-* attn, ``SPLITS`` tasks: one task per split of the cached keys
+* attn, ``SPLITS`` tasks a request (a launch serves the blocks of one or
+  two requests, each with its own length and page table): one task per
+  split of the request's cached keys
   ``[max(seq_len - 2048, 0), seq_len - 8)``, ``ceil(n / SPLITS)`` each, one
   chunk of at most 128 (16 splits hold the 2040) with a base-2 softmax; every row's 8 heads are one
   MFMA row each (64 rows). The last split also takes the block's 8 keys from
@@ -159,7 +161,7 @@ def stages(bases: dict[str, int], splits: int, rows: int) -> tuple[Stage, ...]:
         ),
         Stage(
             "attn",
-            splits,
+            splits * max(rows // int(BLOCK_ROWS), 1),
             attn,
             reads=("qh", "kb", "vb"),
             writes=("apart", "alse", "aflag"),
@@ -341,21 +343,32 @@ def attn_stage(
     mb,
     task,
     table,
+    table_stride,
     seq_len,
     k_cache,
     v_cache,
     SPLITS: gl.constexpr,
     STAGE: gl.constexpr,
 ):
-    """Attn task ``task``: split ``task`` of the cached keys, for every row.
+    """Attn task ``task``: split ``task % SPLITS`` of the cached keys of
+    request ``task // SPLITS`` (block rows ``8 q ..``), for its rows.
 
     Args:
-        table: int32 page table of the request.
-        seq_len: int32 ``[1]``: the request's length after the block.
+        table: int32 page tables, request ``q``'s at ``table + q
+            table_stride``.
+        seq_len: int32 ``[requests]``: each request's length after its
+            block.
         k_cache, v_cache: BF16 ``[slots, 1, 128]`` this layer's cache.
     """
-    R: gl.constexpr = schedule.rows(mb.plan)
+    R: gl.constexpr = min(schedule.rows(mb.plan), BLOCK_ROWS)
     gl.static_assert(R * Q_HEADS <= QM)
+    # One request: no request index (the launch's code stays as it was).
+    if schedule.rows(mb.plan) > BLOCK_ROWS:
+        req = task // SPLITS
+        task = task % SPLITS
+        mb = mb.row(req * BLOCK_ROWS)
+        table = table + req * table_stride
+        seq_len = seq_len + req
     # Every split's cached keys fit one chunk: ceil(2041 / SPLITS) <= BN.
     gl.static_assert((WINDOW_KEYS - BLOCK_ROWS + SPLITS - 1) // SPLITS <= BN)
     mb.stamp(STAGE, trace.START)
@@ -475,8 +488,11 @@ def merge_stage(mb, task, SPLITS: gl.constexpr, STAGE: gl.constexpr):
     LSE merge of the splits, rounded to BF16, into ``ao``."""
     mb.stamp(STAGE, trace.START)
     row, h, _ = schedule.row_task(mb.plan, task, Q_HEADS)
-    # The splits' flags sit in row 0 (one request a launch).
-    flag0 = -row * schedule.row_pairs(mb.plan)
+    # The splits' flags sit in the request's row 0.
+    if schedule.rows(mb.plan) > BLOCK_ROWS:
+        flag0 = -(row % BLOCK_ROWS) * schedule.row_pairs(mb.plan)
+    else:
+        flag0 = -row * schedule.row_pairs(mb.plan)
     mb = mb.row(row)
     nw: gl.constexpr = gl.num_warps()
     ml: gl.constexpr = gl.BlockedLayout([1, 1], [2, 32], [nw, 1], [1, 0])

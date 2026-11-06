@@ -116,7 +116,8 @@ def _worker(rank: int, port: int, seed: int) -> None:
         device = torch.device(f"cuda:{rank}")
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, device)
-        plan = draft_head.head_plan(STEPS)
+        # Two requests' plan is the larger: one scratch serves both.
+        plan = draft_head.head_plan(2 * STEPS)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         group.finish_prepare()
         x, hidden_proj, pred, succ, anchor = _shared(seed, device)
@@ -159,6 +160,50 @@ def _worker(rank: int, port: int, seed: int) -> None:
             torch.cuda.synchronize()
             _check(x, shard, rank, hidden_proj, pred, succ, anchor, outs)
             dist.barrier()
+        # Two requests' steps in one launch: each request's outputs are the
+        # bits of its own launch (the rows are independent, the anchor and
+        # step 0's predecessors per request).
+        xb, _, _, _, anchor_b = _shared(seed + 1, device)
+        one = {}
+        for name, xs, first, step in (("a", x, anchor, 7), ("b", xb, anchor_b, 8)):
+            one[name] = {k: torch.empty_like(v) for k, v in outs.items()}
+            draft_head.launch_gluon_muse_spark_draft_head_gfx950(
+                weights,
+                x=xs,
+                first_token=first.to(torch.int32),
+                **one[name],
+                scratch=scratch,
+                step=torch.full((1,), step, dtype=torch.int32, device=device),
+                peer_bases=group.bases,
+                trace_buf=None,
+                compile_only=False,
+            )
+        both = dict(
+            anchor=torch.empty(2, dtype=torch.int64, device=device),
+            cand_ids=torch.empty(2 * STEPS, TOPK, dtype=torch.int64, device=device),
+            unary=torch.empty(2 * STEPS, TOPK, dtype=torch.float32, device=device),
+            scores=torch.empty(
+                2 * STEPS, TOPK, TOPK, dtype=torch.float32, device=device
+            ),
+        )
+        draft_head.launch_gluon_muse_spark_draft_head_gfx950(
+            weights,
+            x=torch.cat([x, xb]),
+            first_token=torch.cat([anchor, anchor_b]).to(torch.int32),
+            **both,
+            scratch=scratch,
+            step=torch.full((1,), 9, dtype=torch.int32, device=device),
+            peer_bases=group.bases,
+            trace_buf=None,
+            compile_only=False,
+        )
+        torch.cuda.synchronize()
+        for q, name in enumerate(("a", "b")):
+            rows = slice(q * STEPS, (q + 1) * STEPS)
+            assert torch.equal(both["anchor"][q : q + 1], one[name]["anchor"])
+            for k in ("cand_ids", "unary", "scores"):
+                assert torch.equal(both[k][rows], one[name][k]), (name, k)
+        dist.barrier()
     finally:
         dist.destroy_process_group()
 
@@ -239,6 +284,10 @@ def test_the_head_scratch_query_matches_the_heads_plan():
     (its plan's pairs), and serve no other step count."""
     from tokenspeed_kernel.ops.monokernel import muse_spark_draft_head_scratch_pairs
 
-    pairs = muse_spark_draft_head_scratch_pairs(max_rows=STEPS)
-    assert pairs == draft_head.head_plan(STEPS).scratch_pairs
+    # One request's steps, or two requests' (the head serves up to MAX_REQUESTS).
+    for rows in (STEPS, draft_head.MAX_REQUESTS * STEPS):
+        pairs = muse_spark_draft_head_scratch_pairs(max_rows=rows)
+        assert pairs == draft_head.head_plan(rows).scratch_pairs
     assert muse_spark_draft_head_scratch_pairs(max_rows=STEPS + 1) is None
+    rows = (draft_head.MAX_REQUESTS + 1) * STEPS
+    assert muse_spark_draft_head_scratch_pairs(max_rows=rows) is None

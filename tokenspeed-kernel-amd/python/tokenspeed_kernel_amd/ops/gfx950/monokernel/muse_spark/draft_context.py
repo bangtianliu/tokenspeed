@@ -25,8 +25,9 @@ After a verify, the regular drafter projects the target's tapped hidden
 states (5 taps of 8192 a row, ``models/dflash.py`` ``project_target_hidden``)
 through ``fc`` and ``hidden_norm``, then writes every draft layer's K and V
 of those rows into the draft cache (``drafter/_dflash_fused_kv.py``: one
-stacked K|V GEMM, then RMSNorm and RoPE on K). This launch does it for one
-request's verify rows on every rank of the TP8 group:
+stacked K|V GEMM, then RMSNorm and RoPE on K). This launch does it for the
+verify rows of one or two requests (8 a request; the rows are independent)
+on every rank of the TP8 group:
 
 * fc, 256 tasks: 128 of the rank's 1024 fc output columns (``fc`` rows
   ``1024 rank ..``) x a 1280-wide K part of the taps, FP32 partials into
@@ -84,6 +85,7 @@ KV_TASKS = gl.constexpr(160)  # 10 groups of 128 rows x 16 K parts
 OUT_TASKS = gl.constexpr(10)  # per row: layer, then K or V
 EPS = gl.constexpr(1e-5)
 ROWS = 8  # one request's verify rows
+MAX_REQUESTS = 2  # requests a launch: their verify rows one after another
 
 PEERS = ("css", "chin")
 
@@ -399,7 +401,7 @@ def gluon_muse_spark_draft_context_gfx950(
     PLAN: gl.constexpr,
     RANK: gl.constexpr,
 ):
-    """The context write of one request's verify rows on rank ``RANK`` (see
+    """The context write of the verify rows on rank ``RANK`` (see
     the module docstring and :func:`launch_gluon_muse_spark_draft_context_gfx950`)."""
     table_ = trace.allocate(trace_buf)
     peers = mailbox.load_peers(bases, RANK, gl.load(step) & 1, WORLD)
@@ -464,19 +466,19 @@ def launch_gluon_muse_spark_draft_context_gfx950(
     trace_buf,
     compile_only: bool,
 ) -> None:
-    """The context write of one request's verify rows, on every rank of the
+    """The context write of one or two requests' verify rows, on every rank of the
     TP8 group at once (the launches exchange the norm and its output).
 
     Args:
         weights: From :func:`pack_draft_context`.
-        taps: BF16 ``[8, 40960]`` contiguous: the target's tapped hidden
+        taps: BF16 ``[rows, 40960]`` (8 or 16 rows) contiguous: the target's tapped hidden
             states of the verify rows (the same on every rank).
-        positions: int32 ``[8]``: the rows' positions.
-        slots: int32 or int64 ``[8]``: the rows' draft cache slots.
+        positions: int32 ``[rows]``: the rows' positions.
+        slots: int32 or int64 ``[rows]``: the rows' draft cache slots.
         k_caches, v_caches: 5 BF16 ``[slots, 1, 128]`` each: the draft
             layers' caches of the rank's KV head.
         cos_sin: FP32 ``[positions, 128]`` RoPE table, cos then sin.
-        scratch: int64 mailbox pairs of ``context_plan(8).scratch_pairs`` on
+        scratch: int64 mailbox pairs of ``context_plan(rows).scratch_pairs`` on
             the Iris symmetric heap.
         step: int32 ``[1]`` counter that changes from launch to launch.
         peer_bases: int64 ``[8]`` heap bases of the group's ranks.
@@ -484,8 +486,11 @@ def launch_gluon_muse_spark_draft_context_gfx950(
         compile_only: Only compile the launch for these operands.
     """
     rows = taps.shape[0]
-    if rows != ROWS:
-        raise ValueError(f"the context write serves {ROWS} verify rows, got {rows}")
+    if rows % ROWS or not 1 <= rows // ROWS <= MAX_REQUESTS:
+        raise ValueError(
+            f"the context write serves {ROWS} verify rows a request, at most "
+            f"{MAX_REQUESTS} requests, got {rows} rows"
+        )
     if (
         taps.dtype != torch.bfloat16
         or tuple(taps.shape) != (rows, int(TAPS_K))
@@ -537,6 +542,7 @@ def launch_gluon_muse_spark_draft_context_gfx950(
 
 
 __all__ = [
+    "MAX_REQUESTS",
     "BASES",
     "DraftContextWeights",
     "ROWS",

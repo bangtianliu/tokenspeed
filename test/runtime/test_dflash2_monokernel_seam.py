@@ -42,14 +42,20 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa:
 from tokenspeed.runtime.execution.output_layout import (  # noqa: E402
     ForwardOutputLayout,
 )
+from tokenspeed.runtime.layers.attention.backends.paged import mha  # noqa: E402
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig  # noqa: E402
+from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig  # noqa: E402
 from tokenspeed.runtime.models.dflash2 import DFlash2DraftModel  # noqa: E402
 from tokenspeed.runtime.models.dflash2_monokernel import (  # noqa: E402
     BLOCK_ROWS,
+    MAX_REQUESTS,
     NOT_BF16_KV,
     NOT_TP8,
     OTHER_ATTENTION,
     OTHER_SHAPES,
     model_reasons,
+    request_seq_lens,
+    takes_head,
     takes_monokernels,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict  # noqa: E402
@@ -67,13 +73,19 @@ def _ctx(mode: ForwardMode, bs: int, rows: int) -> ForwardContext:
     )
 
 
-def test_the_block_of_one_request_takes_the_kernels() -> None:
-    """A launch computes one request's block of 8 rows; several requests
-    keep the regular path."""
+def test_the_blocks_of_up_to_two_requests_take_the_kernels() -> None:
+    """A launch computes the blocks of 8 rows of up to MAX_REQUESTS requests;
+    more requests, other row counts and other modes keep the regular path.
+    The head and the context write serve the same requests: 7 draft steps
+    and 8 verify rows each."""
     assert takes_monokernels(BLOCK_ROWS, _ctx(ForwardMode.DECODE, 1, BLOCK_ROWS))
-    assert not takes_monokernels(2 * BLOCK_ROWS, _ctx(ForwardMode.DECODE, 2, 16))
+    assert takes_monokernels(2 * BLOCK_ROWS, _ctx(ForwardMode.DECODE, 2, 16))
+    assert not takes_monokernels(3 * BLOCK_ROWS, _ctx(ForwardMode.DECODE, 3, 24))
+    assert not takes_monokernels(BLOCK_ROWS, _ctx(ForwardMode.DECODE, 2, 8))
     assert not takes_monokernels(BLOCK_ROWS, _ctx(ForwardMode.EXTEND, 1, 8))
     assert not takes_monokernels(BLOCK_ROWS, _ctx(ForwardMode.IDLE, 1, 8))
+    assert MAX_REQUESTS == 2
+    assert [takes_head(r) for r in (7, 14, 21, 8)] == [True, True, False, False]
 
 
 def _config(**overrides) -> PretrainedConfig:
@@ -188,3 +200,41 @@ def test_an_fp8_server_keeps_the_drafts_cache_bf16_unless_trtllm_attends(
         global_server_args_dict, "drafter_attention_backend", drafter_attention_backend
     )
     assert model_reasons(_draft(_config())) == reasons
+
+
+def test_each_request_of_a_block_forward_reads_its_own_length() -> None:
+    """Under block decode the leaf keeps one cache-seqlens entry per block
+    position (``block_decode_expansion`` a request), so the launches' per
+    request lengths are every expansion-th entry: with two requests decoding
+    together, the second reads its own length, not the first request's
+    broadcast copy. One request's length stays a view (no copy on C1)."""
+    spec = MHAConfig(
+        backend_name="mha",
+        num_attention_heads=8,
+        num_kv_heads=1,
+        head_dim=128,
+        attn_tp_size=1,
+    )
+    config = AttnConfig(
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
+        context_len=8192,
+        max_bs=4,
+        speculative_num_draft_tokens=BLOCK_ROWS,
+        is_draft=True,
+        draft_block_decode=True,
+        components=(spec,),
+    )
+    leaf = mha.MHAAttnBackend(config, spec, kernel_page_size=64)
+    leaf.init_cuda_graph_state(4)
+    assert leaf.block_decode_expansion == BLOCK_ROWS
+    # The drafter's in-graph broadcast of each request's block-end length.
+    leaf.fill_block_decode_seq_lens(
+        MAX_REQUESTS, torch.tensor([100, 3000], dtype=torch.int32)
+    )
+    assert request_seq_lens(leaf, MAX_REQUESTS).tolist() == [100, 3000]
+    one = request_seq_lens(leaf, 1)
+    assert one.tolist() == [100]
+    assert one.data_ptr() == leaf.decode_seq_lens_buffer.data_ptr()

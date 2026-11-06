@@ -56,7 +56,8 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import bf16_tiles
 WORLD = gl.constexpr(8)
 DRAFT_LAYERS = gl.constexpr(5)  # launches a draft forward runs
 SPLITS = 16  # attention splits: 16 x 128 keys hold the 2041 cached
-MAX_ROWS = 8  # one request's block
+BLOCK_ROWS = 8  # one request's block
+MAX_ROWS = 16  # two requests' blocks, one after the other
 
 # The last layer's launch also runs the draft's final norm: fin puts the MLP
 # partial into the owners' ``fred``, fsum and fnorm (on sum1's CTAs, with its
@@ -164,7 +165,7 @@ def layer_plan(rows: int, last: bool) -> Plan:
         stages=(Stage("code", CODE_TASKS, 0),) + stages(BASES, SPLITS, rows, last),
         regions=regions(SPLITS),
         rows=rows,
-        chain=rows,
+        chain=min(rows, BLOCK_ROWS),
         world=int(WORLD),
         peers=PEERS,
     )
@@ -244,10 +245,11 @@ def pack_draft_layer(tensors: dict[str, torch.Tensor], rank: int) -> DraftLayerW
     )
 
 
-# The layer index changes every launch: a specialization on it would compile
-# new binaries while serving. The code range is the compiled binary's own,
+# The layer index changes every launch and the page tables' row stride with
+# the table's width: a specialization on them would compile new binaries
+# while serving. The code range is the compiled binary's own,
 # known only after the compile.
-@gluon.jit(do_not_specialize=("layer", "code_offset", "code_quads"))
+@gluon.jit(do_not_specialize=("layer", "table_stride", "code_offset", "code_quads"))
 def gluon_muse_spark_draft_layer_gfx950(
     scratch,
     step,
@@ -266,6 +268,7 @@ def gluon_muse_spark_draft_layer_gfx950(
     positions,
     slots,
     table,
+    table_stride,
     seq_len,
     k_cache,
     v_cache,
@@ -369,7 +372,7 @@ def gluon_muse_spark_draft_layer_gfx950(
     task, active = schedule.stage_task(PLAN, "attn")
     if active:
         draft_attn.attn_stage(
-            mb, task, table, seq_len, k_cache, v_cache, SPLITS_, "attn"
+            mb, task, table, table_stride, seq_len, k_cache, v_cache, SPLITS_, "attn"
         )
     task, active = schedule.stage_task(PLAN, "merge")
     if active:
@@ -583,8 +586,9 @@ def launch_gluon_muse_spark_draft_layer_gfx950(
     trace_buf,
     compile_only: bool,
 ) -> None:
-    """One step of a packed draft layer for one request's block of rows, on
-    every rank of the TP8 group at once (the launches exchange values).
+    """One step of a packed draft layer for the blocks of one or two
+    requests (8 rows each, request by request), on every rank of the TP8
+    group at once (the launches exchange values).
 
     Args:
         weights: From :func:`pack_draft_layer`.
@@ -602,10 +606,12 @@ def launch_gluon_muse_spark_draft_layer_gfx950(
             norm's gain of the rank's owned columns.
         normed: None, or (the last layer) BF16 ``[rows, 8192]``: the final
             norm's output, the whole rows on every rank.
-        seq_len: int32 ``[1]``: the request's length after the block.
+        seq_len: int32 ``[requests]``: each request's length after its
+            block.
         positions: int32 ``[rows]``: the block rows' positions.
         slots: int32 or int64 ``[rows]``: the block rows' cache slots.
-        page_table: int32 page table of the request (64 tokens a page).
+        page_table: int32 ``[>= requests, pages]``: row ``q`` is request
+            ``q``'s page table (64 tokens a page).
         k_cache, v_cache: BF16 ``[slots, 1, 128]``: this layer's cache.
         cos_sin: FP32 ``[positions, 128]`` rotary table, cos then sin.
         scratch: int64 mailbox pairs of ``layer_plan(rows, last)
@@ -620,8 +626,18 @@ def launch_gluon_muse_spark_draft_layer_gfx950(
             ranks compile before any of them launches.
     """
     rows = x.shape[0]
-    if not 1 <= rows <= MAX_ROWS or rows % 8:
-        raise ValueError(f"a draft block of 8 rows, got {rows}")
+    if not 1 <= rows <= MAX_ROWS or rows % BLOCK_ROWS:
+        raise ValueError(f"draft blocks of {BLOCK_ROWS} rows, got {rows}")
+    requests = rows // BLOCK_ROWS
+    if seq_len.dtype != torch.int32 or tuple(seq_len.shape) != (requests,):
+        raise ValueError(f"seq_len: int32 [{requests}]")
+    if (
+        page_table.dtype != torch.int32
+        or page_table.dim() != 2
+        or page_table.shape[0] < requests
+        or page_table.stride(1) != 1
+    ):
+        raise ValueError(f"page_table: int32 [>= {requests}, pages], rows contiguous")
     last = normed is not None
     if (out is None) != last or (final_gain is not None) != last:
         raise ValueError("either out, or (the last layer) final_gain and normed")
@@ -674,6 +690,7 @@ def launch_gluon_muse_spark_draft_layer_gfx950(
             positions,
             slots,
             page_table,
+            page_table.stride(0),
             seq_len,
             k_cache,
             v_cache,
@@ -707,6 +724,7 @@ def launch_gluon_muse_spark_draft_layer_gfx950(
 
 
 __all__ = [
+    "BLOCK_ROWS",
     "BASES",
     "DraftLayerWeights",
     "MAX_ROWS",
