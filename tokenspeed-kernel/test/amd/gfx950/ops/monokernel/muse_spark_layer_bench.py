@@ -393,7 +393,13 @@ def worker(rank: int, port: int, args) -> None:
                 b[: args.experts] = torch.randn(args.experts, generator=g) * std
                 bias.copy_(b)
                 step.add_(1)
-                launch(1)
+                # Layers 1 and 2 by turns: the peer regions' copy (parity)
+                # must alternate from one launch to the next (mailbox.Peers).
+                # With layer 1 every time, a fast rank's next launch could
+                # overwrite the copy a slow rank still polled, and every rank
+                # then spun until the fail-stop trap (~1 run in 100).
+                lay = 2 - len(seen) % 2
+                launch(lay)
                 torch.cuda.synchronize()
                 u = torch.tensor([_distinct(plan, scratch, args.rows)])
                 dist.broadcast(u, 0)
