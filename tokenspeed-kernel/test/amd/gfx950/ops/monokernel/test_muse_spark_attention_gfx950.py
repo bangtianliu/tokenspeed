@@ -66,6 +66,7 @@ def attention_kernel(
     k_cache,
     v_cache,
     cos_sin,
+    proj,
     PLAN: gl.constexpr,
     SPLITS: gl.constexpr,
     WINDOW: gl.constexpr,
@@ -74,8 +75,10 @@ def attention_kernel(
     mb = mailbox.Mailbox(scratch, mailbox.launch_tag(step, 0), PLAN, None)
     task, active = schedule.stage_task(PLAN, "head")
     if active:
+        # The launch projects its own q | k | v (the qkvg region): proj is
+        # unused.
         attention.head_stage(
-            mb, task, seq_len, slot, k_cache, v_cache, cos_sin, ROPE, "head"
+            mb, task, seq_len, slot, k_cache, v_cache, cos_sin, proj, ROPE, True, "head"
         )
     G: gl.constexpr = schedule.grid(PLAN)
     attn_task, attn_rounds = schedule.stage_rounds(PLAN, "attn")
@@ -89,7 +92,9 @@ def attention_kernel(
             k_cache,
             v_cache,
             cos_sin,
+            proj,
             ROPE,
+            True,
             SPLITS,
             WINDOW,
             "attn",
@@ -103,7 +108,7 @@ def _plan(splits: int, rows: int, chain: int) -> Plan:
     return Plan(
         grid=256,
         stages=attention.stages(
-            {"head": 0, "attn": 32, "merge": 18}, splits, rows, chain
+            {"head": 0, "attn": 32, "merge": 18}, splits, rows, chain, True
         ),
         regions=qkvg_stage.REGIONS + attention.regions(splits),
         rows=rows,
@@ -192,6 +197,7 @@ def test_attention_matches_the_regular_path_math(
         kc,
         vc,
         cs.cuda(),
+        scratch.view(torch.int32),
         plan.key,
         splits,
         window,
