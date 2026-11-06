@@ -78,6 +78,7 @@ from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
 )
 from tokenspeed_kernel_amd._triton import tl, triton  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import plan as plan_mod  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel import stuck  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import layer  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.qkvg import (  # noqa: E402
     PROJ_WORDS,
@@ -369,6 +370,8 @@ def worker(rank: int, port: int, args) -> None:
             flush.zero_()
 
     trace = torch.zeros(TRACE_SHAPE, dtype=torch.int64, device=dev)
+    # The served launches carry a stuck-poll record buffer: so do the bench's.
+    stuck_rec = stuck.stuck_buffer(256, None, scratch.data_ptr(), rank).tensor
     group.finish_prepare()
 
     def launch(lay: int, trace_buf=None) -> None:
@@ -387,6 +390,7 @@ def worker(rank: int, port: int, args) -> None:
             proj[(lay + 1) & 1] if args.shift else None,
             attn_ops[0] if args.shift else None,  # the next layer's: this one's
             trace_buf,
+            stuck_rec,
             rank,
             args.full,
             R,

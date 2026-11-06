@@ -616,7 +616,7 @@ def launch_gluon_muse_spark_draft_layer_gfx950(
         layer: The draft layer index, below ``DRAFT_LAYERS``.
         trace_buf: None, or a trace buffer (``trace.py``).
         compile_only: Only compile the launch for these operands: a rank's
-            launch polls its peers for a few seconds before it traps, so the
+            launch polls its peers for about a minute before it traps, so the
             ranks compile before any of them launches.
     """
     rows = x.shape[0]

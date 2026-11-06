@@ -59,8 +59,11 @@ regular layer after it. Layers 0 and 61 keep the regular path.
 
 from __future__ import annotations
 
+import atexit
 import functools
+import json
 import logging
+import os
 from collections.abc import Callable
 
 import torch
@@ -68,7 +71,10 @@ import torch.distributed as dist
 from tokenspeed_kernel.ops.monokernel import (
     MUSE_SPARK_PROJ_WORDS,
     FusedDecodeLayer,
+    MonokernelStuckRecord,
+    describe_muse_spark_stuck,
     muse_spark_layer_decode,
+    muse_spark_layer_kinds,
     prepare_muse_spark_experts,
     prepare_muse_spark_layer,
 )
@@ -91,6 +97,8 @@ MAX_REQUESTS = 1
 CHAIN_ROWS = 8  # a request's rows at most
 MAX_ROWS = MAX_REQUESTS * CHAIN_ROWS
 WORLD = 8
+# CTAs of a layer launch (layer.layer_plan), each with a stuck-poll record.
+GRID = 256
 # The served MoE splits, as (MoE TP size, EP size).
 MOE_SPLITS = frozenset({(WORLD, 1), (1, WORLD)})
 HIDDEN = 8192
@@ -430,6 +438,18 @@ class MonokernelSteps:
         # layer's plan lays the regions out alike (layer.layer_plan), so one
         # scratch serves both kinds of layer.
         self.scratch = context.zeros((scratch_pairs,), dtype=torch.int64)
+        # Where a launch's poll that gives up writes what it waited for
+        # before the trap: a file per rank with a record directory (it
+        # outlives the process), else pinned memory.
+        record_dir = global_server_args_dict["monokernel_stuck_record_dir"]
+        path = (
+            None
+            if record_dir is None
+            else os.path.join(record_dir, f"stuck-rank{rank}-pid{os.getpid()}.bin")
+        )
+        if path is not None:
+            os.makedirs(record_dir, exist_ok=True)
+        self.stuck = MonokernelStuckRecord(GRID, path, self.scratch, rank)
         # A draft's taps: the residual entering each captured layer, BF16, in
         # the layout of the concatenated captures (row, tap, column). The
         # launch before a captured layer stores it on every rank.
@@ -474,6 +494,8 @@ class MuseSparkMonokernels:
             :meth:`prepare` (None before it).
         compiled: The ``(layer index, rows, whole_rows)`` launches compiled on
             every rank.
+        launches: The ``(rows, chain)`` of the launches compiled, for
+            decoding stuck-poll records.
         tap_slots: The draft taps the launches store, by captured layer: its
             slot in ``steps.taps``. Empty when some captured layer follows a
             layer without a launch (the regular capture then serves them all).
@@ -496,6 +518,7 @@ class MuseSparkMonokernels:
         self.steps: MonokernelSteps | None = None
         self.cpu_group: dist.ProcessGroup | None = None
         self.compiled: set[tuple[int, int, bool]] = set()
+        self.launches: set[tuple[int, int]] = set()
         self.tap_slots: dict[int, int] = {}
 
     def prepare(
@@ -521,6 +544,37 @@ class MuseSparkMonokernels:
                 group, rank, scratch_pairs, len(self.tap_slots)
             )
             self.cpu_group = cpu_group
+            self.write_stuck_sidecar()
+            atexit.register(self.report_stuck)
+
+    def write_stuck_sidecar(self) -> None:
+        """Describe the launches next to a file-backed stuck-poll record (its
+        ``.json``), for decoding the file after the process died."""
+        path = self.steps.stuck.path
+        if path is None:
+            return
+        side = {
+            "layers": muse_spark_layer_kinds(self.fused),
+            "launches": sorted(self.launches),
+        }
+        with open(f"{path}.json.tmp", "w") as f:
+            json.dump(side, f)
+        os.replace(f"{path}.json.tmp", f"{path}.json")
+
+    def report_stuck(self) -> None:
+        """At exit: log the stuck polls the launches recorded, if any; else
+        remove a record file and its sidecar."""
+        record = self.steps.stuck
+        if record.any():
+            for line in describe_muse_spark_stuck(
+                record, self.fused, sorted(self.launches)
+            ):
+                logger.error(f"decode monokernel stuck poll: {line}")
+            return
+        path = record.path
+        record.close(remove=True)
+        if path is not None and os.path.exists(f"{path}.json"):
+            os.remove(f"{path}.json")
 
     def plan(
         self, rows: int, ctx: ForwardContext, taps: list[int]
@@ -648,6 +702,7 @@ class MonokernelStep:
             scratch=steps.scratch,
             step=steps.step,
             peer_bases=steps.bases,
+            stuck_rec=steps.stuck.tensor,
             layer_index=index,
             chain=self._chain,
             whole_rows=whole_rows,
@@ -668,12 +723,15 @@ class MonokernelStep:
         # A forward with a capture sink and one without differ in whole_rows
         # before a tapped layer: each variant compiles on every rank first.
         if (index, rows, whole_rows) not in monokernels.compiled:
-            # A launch traps when its peers' values do not come within a few
-            # seconds, and a first launch compiles for longer on some ranks
+            # A launch traps when its peers' values do not come within about
+            # a minute, and a first launch compiles for longer on some ranks
             # than on others: every rank compiles, then the ranks meet.
             muse_spark_layer_decode(fused, compile_only=True, **operands)
             dist.barrier(group=monokernels.cpu_group)
             monokernels.compiled.add((index, rows, whole_rows))
+            if (rows, self._chain) not in monokernels.launches:
+                monokernels.launches.add((rows, self._chain))
+                monokernels.write_stuck_sidecar()
         muse_spark_layer_decode(fused, compile_only=False, **operands)
         if whole_rows:
             self._owned = None

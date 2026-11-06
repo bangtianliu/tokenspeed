@@ -61,7 +61,7 @@ seam. The switch `--decode-monokernel` enables it.
   with its reasons. Startup fails when no layer is eligible.
 - The seam allocates the mailbox scratch on the Iris symmetric heap before
   graph capture.
-- A launch traps when its peers' values do not come within a few seconds,
+- A launch traps when its peers' values do not come within about a minute,
   and a cold compile can take longer on one rank than on the others. Thus
   the first launch of each layer and row count only compiles
   (`compile_only`), the ranks meet at a CPU barrier, and then they launch.
