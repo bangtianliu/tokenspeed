@@ -43,8 +43,8 @@ output projection (a reduce-scatter).
     sums (:func:`norm_scales`). ``u`` goes as BF16 into every rank's
     ``xin`` (the MoE input, which the pooler reads whole) as plain words,
     then one flag per rank in ``xflag``: the pooler reads half the bytes of
-    tagged pairs. The router does
-    not wait for it: it reads ``hp`` and ``ss1`` (see moe_route).
+    tagged pairs. The router does not wait for it: it sums ``b`` itself from
+    ``red`` and takes the scales from ``ss1`` (see moe_route).
 """
 
 from __future__ import annotations
@@ -72,7 +72,6 @@ def regions() -> tuple[tuple[str, int], ...]:
         ("red", world * owned // 2),  # BF16 pairs [source rank][owned column]
         ("ss1", world * tasks * int(SUMS)),  # FP32 partial sums [rank][task][sum]
         ("hp", owned),  # FP32 owned slice of the residual after attention (h')
-        ("bq", owned),  # FP32 owned slice of the reduced, BF16-rounded o_proj (b)
         # Words of BF16 pairs of the whole MoE input, rank-major (2 words a
         # pair of the region), and a flag per tail task: [rank][task].
         ("xin", world * owned // 4),
@@ -86,7 +85,7 @@ def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
     tasks = int(TAIL_TASKS) * rows
     return (
         Stage("oproj", int(OPROJ_TASKS), oproj, reads=("z",), writes=("red",)),
-        Stage("tail1", tasks, tail, reads=("red",), writes=("bq", "ss1")),
+        Stage("tail1", tasks, tail, reads=("red",), writes=("ss1",)),
         Stage("tail2", tasks, tail, reads=("ss1",), writes=("hp", "xin", "xflag")),
     )
 
@@ -207,9 +206,6 @@ def tail_stages(mb, task, h, alpha, beta, pre_gain, RANK: gl.constexpr):
         hi += gl.sum(gl.where(src[:, None] == p, hi_all, 0.0), axis=0)
     lo = lo.to(gl.bfloat16).to(gl.float32)
     hi = hi.to(gl.bfloat16).to(gl.float32)
-    # The router needs only b (see moe_route): it does not wait for the norm.
-    mb.put("bq", c, lo.to(gl.int32, bitcast=True))
-    mb.put("bq", c + 1, hi.to(gl.int32, bitcast=True))
     bb_lo = beta_lo * lo
     bb_hi = beta_hi * hi
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
