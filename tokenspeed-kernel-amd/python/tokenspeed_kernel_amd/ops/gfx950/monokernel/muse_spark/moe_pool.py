@@ -30,7 +30,14 @@ pooled rows (4096 each, rank-major).
 from __future__ import annotations
 
 from tokenspeed_kernel_amd._triton import gl, gluon
-from tokenspeed_kernel_amd.ops.gfx950.monokernel import bf16, mx, schedule, trace
+from tokenspeed_kernel_amd.ops.gfx950.monokernel import (
+    bf16,
+    mailbox,
+    mx,
+    schedule,
+    trace,
+)
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.attn_tail import TAIL_TASKS
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import HIDDEN, WORLD
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Stage, placement
 
@@ -48,7 +55,9 @@ def regions() -> tuple[tuple[str, int], ...]:
 def stages(bases: dict[str, int]) -> tuple[Stage, ...]:
     """The pool stage (one task serves every row), placed by ``bases``."""
     (pool,) = placement(bases, ("pool",))
-    return (Stage("pool", int(POOL_TASKS), pool, reads=("xin",), writes=("cg",)),)
+    return (
+        Stage("pool", int(POOL_TASKS), pool, reads=("xin", "xflag"), writes=("cg",)),
+    )
 
 
 @gluon.jit
@@ -71,11 +80,10 @@ def pool_stage(mb, task, w, RANK: gl.constexpr, STAGE: gl.constexpr):
         GROUP=1,
         GROUP_STRIDE=0,
     )
-    if R > 1:
-        # Past one row every wave of many CTAs polls several whole rows:
-        # one wave spins on hints first (unthrottled, the flood of polls
-        # starves the producers' stores across ranks and the grid livelocks).
-        mb.row(R - 1).pre_poll_spread("xin", HIDDEN // 2)
+    # One wave spins on the last row's flags first: the attention tail
+    # publishes every row at about the same time.
+    lanes = gl.arange(0, 64 * gl.num_warps(), mailbox.lane_layout(gl.num_warps()))
+    mb.row(R - 1).pre_poll("xflag", lanes % (WORLD * TAIL_TASKS))
     # The whole rows of K sit in LDS (16 KiB a row): past 8 rows, the rows
     # go through in two passes of the weights the task holds.
     if R > 8:
@@ -92,7 +100,9 @@ def _pool_pass(mb, tiles, p0: gl.constexpr, n: gl.constexpr, task, RANK: gl.cons
     """Rows ``p0 .. p0 + n - 1`` of pool task ``task``: their whole rows of
     ``xin`` in LDS times the task's weight ``tiles``, BF16, into every
     rank's ``cg``."""
-    x_smem, _ = bf16.load_rows(mb.row(p0), "xin", 0, HIDDEN, n)
+    x_smem = bf16.load_word_rows(
+        mb.row(p0), "xin", "xflag", WORLD * TAIL_TASKS, HIDDEN, n
+    )
     out = bf16.gemv(x_smem, tiles, FIRST=0, ROWS=n)  # FP32 [RP, 16]
     RP: gl.constexpr = out.shape[0]
     pairs: gl.constexpr = gl.BlockedLayout([1, 2], [1, 64], [gl.num_warps(), 1], [1, 0])
