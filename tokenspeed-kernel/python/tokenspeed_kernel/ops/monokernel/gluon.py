@@ -259,7 +259,7 @@ if _muse_spark_layer is not None:
             # on the warm stage or on qnext (every plan lays out the same
             # regions).
             _muse_spark_layer.layer_plan(
-                weights.full, rows, rows, True, True, False
+                weights.full, rows, rows, True, True, False, weights.bf16_experts
             ).scratch_pairs
             for rows in range(1, max_rows + 1)
         )
