@@ -112,7 +112,7 @@ def _worker(rank: int, port: int, seed: int) -> None:
         ]
         weights = draft_context.pack_draft_context(
             {
-                "fc": fc,
+                "fc": fc[rank * HIDDEN // 8 : (rank + 1) * HIDDEN // 8],
                 "hidden_norm": norm_w,
                 **{f"qkv_{i}": qkv[i] for i in range(LAYERS)},
                 **{f"k_norm_{i}": k_norm[i] for i in range(LAYERS)},
