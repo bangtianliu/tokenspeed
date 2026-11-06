@@ -438,6 +438,48 @@ class TestGroupTableStacksTest:
         torch.testing.assert_close(stacks_cuda.tables, stacks_ref.tables)
 
     @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs CUDA"))
+    def test_cuda_fill_of_long_rows_matches_torch_reference(self):
+        """Rows of thousands of pages (a long context's full-attention group:
+        ~52 column blocks of 128) take several programs per row; every column,
+        the zero tail included, matches the reference over stale contents."""
+        torch.manual_seed(3)
+        specs = [
+            GroupTableSpec(
+                FULL, block_granularity=64, kernel_page_size=64, max_num_pages=6600
+            ),
+            GroupTableSpec(
+                SWA, block_granularity=64, kernel_page_size=32, max_num_pages=260
+            ),
+        ]
+
+        def stacks():
+            return GroupTableStacks(
+                specs,
+                max_bs=4,
+                max_tokens_per_req=8,
+                max_extend_tokens=16,
+                device="cuda",
+            )
+
+        stacks_cuda, stacks_ref = stacks(), stacks()
+        bs = 3
+        blocks = (6600, 130)
+        packed = torch.randint(
+            -1, 50000, (bs * sum(blocks),), dtype=torch.int32, device="cuda"
+        )
+        full = packed[: bs * blocks[0]].view(bs, blocks[0])
+        swa = packed[bs * blocks[0] :].view(bs, blocks[1])
+        # A previous step's longer rows leave non-zero pages everywhere.
+        stacks_cuda.tables.fill_(7)
+        stacks_ref.tables.fill_(7)
+        stacks_cuda.fill(4, bs, {FULL: full, SWA: swa})
+        stacks_ref._fill_torch(4, bs, [full, swa])
+        assert torch.equal(stacks_cuda.tables, stacks_ref.tables)
+        stacks_cuda.tables.fill_(7)
+        stacks_cuda.fill(4, bs, {FULL: full.clone(), SWA: swa.clone()})
+        assert torch.equal(stacks_cuda.tables, stacks_ref.tables)
+
+    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs CUDA"))
     def test_cuda_fill_reads_any_packed_order_and_in_place_padding(self):
         from unittest.mock import patch
 
