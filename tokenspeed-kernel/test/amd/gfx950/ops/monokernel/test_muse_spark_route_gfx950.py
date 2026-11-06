@@ -123,11 +123,11 @@ def _worker(rank: int, port: int, rows: int) -> None:
         plan = Plan(
             grid=256,
             stages=moe_route.stages({"router": 0, "topk": 16}, rows),
-            regions=(("bq", OWNED), ("ss1", WORLD * TAIL_TASKS * SUMS))
+            regions=(("red", WORLD * OWNED // 2), ("ss1", WORLD * TAIL_TASKS * SUMS))
             + moe_route.regions(),
             rows=rows,
             chain=rows,
-            external=("bq", "ss1"),
+            external=("red", "ss1"),
             world=WORLD,
             peers=moe_route.PEERS,
         )
@@ -139,11 +139,19 @@ def _worker(rank: int, port: int, rows: int) -> None:
             (b, h, alpha, beta), hp, pre_gain, w, bias = _inputs(seed, rows)
             tag = launch_tag(step, 0)
             for row in range(rows):
+                # The ranks' o_proj partials that sum to b: rank 1's holds
+                # b - bf16 of half of it, rank 0's that half, the rest zero
+                # (the router sums them in rank order and rounds to BF16).
+                half = (b[row, own] / 2).to(torch.bfloat16)
+                rest = (b[row, own] - half.float()).to(torch.bfloat16)
+                assert torch.equal((half.float() + rest.float()), b[row, own])
+                parts = torch.zeros(WORLD, OWNED, dtype=torch.bfloat16)
+                parts[0], parts[1] = half, rest
                 fill(
                     scratch,
                     plan,
-                    "bq",
-                    b[row, own].contiguous().view(torch.int32).to(device),
+                    "red",
+                    parts.view(torch.int32).to(device),
                     tag,
                     row=row,
                 )
