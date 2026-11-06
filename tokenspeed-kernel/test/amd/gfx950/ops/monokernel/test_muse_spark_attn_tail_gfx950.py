@@ -29,7 +29,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from monokernel_testing import fill, payloads
+from monokernel_testing import fill, payloads, words
 from utils import is_cdna4
 
 if not is_cdna4():
@@ -201,10 +201,18 @@ def _worker(rank: int, port: int, rows: int) -> None:
                     rtol=2**-7,
                     atol=1e-3,
                 )
-                # Every rank holds the whole BF16 MoE input, rank-major.
-                xin = payloads(
-                    scratch, plan, "xin", HIDDEN // 2, tag, row=row, copy=step & 1
+                # Every rank holds the whole BF16 MoE input, rank-major, as
+                # words, and every tail task's flag.
+                payloads(
+                    scratch,
+                    plan,
+                    "xflag",
+                    WORLD * attn_tail.TAIL_TASKS,
+                    tag,
+                    row=row,
+                    copy=step & 1,
                 )
+                xin = words(scratch, plan, "xin", HIDDEN // 2, row=row, copy=step & 1)
                 torch.testing.assert_close(
                     xin.view(torch.bfloat16).float().cpu(),
                     want_u[row],

@@ -41,7 +41,9 @@ output projection (a reduce-scatter).
     rsqrt(mean(h'^2) + 1e-5) bf16(w + 1)`` (the pre-FFN norm), whose sum of
     squares is the expansion of ``(beta b inv + alpha h)^2`` in the four
     sums (:func:`norm_scales`). ``u`` goes as BF16 into every rank's
-    ``xin`` (the MoE input, which the pooler reads whole). The router does
+    ``xin`` (the MoE input, which the pooler reads whole) as plain words,
+    then one flag per rank in ``xflag``: the pooler reads half the bytes of
+    tagged pairs. The router does
     not wait for it: it reads ``hp`` and ``ss1`` (see moe_route).
 """
 
@@ -61,7 +63,7 @@ SUMS = gl.constexpr(4)  # partial sums a tail task puts (see tail_stages)
 POST_EPS = gl.constexpr(1e-8)
 PRE_EPS = gl.constexpr(1e-5)
 
-PEERS = ("red", "ss1", "xin")
+PEERS = ("red", "ss1", "xin", "xflag")
 
 
 def regions() -> tuple[tuple[str, int], ...]:
@@ -71,7 +73,10 @@ def regions() -> tuple[tuple[str, int], ...]:
         ("ss1", world * tasks * int(SUMS)),  # FP32 partial sums [rank][task][sum]
         ("hp", owned),  # FP32 owned slice of the residual after attention (h')
         ("bq", owned),  # FP32 owned slice of the reduced, BF16-rounded o_proj (b)
-        ("xin", world * owned // 2),  # BF16 pairs of the whole MoE input, rank-major
+        # Words of BF16 pairs of the whole MoE input, rank-major (2 words a
+        # pair of the region), and a flag per tail task: [rank][task].
+        ("xin", world * owned // 4),
+        ("xflag", world * tasks),
     )
 
 
@@ -82,7 +87,7 @@ def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
     return (
         Stage("oproj", int(OPROJ_TASKS), oproj, reads=("z",), writes=("red",)),
         Stage("tail1", tasks, tail, reads=("red",), writes=("bq", "ss1")),
-        Stage("tail2", tasks, tail, reads=("ss1",), writes=("hp", "xin")),
+        Stage("tail2", tasks, tail, reads=("ss1",), writes=("hp", "xin", "xflag")),
     )
 
 
@@ -242,5 +247,6 @@ def tail_stages(mb, task, h, alpha, beta, pre_gain, RANK: gl.constexpr):
         u_hi.to(gl.bfloat16).to(gl.int16, bitcast=True).to(gl.int32) << 16
     )
     for p in gl.static_range(WORLD):
-        mb.put_peer("xin", p, RANK * (OWNED // 2) + c // 2, word)
+        mb.store_words_peer("xin", p, RANK * (OWNED // 2) + c // 2, word)
+    mb.raise_flag_peers("xflag", RANK * TAIL_TASKS + task)
     mb.stamp("tail2", trace.END)
