@@ -124,10 +124,12 @@ CHAINED_BASES = {
 # expert tasks first (ex2's last lanes) or run only comb before; the
 # out tasks (8 a row) move to 96 .. 159, after comb or unpool, so no qnext
 # weight stream waits behind an out task.
-# exr stays on CTAs 192 .. 255, one task a lane (not spread): spread, its
-# tasks on qnext's CTAs held their qnext weight streams back (served, 8 rows:
-# -115 us a step at 8k and 200k vs spread).
-NEXT_BASES = {**CHAINED_BASES, "qnext": 192, "out": 96, "exr": 192}
+# exr runs in 2 parts on CTAs 128 .. 255, not spread over every CTA: spread,
+# its tasks on qnext's CTAs held their qnext weight streams back (served, 8
+# rows: -115 us a step at 8k and 200k vs spread). In one part on 64 CTAs, the
+# ex2 tasks behind it ended ~5 us after the others: the tail follows the exr
+# work, so halving each CTA's share removes it.
+NEXT_BASES = {**CHAINED_BASES, "qnext": 192, "out": 96, "exr": 128}
 
 
 def _bases(rows: int, next_qkvg: bool, *names: str) -> dict[str, int]:
@@ -205,7 +207,7 @@ def layer_plan(
         + moe_experts.stages(
             _bases(rows, nq, "slt", "xq", "ex1", "exr", "ex2"),
             rows,
-            1 if rows == 1 or next_qkvg else int(moe_experts.EXR_PARTS),
+            1 if rows == 1 else 2 if next_qkvg else int(moe_experts.EXR_PARTS),
         )
         + ((Stage("warm", WARM_TASKS, 0),) if warm_next else ())
         + moe_tail.stages(
