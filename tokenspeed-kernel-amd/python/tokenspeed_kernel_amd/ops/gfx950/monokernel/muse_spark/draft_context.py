@@ -157,14 +157,15 @@ def pack_draft_context(
     """Pack one rank's context write.
 
     Args:
-        tensors: BF16 by role: ``fc`` ``[8192, 40960]`` (replicated);
+        tensors: BF16 by role: ``fc`` ``[1024, 40960]``, the rank's rows of
+            the column-parallel ``fc`` (output columns ``1024 rank ..``);
             ``hidden_norm`` ``[8192]``; ``qkv_0`` .. ``qkv_4`` ``[1280, 8192]``
             (each layer's q, k, v rows of the rank) and ``k_norm_0`` ..
             ``k_norm_4`` ``[128]``.
         rank: The rank in the TP8 group.
     """
     shapes = {
-        "fc": (int(HIDDEN), int(TAPS_K)),
+        "fc": (int(OWNED), int(TAPS_K)),
         "hidden_norm": (int(HIDDEN),),
         **{f"qkv_{i}": (1280, int(HIDDEN)) for i in range(int(LAYERS))},
         **{f"k_norm_{i}": (int(HEAD),) for i in range(int(LAYERS))},
@@ -177,7 +178,7 @@ def pack_draft_context(
     kv = torch.cat([tensors[f"qkv_{i}"][1024:] for i in range(int(LAYERS))])
     return DraftContextWeights(
         rank=rank,
-        fc=bf16_tiles(tensors["fc"][own].contiguous()),
+        fc=bf16_tiles(tensors["fc"].contiguous()),
         gain=tensors["hidden_norm"][own].float().contiguous(),
         kv=bf16_tiles(kv.contiguous()),
         k_norm=torch.stack([tensors[f"k_norm_{i}"] for i in range(int(LAYERS))]),

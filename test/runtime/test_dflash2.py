@@ -617,3 +617,28 @@ def test_the_capture_sink_follows_its_server_flag(disabled: bool) -> None:
     drafter.device = torch.device("cuda")
     drafter._init_context_taps()
     assert (drafter._tap_rows is None) is disabled
+
+
+@pytest.mark.parametrize(
+    "rows, tp_size, served",
+    [(1024, 8, True), (8192, 1, False), (8192, 8, False)],
+)
+def test_the_context_write_monokernel_takes_the_column_parallel_fc(
+    rows: int, tp_size: int, served: bool
+) -> None:
+    """The context write's monokernel reads each rank's own fc rows, the shard
+    the column-parallel ``fc`` holds; a replicated ``fc`` is not its layout."""
+    from tokenspeed.runtime.models import dflash2_monokernel
+
+    model = SimpleNamespace(
+        fc=SimpleNamespace(
+            quant_method=UnquantizedLinearMethod(),
+            tp_size=tp_size,
+            weight=torch.empty(rows, 5 * 8192, dtype=torch.bfloat16, device="meta"),
+        ),
+        hidden_norm=SimpleNamespace(
+            weight=torch.empty(8192, dtype=torch.bfloat16, device="meta"),
+            variance_epsilon=dflash2_monokernel.RMS_NORM_EPS,
+        ),
+    )
+    assert (dflash2_monokernel.context_reasons(model) == []) is served
