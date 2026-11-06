@@ -175,7 +175,12 @@ def xq_tasks(rows: int) -> int:
     return int(KSPLIT) * (rp // min(rp, int(XQ_ROWS)))
 
 
-def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
+def stages(bases: dict[str, int], rows: int, exr_parts: int) -> tuple[Stage, ...]:
+    """slt, xq, ex1, exr and ex2 of ``rows`` token rows, placed by ``bases``;
+    each lane's slots split over ``exr_parts`` exr tasks (1, or EXR_PARTS to
+    spread exr over every CTA)."""
+    if exr_parts not in (1, int(EXR_PARTS)):
+        raise ValueError(f"exr parts: 1 or {int(EXR_PARTS)}, got {exr_parts}")
     slt, xq, ex1, exr, ex2 = placement(bases, ("slt", "xq", "ex1", "exr", "ex2"))
     return (
         Stage("slt", 1, slt, reads=("route",), writes=("slt", "sltf")),
@@ -191,7 +196,7 @@ def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
         ),
         Stage(
             "exr",
-            int(EXR_LANE_TASKS) * (1 if rows == 1 else int(EXR_PARTS)),
+            int(EXR_LANE_TASKS) * exr_parts,
             exr,
             reads=("route", "p1"),
             writes=("h1",),
