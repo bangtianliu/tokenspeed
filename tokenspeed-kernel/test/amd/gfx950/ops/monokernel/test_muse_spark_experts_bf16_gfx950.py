@@ -152,7 +152,14 @@ def _worker(rank: int, port: int, rows: int) -> None:
             grid=256,
             # The layer's placement: exr over every CTA past one row.
             stages=moe_experts.stages(
-                {"slt": 255, "ex1": 0, "exr": 192 if rows == 1 else 0, "ex2": 0}, rows
+                {
+                    "slt": 255,
+                    "xq": 240,
+                    "ex1": 0,
+                    "exr": 192 if rows == 1 else 0,
+                    "ex2": 0,
+                },
+                rows,
             ),
             regions=(("route", 2 * TOP_K), ("cg", POOLED // 2)) + moe_experts.regions(),
             rows=rows,
