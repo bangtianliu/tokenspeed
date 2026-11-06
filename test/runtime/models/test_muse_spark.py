@@ -418,8 +418,12 @@ def test_a_tap_entering_a_fused_layer_reads_the_rows_the_step_returned() -> None
     def fused(*, hidden_states, attention_input, ctx):
         return hidden_states + 10.0, attention_input
 
+    # The forward has a capture sink, so the model, not the launches, takes
+    # the taps.
     step = SimpleNamespace(
-        layer=lambda index: fused if index == 0 else None, finish=lambda: None
+        layer=lambda index: fused if index == 0 else None,
+        finish=lambda: None,
+        serves_taps=lambda: False,
     )
 
     def plan(rows, ctx, taps):
@@ -432,9 +436,8 @@ def test_a_tap_entering_a_fused_layer_reads_the_rows_the_step_returned() -> None
     model.forward(torch.tensor([0, 1]), torch.tensor([0, 1]), ctx, hidden)
 
     assert planned == [model.layers_to_capture]
-    torch.testing.assert_close(
-        sink.captures[0][1], (hidden + 10.0).to(torch.bfloat16), rtol=0, atol=0
-    )
+    # A sink gets full rows unrounded (it rounds as it copies).
+    torch.testing.assert_close(sink.captures[0][1], hidden + 10.0, rtol=0, atol=0)
 
 
 def test_idle_forward_taps_nothing() -> None:
