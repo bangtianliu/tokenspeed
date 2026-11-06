@@ -35,12 +35,17 @@ once for every row that picked it. Row ``r``'s result for slot ``i`` goes to
 row ``r``'s entry of the pick that chose that expert, so the combine reads
 each row's 8 picks as for one row.
 
+* xq, a task a K quarter of a group of up to 4 rows: polls the group's
+  whole pooled rows, applies the pre-expert RMS norm, and quantizes the
+  quarter to MXFP4 (the regular path's "even" rule), then publishes the
+  E2M1 bytes and E8M0 scales as plain words under one flag.
 * ex1, 256 tasks: lane ``l``, 128 of the 1024 interleaved gate / up columns,
-  a quarter of K (64 KiB of weights a slot). A task polls every whole pooled
-  row, applies the pre-expert RMS norm, and quantizes its K quarter of every
-  row to MXFP4 (the regular path's "even" rule) in LDS, one MFMA row each.
-  It publishes the FP32 partial sums of the rows that picked the slot's
-  expert.
+  a quarter of K (64 KiB of weights a slot). A task issues its first slot's
+  weights once routing names the experts, then loads its K quarter of every
+  row from xq into LDS, one MFMA row each (136 words a row, not every whole
+  pooled row on each of the 256 CTAs). It publishes the FP32 partial sums of
+  the rows that picked the slot's expert. The layers with BF16 experts
+  (moe_experts_bf16) run no xq: their ex1 polls and norms the pooled rows.
 * exr, 64 tasks at one row (lane ``l``, one ex1 column block), 256 past one
   row (each lane's slots split over EXR_PARTS tasks, one a CTA). For each of
   its slots, a task polls the 4 K quarters of every row that picked the
@@ -134,6 +139,16 @@ PEERS = ("rr",)
 # 9-14 us past the table's end.
 SLT_PICKS = gl.constexpr(128)
 SLT_WORDS = gl.constexpr(128 + 128 * 16)
+# The expert input (:func:`xq_stage`): each row's K quarters normed and
+# quantized to MXFP4 once, as plain words in the row's copy of xq: a
+# quarter's 512 E2M1 bytes (128 words), then its 32 E8M0 scales (8 words).
+# An xq task does one K quarter of a group of up to XQ_ROWS rows (one poll
+# round trip) and raises flag ``quarter * XQ_GROUPS + group`` in row 0 of
+# xqf. ex1 then loads 136 words a row instead of polling every whole pooled
+# row (16 KiB of pairs) on each of its 256 CTAs.
+XQ_QUARTER_WORDS = gl.constexpr(136)  # K_SLICE // 8 + K_SLICE // 128
+XQ_ROWS = gl.constexpr(4)
+XQ_GROUPS = gl.constexpr(4)  # 16 rows / XQ_ROWS
 
 
 def regions() -> tuple[tuple[str, int], ...]:
@@ -141,6 +156,8 @@ def regions() -> tuple[tuple[str, int], ...]:
     return (
         ("slt", int(SLT_WORDS) // 2),  # words (half the region)
         ("sltf", 1),
+        ("xq", int(KSPLIT) * int(XQ_QUARTER_WORDS) // 2),  # words
+        ("xqf", int(KSPLIT) * int(XQ_GROUPS)),
         ("p1", k * nb1 * ks * bn),  # FP32 [pick][block][K quarter][column] a row
         # The intermediate [pick][word] a row: MXFP4, or BF16 for the
         # layers with BF16 experts (one layout serves both).
@@ -152,15 +169,24 @@ def regions() -> tuple[tuple[str, int], ...]:
     )
 
 
+def xq_tasks(rows: int) -> int:
+    """The xq tasks of a launch of ``rows``: a K quarter of a row group each."""
+    rp = 1 << (rows - 1).bit_length()
+    return int(KSPLIT) * (rp // min(rp, int(XQ_ROWS)))
+
+
 def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
-    slt, ex1, exr, ex2 = placement(bases, ("slt", "ex1", "exr", "ex2"))
+    slt, xq, ex1, exr, ex2 = placement(bases, ("slt", "xq", "ex1", "exr", "ex2"))
     return (
         Stage("slt", 1, slt, reads=("route",), writes=("slt", "sltf")),
+        # The layers with BF16 experts run no xq task: their ex1 norms the
+        # pooled rows itself (moe_experts_bf16).
+        Stage("xq", xq_tasks(rows), xq, reads=("cg",), writes=("xq", "xqf")),
         Stage(
             "ex1",
             int(EX1_TASKS),
             ex1,
-            reads=("slt", "sltf", "route", "cg"),
+            reads=("slt", "sltf", "xq", "xqf", "route", "cg"),
             writes=("p1",),
         ),
         Stage(
@@ -493,6 +519,133 @@ def ex1_operand(task, rows, gain_lo, gain_hi):
     dl: gl.constexpr = scaled_downcast_layout(M_DUP, K_SLICE, nw)
     packed, scales = _mxfp4_quantize_tile_in_layout(x_smem.load(dl))
     return _stage_a(packed, scales)
+
+
+@gluon.constexpr_function
+def _words_layout(cols, num_warps):
+    """``[row, word]`` of an xq quarter's words (a word a thread)."""
+    lanes = min(64, cols)
+    return gl.BlockedLayout([1, 1], [64 // lanes, lanes], [num_warps, 1], [1, 0])
+
+
+@gluon.jit
+def xq_stage(mb, task, pre_gain, STAGE: gl.constexpr):
+    """xq task ``task``: K quarter ``task % KSPLIT`` of the rows of group
+    ``task // KSPLIT`` (``G = min(RP, XQ_ROWS)`` rows), normed and quantized
+    by :func:`ex1_operand` (the same polls, layouts and math, so the MXFP4
+    bytes are the ones each ex1 task computed itself), published as plain
+    words in each row's copy of xq under one flag (xqf)."""
+    mb.stamp(STAGE, trace.START)
+    R: gl.constexpr = schedule.rows(mb.plan)
+    RP: gl.constexpr = triton.next_power_of_2(R)
+    G: gl.constexpr = min(RP, XQ_ROWS)
+    ks = task % KSPLIT
+    grp = task // KSPLIT
+    nw: gl.constexpr = gl.num_warps()
+    cl: gl.constexpr = _cg_layout(nw)
+    gr = gl.arange(0, G, gl.SliceLayout(1, gl.SliceLayout(2, cl)))[:, None, None]
+    q = gl.arange(0, KSPLIT, gl.SliceLayout(0, gl.SliceLayout(2, cl)))[None, :, None]
+    j = gl.arange(0, K_SLICE // 2, gl.SliceLayout(0, gl.SliceLayout(1, cl)))
+    c = ks * K_SLICE + 2 * j
+    gain_lo = gl.load(pre_gain + c)
+    gain_hi = gl.load(pre_gain + c + 1)
+    pair = q * (K_SLICE // 2) + j[None, None, :]
+    (got,) = mb.poll_many(("cg",), (mb.row_offset(grp * G + gr) + pair,))
+    mb.stamp(STAGE, trace.READY)
+    p_smem, s_smem = ex1_operand(task, (got,), gain_lo, gain_hi)
+    mb.stamp(STAGE, trace.COMPUTED)
+    plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    PW: gl.constexpr = K_SLICE // 8
+    SW: gl.constexpr = K_SLICE // 128
+    pl: gl.constexpr = _words_layout(PW, nw)
+    sl: gl.constexpr = _words_layout(SW, nw)
+    words = p_smem.reinterpret(gl.int32, [M_DUP, PW], plain).slice(0, G, dim=0)
+    pr = gl.arange(0, G, gl.SliceLayout(1, pl))[:, None]
+    pw = gl.arange(0, PW, gl.SliceLayout(0, pl))[None, :]
+    prow = grp * G + pr
+    mb.store_words(
+        "xq",
+        2 * mb.row_offset(prow) + ks * XQ_QUARTER_WORDS + pw,
+        words.load(pl),
+        mask=(prow < R) & (pw >= 0),
+    )
+    scales = s_smem.reinterpret(gl.int32, [M_DUP, SW], plain).slice(0, G, dim=0)
+    sr = gl.arange(0, G, gl.SliceLayout(1, sl))[:, None]
+    sw = gl.arange(0, SW, gl.SliceLayout(0, sl))[None, :]
+    srow = grp * G + sr
+    mb.store_words(
+        "xq",
+        2 * mb.row_offset(srow) + ks * XQ_QUARTER_WORDS + PW + sw,
+        scales.load(sl),
+        mask=(srow < R) & (sw >= 0),
+    )
+    mb.raise_flag("xqf", ks * XQ_GROUPS + grp)
+    mb.stamp(STAGE, trace.END)
+
+
+@gluon.jit
+def ex1_poll_routes(mb, task, task2, active, STAGE: gl.constexpr):
+    """:func:`ex1_poll` without the pooled rows (their quantized words come
+    from xq, :func:`ex1_xq`): the slot table's flag with the experts of the
+    first slots of ex1 task ``task`` and ex2 task ``task2``, then the table's
+    words. Returns ``(ids, e1, e2)``; the weights can stream from here."""
+    if active:
+        mb.stamp(STAGE, trace.START)
+    R: gl.constexpr = schedule.rows(mb.plan)
+    RP: gl.constexpr = triton.next_power_of_2(R)
+    nw: gl.constexpr = gl.num_warps()
+    NP: gl.constexpr = RP * TOP_K
+    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
+    pk = gl.arange(0, NP, lanes)
+    tl: gl.constexpr = _table_layout(NP, RP, nw)
+    tp = gl.arange(0, NP, gl.SliceLayout(1, tl))[:, None]
+    tr = gl.arange(0, RP, gl.SliceLayout(0, tl))[None, :]
+    i = gl.arange(0, 2, lanes)
+    first = gl.where(i == 0, task // (NB1 * KSPLIT), task2 // (NB2 // EX2_BLOCKS))
+    firsts, _ = mb.poll_many(("route", "sltf"), (first, i * 0))
+    # The table's flag is in: its words load after the poll returned.
+    gl.barrier()
+    ids = (mb.load_words("slt", pk), mb.load_words("slt", SLT_PICKS + tp * RP + tr))
+    e1 = gl.max(gl.where(i == 0, firsts, -1), axis=0)
+    e2 = gl.max(gl.where(i == 1, firsts, -1), axis=0)
+    return ids, e1, e2
+
+
+@gluon.jit
+def ex1_xq(mb, task, active, STAGE: gl.constexpr):
+    """ex1 task ``task``'s A operand from xq: poll its K quarter's flags (one
+    a row group), then load the quarter's words of every row into LDS, as
+    :func:`ex1_operand` leaves them (rows past the launch's rows repeat its
+    last row, rows past ``RP`` are zero). Returns the LDS (values, scales)."""
+    R: gl.constexpr = schedule.rows(mb.plan)
+    RP: gl.constexpr = triton.next_power_of_2(R)
+    NG: gl.constexpr = RP // min(RP, XQ_ROWS)
+    ks = task % KSPLIT
+    nw: gl.constexpr = gl.num_warps()
+    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
+    f = gl.arange(0, XQ_GROUPS, lanes)
+    mb.poll_many(("xqf",), (ks * XQ_GROUPS + gl.minimum(f, NG - 1),))
+    gl.barrier()
+    if active:
+        mb.stamp(STAGE, trace.READY)
+    plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    PW: gl.constexpr = K_SLICE // 8
+    SW: gl.constexpr = K_SLICE // 128
+    pl: gl.constexpr = _words_layout(PW, nw)
+    sl: gl.constexpr = _words_layout(SW, nw)
+    pr = gl.arange(0, M_DUP, gl.SliceLayout(1, pl))[:, None]
+    pw = gl.arange(0, PW, gl.SliceLayout(0, pl))[None, :]
+    sr = gl.arange(0, M_DUP, gl.SliceLayout(1, sl))[:, None]
+    sw = gl.arange(0, SW, gl.SliceLayout(0, sl))[None, :]
+    base = ks * XQ_QUARTER_WORDS
+    words = mb.load_words("xq", 2 * mb.row_offset(pr) + base + pw)
+    scales = mb.load_words("xq", 2 * mb.row_offset(sr) + base + PW + sw)
+    p_smem = gl.allocate_shared_memory(gl.uint8, [M_DUP, K_SLICE // 2], plain)
+    s_smem = gl.allocate_shared_memory(gl.uint8, [M_DUP, K_SLICE // 32], plain)
+    p_smem.reinterpret(gl.int32, [M_DUP, PW], plain).store(gl.where(pr < RP, words, 0))
+    s_smem.reinterpret(gl.int32, [M_DUP, SW], plain).store(gl.where(sr < RP, scales, 0))
+    gl.barrier()
+    return p_smem, s_smem
 
 
 @gluon.jit
