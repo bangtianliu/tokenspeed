@@ -91,7 +91,8 @@ def _worker(rank: int, port: int, seed: int) -> None:
         device = torch.device(f"cuda:{rank}")
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, device)
-        plan = draft_context.context_plan(ROWS)
+        # Two requests' plan is the larger: one scratch serves both.
+        plan = draft_context.context_plan(2 * ROWS)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         group.finish_prepare()
         g = torch.Generator(device=device).manual_seed(seed)
@@ -165,6 +166,47 @@ def _worker(rank: int, port: int, seed: int) -> None:
                         atol=ref.float().abs().max().item() * 2**-8,
                     )
             dist.barrier()
+        # Two requests' verify rows in one launch write the bits that a launch
+        # of each request's rows writes (the rows are independent).
+        taps_b = randn(ROWS, TAPS_K, std=1.0)
+        positions = torch.cat(
+            [
+                torch.arange(5000, 5000 + ROWS, dtype=torch.int32, device=device),
+                torch.arange(64000, 64000 + ROWS, dtype=torch.int32, device=device),
+            ]
+        )
+        slots = torch.randperm(slots_n, generator=g, device=device)[: 2 * ROWS]
+        caches = {}
+        for name, rows, step in (
+            ("a", slice(0, ROWS), 5),
+            ("b", slice(ROWS, 2 * ROWS), 6),
+            ("both", slice(0, 2 * ROWS), 7),
+        ):
+            ks = tuple(torch.zeros_like(c) for c in k_caches)
+            vs = tuple(torch.zeros_like(c) for c in k_caches)
+            draft_context.launch_gluon_muse_spark_draft_context_gfx950(
+                weights,
+                taps=torch.cat([taps, taps_b])[rows].contiguous(),
+                positions=positions[rows],
+                slots=slots[rows],
+                k_caches=ks,
+                v_caches=vs,
+                cos_sin=cos_sin,
+                scratch=scratch,
+                step=torch.full((1,), step, dtype=torch.int32, device=device),
+                peer_bases=group.bases,
+                trace_buf=None,
+                compile_only=False,
+            )
+            caches[name] = (ks, vs)
+        torch.cuda.synchronize()
+        for layer in range(LAYERS):
+            for kind in (0, 1):
+                both = caches["both"][kind][layer]
+                for name, rows in (("a", slice(0, ROWS)), ("b", slice(ROWS, None))):
+                    at = slots[rows]
+                    assert torch.equal(both[at], caches[name][kind][layer][at])
+        dist.barrier()
     finally:
         dist.destroy_process_group()
 

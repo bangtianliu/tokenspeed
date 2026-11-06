@@ -23,8 +23,9 @@
 After the draft's final norm, the regular path takes each draft step's top 16
 tokens over the vocabulary-parallel LM head (``vocab_parallel_topk.py``) and
 scores the 16 x 16 transitions between consecutive steps with the candidate
-selector (``models/dflash2.py``). This launch does both for one request's
-draft steps (the block's rows 1 .. 7), on every rank of the TP8 group:
+selector (``models/dflash2.py``). This launch does both for the draft steps
+of one or two requests (each block's rows 1 .. 7, request by request), on
+every rank of the TP8 group:
 
 * lmh, 226 tasks of 7 16-row blocks (112 vocabulary rows) of the rank's
   25256-row shard: the logits ``bf16(bf16(x W^T) * scale)`` over the whole K
@@ -41,9 +42,9 @@ draft steps (the block's rows 1 .. 7), on every rank of the TP8 group:
 * score, on merge2's CTAs: the selector's edge scores
   ``unary[c] + bf16(sum_r bf16(pred[p, r] h[r]) succ[c, r])``, where ``pred``
   holds the codebook rows of the previous step's candidates (the anchor
-  token for step 0) and ``succ`` those of this step's. Step 0's task also
-  stores the anchor, the block's first token clamped to the vocabulary, for
-  the walk that follows.
+  token for a request's step 0) and ``succ`` those of this step's. A
+  request's step 0 task also stores its anchor, the block's first token
+  clamped to the vocabulary, for the walk that follows.
 
 Every rank computes the same outputs, as the regular path does.
 """
@@ -83,6 +84,8 @@ HPROJ_KS = gl.constexpr(1024)
 HPROJ_KPARTS = gl.constexpr(8)
 HPROJ_TASKS = gl.constexpr(16)  # 2 groups of 128 rows x 8 K parts
 STEPS = 7  # draft steps a block: rows 1 .. 7
+REQUEST_STEPS = gl.constexpr(STEPS)
+MAX_REQUESTS = 2  # requests a launch: their steps one after another
 VOCAB_IDS = gl.constexpr(VOCAB)
 ID_BITS = gl.constexpr(15)  # a shard row's index fits 15 bits
 GID_BITS = gl.constexpr(18)  # a token id fits 18 bits
@@ -386,9 +389,10 @@ def merge_stages(mb, row, RANK: gl.constexpr, softcap, cand_ids, unary):
 
 @gluon.jit
 def score_stage(mb, row, ids, u, first_token, anchor, pred_cb, succ_cb, scores):
-    """Score task of step ``row``: the selector's 16 x 16 edge scores
-    ``scores[row, p, c]`` from step ``row - 1``'s candidate ``p`` (the anchor
-    token for step 0) to this step's candidate ``c``."""
+    """Score task of step row ``row`` (request ``row // 7``'s step ``row %
+    7``): the selector's 16 x 16 edge scores ``scores[row, p, c]`` from the
+    previous step's candidate ``p`` (the request's anchor token for its step
+    0) to this step's candidate ``c``."""
     mb.stamp("score", trace.START)
     nw: gl.constexpr = gl.num_warps()
     l3: gl.constexpr = gl.BlockedLayout([1, 1, 4], [1, 1, 64], [nw, 1, 1], [2, 1, 0])
@@ -405,10 +409,11 @@ def score_stage(mb, row, ids, u, first_token, anchor, pred_cb, succ_cb, scores):
     h = gl.convert_layout(h, gl.SliceLayout(0, lp))
     # The predecessors: the previous step's candidates (or the anchor).
     pj = gl.arange(0, TOPK, gl.SliceLayout(1, lp))
-    if row == 0:
-        token = gl.load(first_token).to(gl.int64)
+    request = row // REQUEST_STEPS
+    if row % REQUEST_STEPS == 0:
+        token = gl.load(first_token + request).to(gl.int64)
         token = gl.minimum(gl.maximum(token, 0), VOCAB_IDS - 1)
-        gl.store(anchor, token)
+        gl.store(anchor + request, token)
         pid = gl.zeros([TOPK], gl.int64, gl.SliceLayout(1, lp)) + token
     else:
         (prev,) = mb.row(row - 1).poll_many(("cid",), (pj,))
@@ -497,16 +502,18 @@ def launch_gluon_muse_spark_draft_head_gfx950(
     trace_buf,
     compile_only: bool,
 ) -> None:
-    """The draft head of one request's draft steps, on every rank of the TP8
-    group at once (the launches exchange candidates).
+    """The draft head of one or two requests' draft steps, on every rank of
+    the TP8 group at once (the launches exchange candidates).
 
     Args:
         weights: From :func:`pack_draft_head`.
         x: BF16 ``[steps, 8192]`` contiguous: the draft's final-norm output
-            of the block's rows 1 .. 7 (the same on every rank).
-        first_token: int32 ``[1]``: the block's first token (step 0's
-            predecessor).
-        anchor: int64 ``[1]`` out: that token clamped to the vocabulary.
+            of each request's block rows 1 .. 7, request by request (7 rows
+            a request; the same on every rank).
+        first_token: int32 ``[requests]``: each block's first token (its
+            step 0's predecessor).
+        anchor: int64 ``[requests]`` out: those tokens clamped to the
+            vocabulary.
         cand_ids: int64 ``[steps, 16]`` out: each step's candidate token ids,
             by descending unary score.
         unary: FP32 ``[steps, 16]`` out: their softcapped logits.
@@ -520,8 +527,12 @@ def launch_gluon_muse_spark_draft_head_gfx950(
         compile_only: Only compile the launch for these operands.
     """
     rows = x.shape[0]
-    if rows != STEPS:
-        raise ValueError(f"the head serves a block's {STEPS} draft steps, got {rows}")
+    requests = rows // STEPS
+    if rows % STEPS or not 1 <= requests <= MAX_REQUESTS:
+        raise ValueError(
+            f"the head serves {STEPS} draft steps a request, at most "
+            f"{MAX_REQUESTS} requests, got {rows} rows"
+        )
     if (
         x.dtype != torch.bfloat16
         or tuple(x.shape) != (rows, 8192)
@@ -529,8 +540,8 @@ def launch_gluon_muse_spark_draft_head_gfx950(
     ):
         raise ValueError(f"x: contiguous BF16 [{rows}, 8192]")
     for name, t, dtype, shape in (
-        ("first_token", first_token, torch.int32, (1,)),
-        ("anchor", anchor, torch.int64, (1,)),
+        ("first_token", first_token, torch.int32, (requests,)),
+        ("anchor", anchor, torch.int64, (requests,)),
         ("cand_ids", cand_ids, torch.int64, (rows, 16)),
         ("unary", unary, torch.float32, (rows, 16)),
         ("scores", scores, torch.float32, (rows, 16, 16)),
@@ -575,6 +586,7 @@ def launch_gluon_muse_spark_draft_head_gfx950(
 
 
 __all__ = [
+    "MAX_REQUESTS",
     "BASES",
     "DraftHeadWeights",
     "STEPS",

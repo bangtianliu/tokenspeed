@@ -284,7 +284,8 @@ def prepare_muse_spark_draft_context(
             ``tokenspeed_kernel_amd...muse_spark.draft_context
             .pack_draft_context``).
         rank: The rank in the TP8 group.
-        max_rows: The verify rows of one request.
+        max_rows: The most verify rows of one launch: those of up to two
+            requests, 8 each.
         override: Optional registered kernel name to force.
 
     Returns:
@@ -323,8 +324,9 @@ def muse_spark_draft_context_decode(
     peer_bases: torch.Tensor,
     compile_only: bool,
 ) -> None:
-    """The DFlash2 context write of one request's verify rows, on every rank
-    of the TP8 group at once (the launches exchange the norm).
+    """The DFlash2 context write of one or two requests' verify rows (8
+    each), on every rank of the TP8 group at once (the launches exchange
+    the norm).
 
     Args:
         context: From :func:`prepare_muse_spark_draft_context`.
@@ -373,7 +375,8 @@ def prepare_muse_spark_draft_head(
         tensors: The rank's weights by role (see
             ``tokenspeed_kernel_amd...muse_spark.draft_head.pack_draft_head``).
         rank: The rank in the TP8 group.
-        max_rows: The draft steps of one request's block.
+        max_rows: The most draft steps of one launch: those of up to two
+            requests' blocks, 7 each.
         scale: The logits' multiplier.
         softcap: The final logit softcap.
         override: Optional registered kernel name to force.
@@ -407,7 +410,8 @@ def muse_spark_draft_head_scratch_pairs(
     the Iris heap before the heap exists.
 
     Args:
-        max_rows: The draft steps of one request's block.
+        max_rows: The most draft steps of one launch: those of up to two
+            requests' blocks, 7 each.
         override: Optional registered kernel name to force.
 
     Returns:
@@ -436,16 +440,16 @@ def muse_spark_draft_head_decode(
     peer_bases: torch.Tensor,
     compile_only: bool,
 ) -> None:
-    """The DFlash2 draft head of one request's draft steps, on every rank of
-    the TP8 group at once (the launches exchange candidates).
+    """The DFlash2 draft head of one or two requests' draft steps, on every
+    rank of the TP8 group at once (the launches exchange candidates).
 
     Args:
         head: From :func:`prepare_muse_spark_draft_head`.
-        x: BF16 ``[steps, 8192]``: the draft's final-norm output of the
-            block's rows 1 .. 7.
-        first_token: int32 ``[1]``: the block's first token.
-        anchor: int64 ``[1]`` out: that token clamped to the vocabulary
-            (step 0's predecessor, for the walk).
+        x: BF16 ``[steps, 8192]``: the draft's final-norm output of each
+            request's block rows 1 .. 7, request by request.
+        first_token: int32 ``[requests]``: each block's first token.
+        anchor: int64 ``[requests]`` out: those tokens clamped to the
+            vocabulary (each request's step 0 predecessor, for the walk).
         cand_ids: int64 ``[steps, 16]`` out: each step's candidates, by
             descending unary score (the lower token id first on a tie).
         unary: FP32 ``[steps, 16]`` out: their softcapped logits.
@@ -488,7 +492,8 @@ def prepare_muse_spark_draft_layer(
         tensors: The rank's weights by role (see
             ``tokenspeed_kernel_amd...muse_spark.draft_layer.pack_draft_layer``).
         rank: The rank in the TP8 group.
-        max_rows: The rows of one draft block forward (one request's block).
+        max_rows: The most rows of one draft block forward: the blocks of
+            up to two requests, 8 rows each.
         override: Optional registered kernel name to force.
 
     Returns:
@@ -535,9 +540,9 @@ def muse_spark_draft_layer_decode(
     layer_index: int,
     compile_only: bool,
 ) -> None:
-    """One step of a packed DFlash2 draft layer for one request's block of
-    rows, on every rank of the TP8 group at once (the launches exchange
-    values).
+    """One step of a packed DFlash2 draft layer for the blocks of one or two
+    requests (8 rows each, request by request), on every rank of the TP8
+    group at once (the launches exchange values).
 
     Args:
         layer: From :func:`prepare_muse_spark_draft_layer`.
@@ -553,10 +558,12 @@ def muse_spark_draft_layer_decode(
             norm's gain of the rank's owned columns.
         normed: None, or (the last layer) BF16 ``[rows, 8192]``: the final
             norm's output, the whole rows on every rank.
-        seq_len: int32 ``[1]``: the request's length after the block.
+        seq_len: int32 ``[requests]``: each request's length after its
+            block.
         positions: int32 ``[rows]``: the block rows' positions.
         slots: int32 or int64 ``[rows]``: the block rows' cache slots.
-        page_table: int32 page table of the request (64 tokens a page).
+        page_table: int32 ``[>= requests, pages]``: request ``q``'s page
+            table in row ``q`` (64 tokens a page).
         k_cache, v_cache: BF16 ``[slots, 1, 128]``: the layer's cache.
         cos_sin: FP32 ``[positions, 128]`` rotary table, cos then sin.
         scratch: int64 mailbox scratch of at least ``layer.scratch_pairs``

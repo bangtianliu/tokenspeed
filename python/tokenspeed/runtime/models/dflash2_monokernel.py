@@ -123,12 +123,14 @@ SELECTOR_RANK = 256
 TOPK = 16
 STEPS = BLOCK_ROWS - 1  # the block's rows 1 .. 7 draft a token each
 CONTEXT_ROWS = 8  # one request's verify rows
+# Requests a launch serves: their rows one request after another.
+MAX_REQUESTS = 2
 # The rows each launch is packed for, which also size its Iris scratch (and
-# so the draft's heap reservation): one request's block, draft steps and
-# verify rows.
-LAYER_ROWS = BLOCK_ROWS
-HEAD_ROWS = STEPS
-CONTEXT_WRITE_ROWS = CONTEXT_ROWS
+# so the draft's heap reservation): up to MAX_REQUESTS requests' blocks,
+# draft steps and verify rows.
+LAYER_ROWS = MAX_REQUESTS * BLOCK_ROWS
+HEAD_ROWS = MAX_REQUESTS * STEPS
+CONTEXT_WRITE_ROWS = MAX_REQUESTS * CONTEXT_ROWS
 NO_KERNEL = "no draft monokernel for this platform"
 NOT_BF16_KV = "the draft's KV cache is not BF16: the kernels read BF16 keys"
 
@@ -229,8 +231,26 @@ def layer_tensors(layer: torch.nn.Module) -> dict[str, torch.Tensor]:
 
 def takes_monokernels(rows: int, ctx: ForwardContext) -> bool:
     """Whether a draft forward of ``rows`` token rows takes the monokernels:
-    the block of one request. Several requests keep the regular path."""
-    return ctx.forward_mode.is_decode() and ctx.bs == 1 and rows == BLOCK_ROWS
+    the blocks of up to ``MAX_REQUESTS`` requests. More requests keep the
+    regular path."""
+    return (
+        ctx.forward_mode.is_decode()
+        and 1 <= ctx.bs <= MAX_REQUESTS
+        and rows == ctx.bs * BLOCK_ROWS
+    )
+
+
+def request_seq_lens(leaf, bs: int) -> torch.Tensor:
+    """Each request's length after its block, int32 ``[bs]``, from a block
+    decode leaf's cache-seqlens buffer. Under block decode the buffer holds
+    ``block_decode_expansion`` entries a request (every block position, all
+    the block-end length; ``fill_block_decode_seq_lens``), so request ``q``'s
+    length is entry ``q * expansion``, not entry ``q``. One request's is a
+    one-element view (no copy); more requests' are gathered into a
+    contiguous tensor, as the launch reads ``seq_len + q``."""
+    expansion = leaf.block_decode_expansion
+    lengths = leaf.decode_seq_lens_buffer[: bs * expansion].view(bs, expansion)
+    return lengths[:, 0].contiguous()
 
 
 def mailbox_scratch(
@@ -273,6 +293,8 @@ class DFlash2MonokernelState(MonokernelState):
         context_pending: Whether a context write ran whose block forward
             has not run yet (the write reads the layers' step counter, which
             the block forward advances).
+        context_compiled: The context write's row counts every rank
+            compiled.
         final_gain: FP32 ``[1024]``: the final norm's gain of the rank's
             owned columns (the last launch runs the final norm).
         bases: The TP8 group's heap bases, from :meth:`prepare` (None
@@ -281,8 +303,9 @@ class DFlash2MonokernelState(MonokernelState):
             :meth:`prepare` (None before it).
         device_group, rank: The TP8 device group and this process's rank in
             it, from :meth:`prepare` (None before it).
-        compiled: Which binaries every rank compiled: the last layer's
-            (True) and the others' (False).
+        compiled: Which binaries every rank compiled, by ``(last, rows)``:
+            the last layer's (True) and the others' (False), at each row
+            count.
         block_pending: Whether the layers' launches ran a block whose head
             has not run yet (the head reads their step counter).
         head: The draft head's launch, from :meth:`enable_head` (None
@@ -313,9 +336,11 @@ class DFlash2MonokernelState(MonokernelState):
         self.device_group: dist.ProcessGroup | None = None
         self.cpu_group: dist.ProcessGroup | None = None
         self.rank: int | None = None
-        self.compiled: set[bool] = set()
+        self.compiled: set[tuple[bool, int]] = set()
         self.block_pending = False
-        self.context_compiled = False
+        self.context_compiled: set[int] = set()
+        # The current block's positions as int32 (start_step resets it).
+        self.positions: torch.Tensor | None = None
         self.head: DraftHeadMonokernel | None = None
         # What prepare() and enable_head() allocate on the Iris heap, reserved
         # before the heap exists: the layers' scratch, the context write's and
@@ -352,6 +377,10 @@ class DFlash2MonokernelState(MonokernelState):
             self.cpu_group = cpu_group
             self.rank = rank
 
+    def start_step(self) -> None:
+        super().start_step()
+        self.positions = None
+
     def finish_step(self) -> torch.Tensor | None:
         """Give the next block's launches a new tag after a block that
         launched, and return the final norm's output that the last launch
@@ -367,8 +396,13 @@ class DFlash2MonokernelState(MonokernelState):
 
     def serves_context(self, rows: int) -> bool:
         """Whether a context write of ``rows`` verify rows (decode rows only)
-        takes :meth:`write_context`: one request's."""
-        return self.context_scratch is not None and rows == CONTEXT_ROWS
+        takes :meth:`write_context`: those of up to ``MAX_REQUESTS``
+        requests."""
+        return (
+            self.context_scratch is not None
+            and rows % CONTEXT_ROWS == 0
+            and 1 <= rows // CONTEXT_ROWS <= MAX_REQUESTS
+        )
 
     def write_context(
         self,
@@ -377,12 +411,13 @@ class DFlash2MonokernelState(MonokernelState):
         slots: torch.Tensor,
         token_to_kv_pool,
     ) -> None:
-        """The context write of one request's verify rows as one launch.
+        """The context write of the verify rows of up to ``MAX_REQUESTS``
+        requests (8 each) as one launch.
 
         Args:
-            taps: BF16 ``[8, 40960]``: the target's tapped hidden states.
-            positions: ``[8]``: the rows' positions.
-            slots: ``[8]``: the rows' draft cache slots.
+            taps: BF16 ``[rows, 40960]``: the target's tapped hidden states.
+            positions: ``[rows]``: the rows' positions.
+            slots: ``[rows]``: the rows' draft cache slots.
             token_to_kv_pool: The draft's KV pool.
         """
         if self.context_pending:
@@ -405,10 +440,11 @@ class DFlash2MonokernelState(MonokernelState):
             step=self.step[:1],
             peer_bases=self.bases,
         )
-        if not self.context_compiled:
+        rows = taps.shape[0]
+        if rows not in self.context_compiled:
             muse_spark_draft_context_decode(self.context, compile_only=True, **operands)
             dist.barrier(group=self.cpu_group)
-            self.context_compiled = True
+            self.context_compiled.add(rows)
         muse_spark_draft_context_decode(self.context, compile_only=False, **operands)
         self.context_pending = True
 
@@ -519,6 +555,10 @@ class DFlash2MonokernelLayer(MonokernelLayer):
             )
         k_cache, v_cache = ctx.token_to_kv_pool.get_kv_buffer(attn.layer_id)
         leaf = backend.leaves[attn.group_id]
+        rows = hidden_states.shape[0]
+        if state.positions is None:
+            # One cast a block forward, not one a layer launch.
+            state.positions = positions.to(torch.int32)
         out = torch.empty_like(hidden_states)
         res_out = torch.empty_like(residual)
         last = self.last
@@ -529,11 +569,10 @@ class DFlash2MonokernelLayer(MonokernelLayer):
             out=None if last else out,
             final_gain=state.final_gain if last else None,
             normed=out if last else None,
-            # Every block row's length: the request's after the block.
-            seq_len=leaf.decode_seq_lens_buffer[:1],
-            positions=positions.to(torch.int32),
-            slots=backend.write_locations(attn, ctx.forward_mode)[:BLOCK_ROWS],
-            page_table=view.page_table[0],
+            seq_len=request_seq_lens(leaf, ctx.bs),
+            positions=state.positions,
+            slots=backend.write_locations(attn, ctx.forward_mode)[:rows],
+            page_table=view.page_table[: ctx.bs],
             k_cache=k_cache.view(-1, 1, k_cache.shape[-1]),
             v_cache=v_cache.view(-1, 1, v_cache.shape[-1]),
             cos_sin=self.self_attn.rotary_emb.cos_sin_cache,
@@ -542,14 +581,14 @@ class DFlash2MonokernelLayer(MonokernelLayer):
             peer_bases=state.bases,
             layer_index=self.layer_id,
         )
-        if last not in state.compiled:
+        if (last, rows) not in state.compiled:
             # A launch traps when its peers' values do not come within about
             # a minute, and a first launch compiles for longer on some ranks
             # than on others: every rank compiles, then the ranks meet. The
             # layers before the last share one binary.
             muse_spark_draft_layer_decode(self.fused, compile_only=True, **operands)
             dist.barrier(group=state.cpu_group)
-            state.compiled.add(last)
+            state.compiled.add((last, rows))
         muse_spark_draft_layer_decode(self.fused, compile_only=False, **operands)
         if last:
             state.lm_head_input = out
@@ -595,8 +634,9 @@ def head_reasons(
 
 def takes_head(rows: int) -> bool:
     """Whether a draft head over ``rows`` draft rows (``bs * 7``) takes the
-    monokernel: one request's. Several requests keep the regular path."""
-    return rows == STEPS
+    monokernel: those of up to ``MAX_REQUESTS`` requests. More requests keep
+    the regular path."""
+    return rows % STEPS == 0 and 1 <= rows // STEPS <= MAX_REQUESTS
 
 
 class DraftHeadMonokernel:
@@ -615,7 +655,7 @@ class DraftHeadMonokernel:
         scratch, bases: Its mailbox scratch and the group's heap bases.
         step: The draft layers' step counter.
         cpu_group: The TP8 group's CPU (gloo) process group.
-        compiled: Whether every rank compiled the launch.
+        compiled: The row counts every rank compiled the launch for.
     """
 
     def __init__(
@@ -630,40 +670,43 @@ class DraftHeadMonokernel:
         self.scratch, self.bases = mailbox_scratch(group, rank, fused.scratch_pairs)
         self.step = step
         self.cpu_group = cpu_group
-        self.compiled = False
+        self.compiled: set[int] = set()
 
     def __call__(
         self, hidden_states: torch.Tensor, first_token: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """The candidates and edge scores of one request's draft steps.
+        """The candidates and edge scores of the draft steps of up to
+        ``MAX_REQUESTS`` requests.
 
         Args:
-            hidden_states: BF16 ``[7, 8192]``: the draft's final-norm output
-                of the block's rows 1 .. 7.
-            first_token: int32 ``[1]``: the block's first token.
+            hidden_states: BF16 ``[requests * 7, 8192]``: the draft's
+                final-norm output of each block's rows 1 .. 7, request by
+                request.
+            first_token: int32 ``[requests]``: each block's first token.
 
         Returns:
-            ``(candidate_ids, scores, anchor)``: int64 ``[7, 16]`` and FP32
-            ``[7, 16, 16]``, as ``VocabParallelTopK`` and
-            ``CandidateSelector`` give them, and the first token clamped to
-            the vocabulary (int64 ``[1]``).
+            ``(candidate_ids, scores, anchor)``: int64 ``[rows, 16]`` and
+            FP32 ``[rows, 16, 16]``, as ``VocabParallelTopK`` and
+            ``CandidateSelector`` give them, and the first tokens clamped to
+            the vocabulary (int64 ``[requests]``).
         """
         device = hidden_states.device
+        rows = hidden_states.shape[0]
         operands = dict(
             x=hidden_states.contiguous(),
             first_token=first_token,
-            anchor=torch.empty(1, dtype=torch.int64, device=device),
-            cand_ids=torch.empty(STEPS, TOPK, dtype=torch.int64, device=device),
-            unary=torch.empty(STEPS, TOPK, dtype=torch.float32, device=device),
-            scores=torch.empty(STEPS, TOPK, TOPK, dtype=torch.float32, device=device),
+            anchor=torch.empty(first_token.shape[0], dtype=torch.int64, device=device),
+            cand_ids=torch.empty(rows, TOPK, dtype=torch.int64, device=device),
+            unary=torch.empty(rows, TOPK, dtype=torch.float32, device=device),
+            scores=torch.empty(rows, TOPK, TOPK, dtype=torch.float32, device=device),
             scratch=self.scratch,
             step=self.step,
             peer_bases=self.bases,
         )
-        if not self.compiled:
+        if rows not in self.compiled:
             muse_spark_draft_head_decode(self.fused, compile_only=True, **operands)
             dist.barrier(group=self.cpu_group)
-            self.compiled = True
+            self.compiled.add(rows)
         muse_spark_draft_head_decode(self.fused, compile_only=False, **operands)
         return operands["cand_ids"], operands["scores"], operands["anchor"]
 
@@ -753,6 +796,7 @@ __all__ = [
     "BLOCK_ROWS",
     "DFlash2MonokernelLayer",
     "DFlash2MonokernelState",
+    "MAX_REQUESTS",
     "DraftHeadMonokernel",
     "enable_draft_monokernels",
     "head_reasons",

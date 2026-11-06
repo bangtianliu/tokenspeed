@@ -220,8 +220,9 @@ def attn_kernel(
     mb = mailbox.Mailbox(scratch, mailbox.launch_tag(step, 0), PLAN, None)
     task, active = schedule.stage_task(PLAN, "attn")
     if active:
+        # One request: no other page table row (stride 0).
         draft_attn.attn_stage(
-            mb, task, table, seq_len, k_cache, v_cache, SPLITS_, "attn"
+            mb, task, table, 0, seq_len, k_cache, v_cache, SPLITS_, "attn"
         )
     task, active = schedule.stage_task(PLAN, "merge")
     if active:
@@ -380,8 +381,9 @@ def attn_half_kernel(
         )
     task, active = schedule.stage_task(PLAN, "attn")
     if active:
+        # One request: no other page table row (stride 0).
         draft_attn.attn_stage(
-            mb, task, table, seq_len, k_cache, v_cache, SPLITS_, "attn"
+            mb, task, table, 0, seq_len, k_cache, v_cache, SPLITS_, "attn"
         )
     task, active = schedule.stage_task(PLAN, "merge")
     if active:

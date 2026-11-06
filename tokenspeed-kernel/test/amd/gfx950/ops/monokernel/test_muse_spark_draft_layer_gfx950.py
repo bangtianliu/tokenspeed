@@ -149,7 +149,7 @@ def layer_inputs(prefix: int, rank: int, rows: int, device):
         seq_len=torch.full((1,), end, dtype=torch.int32, device=device),
         positions=host["positions"].to(device),
         slots=slots.to(device),
-        page_table=table.to(device),
+        page_table=table.to(device)[None],  # one request's row
         k_cache=k_cache.to(device),
         v_cache=v_cache.to(device),
         cos_sin=host["cos_sin"].to(device),
@@ -315,3 +315,108 @@ def test_draft_layer_in_one_launch_hands_the_attention_partial_to_the_mlp(
         sock.bind(("", 0))
         port = sock.getsockname()[1]
     mp.spawn(_worker, args=(port, prefix), nprocs=WORLD, join=True)
+
+
+def _two_requests_worker(rank: int, port: int, prefixes: tuple[int, int]) -> None:
+    rows = 8
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://localhost:{port}",
+        rank=rank,
+        world_size=WORLD,
+        timeout=timedelta(seconds=300),
+    )
+    try:
+        device = torch.device(f"cuda:{rank}")
+        ctx = get_or_create_context(heap_size=256 << 20)
+        group = IrisGroup(ctx, dist.group.WORLD, rank, device)
+        p = plan(2 * rows, True)
+        scratch = ctx.zeros((p.scratch_pairs,), dtype=torch.int64)
+        group.finish_prepare()
+        g = torch.Generator().manual_seed(7)
+        final_w = (1 + 0.1 * torch.randn(HIDDEN, generator=g)).to(torch.bfloat16)
+        own = slice(rank * OWNED, (rank + 1) * OWNED)
+        step = 41
+        for layer in (2, 4):
+            last = layer == 4
+            # One layer's weights; each request its own rows, context and
+            # pages of one cache (request b's pages after request a's).
+            _, weights, a = layer_inputs(prefixes[0] + layer, rank, rows, device)
+            _, _, b = layer_inputs(prefixes[1] + layer, rank, rows, device)
+            pages_a = a["k_cache"].shape[0] // PAGE
+            b["page_table"] = b["page_table"] + pages_a
+            b["slots"] = b["slots"] + pages_a * PAGE
+            width = max(a["page_table"].shape[1], b["page_table"].shape[1])
+            tables = torch.zeros(2, width, dtype=torch.int32, device=device)
+            tables[0, : a["page_table"].shape[1]] = a["page_table"][0]
+            tables[1, : b["page_table"].shape[1]] = b["page_table"][0]
+            k_cache = torch.cat([a["k_cache"], b["k_cache"]])
+            v_cache = torch.cat([a["v_cache"], b["v_cache"]])
+            cos_sin = max(a["cos_sin"], b["cos_sin"], key=len)
+
+            def run(rt, table, s):
+                outs = dict(
+                    residual_out=torch.zeros_like(rt["residual"]),
+                    out=None if last else torch.zeros_like(rt["x"]),
+                    final_gain=final_w[own].float().to(device) if last else None,
+                    normed=torch.zeros_like(rt["x"]) if last else None,
+                )
+                draft_layer.launch_gluon_muse_spark_draft_layer_gfx950(
+                    weights,
+                    x=rt["x"],
+                    residual=rt["residual"],
+                    seq_len=rt["seq_len"],
+                    positions=rt["positions"],
+                    slots=rt["slots"],
+                    page_table=table,
+                    # Each launch its own copy: the launches write the
+                    # block's keys into the cache.
+                    k_cache=k_cache.clone(),
+                    v_cache=v_cache.clone(),
+                    cos_sin=cos_sin,
+                    **outs,
+                    scratch=scratch,
+                    step=torch.full((1,), s, dtype=torch.int32, device=device),
+                    peer_bases=group.bases,
+                    layer=layer,
+                    trace_buf=None,
+                    compile_only=False,
+                )
+                torch.cuda.synchronize()
+                dist.barrier()
+                return outs["residual_out"], outs["normed" if last else "out"]
+
+            one = [run(a, tables[0:1], step), run(b, tables[1:2], step + 1)]
+            both = run(
+                {
+                    k: torch.cat([a[k], b[k]])
+                    for k in ("x", "residual", "seq_len", "positions", "slots")
+                },
+                tables,
+                step + 2,
+            )
+            step += 3
+            for q in range(2):
+                block = slice(q * rows, (q + 1) * rows)
+                # The residual: this rank's columns (the others are not
+                # stored); the output: every column.
+                assert torch.equal(both[0][block, own], one[q][0][:, own])
+                assert torch.equal(both[1][block], one[q][1]), (layer, q)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("prefixes", [(3000, 9000)])
+def test_draft_layer_of_two_requests_matches_a_launch_of_each(
+    prefixes: tuple[int, int],
+):
+    """One launch of two requests' blocks gives each request the bits of a
+    launch of its block alone: the rows are independent except attention,
+    which runs per request (its own length, pages and keys)."""
+    if torch.cuda.device_count() < WORLD:
+        pytest.skip(f"requires {WORLD} GPUs")
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_two_requests_worker, args=(port, prefixes), nprocs=WORLD, join=True)
