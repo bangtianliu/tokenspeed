@@ -162,6 +162,7 @@ def layer_plan(
     warm_next: bool,
     own_qkvg: bool,
     next_qkvg: bool,
+    bf16_experts: bool,
 ) -> Plan:
     """The plan of a full-attention (``full``) or sliding-window layer for
     ``rows`` token rows: requests of ``chain`` tokens each, 1 for decode,
@@ -171,7 +172,9 @@ def layer_plan(
     ``own_qkvg``: the launch projects its own q | k | v (qkvg tasks), else
     the previous launch did (its qnext tasks; the launch's attention then
     starts at once). ``next_qkvg``: the launch ends with the next layer's
-    projection (qnext), which replaces the warm stage; past one row only."""
+    projection (qnext), which replaces the warm stage; past one row only.
+    ``bf16_experts``: the layer's experts are BF16 (``moe_experts_bf16``),
+    which run no xq stage."""
     if not 1 <= rows <= MAX_ROWS or rows % chain:
         raise ValueError(
             f"a launch serves 1 to {MAX_ROWS} rows of requests of {chain}, got {rows}"
@@ -208,6 +211,7 @@ def layer_plan(
             _bases(rows, nq, "slt", "xq", "ex1", "exr", "ex2"),
             rows,
             1 if rows == 1 else 2 if next_qkvg else int(moe_experts.EXR_PARTS),
+            bf16_experts,
         )
         + ((Stage("warm", WARM_TASKS, 0),) if warm_next else ())
         + moe_tail.stages(
@@ -591,6 +595,7 @@ def launch_layer(
         warm_next is not None,
         proj_in is None,
         proj_out is not None,
+        bf16_experts,
     )
     if tap is None:
         tap_args = (attn_ops[0], 0, 0)
