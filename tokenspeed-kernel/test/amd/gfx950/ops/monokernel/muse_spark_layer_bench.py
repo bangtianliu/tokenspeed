@@ -158,6 +158,7 @@ def _operands(
     rank: int,
     length: int,
     rows: int,
+    requests: int,
     experts: int,
     bias_std: float,
     route_seed: int,
@@ -165,13 +166,37 @@ def _operands(
     kv_dtype,
     dev,
 ):
-    """The launch operands of ``rows`` chained rows (row 0 at ``length``)
+    """The launch operands of ``requests`` requests of ``rows`` chained rows
+    each (request ``i``'s row 0 at ``length - 73 i``, its own page table)
     whose routing picks among the first ``experts`` experts, the router bias
     drawn with standard deviation ``bias_std`` (seed ``route_seed``), with a
     ``kv_dtype`` KV cache."""
-    sh = layer_test._shared(42, length, rows)
-    end = length + rows - 1
-    w = layer_test._rank_weights(rank, end)
+    R = requests * rows
+    sh = layer_test._shared(42, length, R)
+    # Request i's length, positions and page table: request 0 takes the
+    # shared table, the others pages past every earlier request's.
+    g = torch.Generator().manual_seed(77)
+    lengths = [length - 73 * i for i in range(requests)]
+    tables = [sh["table"]]
+    for n in lengths[1:]:
+        used = (n + rows - 1 + 63) // 64
+        first = int(max(int(t.max()) for t in tables)) + 1
+        tables.append((first + torch.randperm(used, generator=g)).to(torch.int32))
+    pos = torch.cat([torch.arange(n - 1, n - 1 + rows) for n in lengths])
+    slots = torch.cat(
+        [
+            t[q // 64].long() * 64 + q % 64
+            for t, q in zip(tables, pos.view(requests, rows))
+        ]
+    )
+    width = max(len(t) for t in tables)
+    table = torch.zeros(requests, width, dtype=torch.int32)
+    for i, t in enumerate(tables):
+        table[i, : len(t)] = t
+    end = max(lengths) + rows - 1
+    # The caches hold every request's pages (_rank_weights adds 5 pages past
+    # its length, so one request keeps the cache it always had).
+    w = layer_test._rank_weights(rank, max(end, 64 * (int(table.max()) - 4)))
     # Each row picks 8 of the held experts. The bias spread sets how much
     # the rows agree: the router scores vary by ~0.04 across experts, so a
     # bias spread of 0.1 makes 8 rows pick about the same experts (12-18
@@ -195,17 +220,15 @@ def _operands(
         s13, s2 = w13s.stride(), w2s.stride()
     own = slice(rank * OWNED, (rank + 1) * OWNED)
     own_pool = slice(rank * POOL_OWNED, (rank + 1) * POOL_OWNED)
-    pos = torch.arange(length - 1, end)
-    slots = sh["table"][pos // 64].long() * 64 + pos % 64
-    h_next = torch.empty(rows, OWNED, device=dev)
-    a_out = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
+    h_next = torch.empty(R, OWNED, device=dev)
+    a_out = torch.empty(R, HIDDEN, dtype=torch.bfloat16, device=dev)
     attn_ops = (
         bf16_tiles(w["w_qkvg"]).to(dev),
         sh["a_in"].to(dev),
         (pos + 1).to(torch.int32).to(dev),
         slots.to(torch.int32).to(dev),
-        sh["table"].to(dev),
-        sh["table"].numel(),  # one request: the page table row stride
+        table.to(dev),
+        width,  # the page table row stride
         w["k_cache"].to(kv_dtype).to(dev),
         w["v_cache"].to(kv_dtype).to(dev),
         ref.rope_table(end + 1).to(dev),
@@ -286,9 +309,10 @@ def worker(rank: int, port: int, args) -> None:
     group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
     # With --shift every launch reads the q | k | v projection that the one
     # before it stored, and ends with the next one's (qnext).
+    R = args.requests * args.rows
     plan = layer.layer_plan(
         args.full,
-        args.rows,
+        R,
         args.rows,
         False,
         not args.shift,
@@ -296,7 +320,7 @@ def worker(rank: int, port: int, args) -> None:
         args.bf16_experts,
         True,  # check_parity, as the launches
     )
-    proj = torch.zeros(2, args.rows, int(PROJ_WORDS), dtype=torch.int32, device=dev)
+    proj = torch.zeros(2, R, int(PROJ_WORDS), dtype=torch.int32, device=dev)
     scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
     ghost = torch.zeros_like(scratch)
     bases = torch.empty(TP, dtype=torch.int64, device=dev)
@@ -306,6 +330,7 @@ def worker(rank: int, port: int, args) -> None:
         rank,
         args.length,
         args.rows,
+        args.requests,
         args.experts,
         args.bias_std,
         args.route_seed,
@@ -364,7 +389,7 @@ def worker(rank: int, port: int, args) -> None:
             trace_buf,
             rank,
             args.full,
-            args.rows,
+            R,
             args.rows,
             False,  # whole_rows: the owned residual columns
             args.bf16_experts,
@@ -403,7 +428,7 @@ def worker(rank: int, port: int, args) -> None:
                 lay = 2 - len(seen) % 2
                 launch(lay)
                 torch.cuda.synchronize()
-                u = torch.tensor([_distinct(plan, scratch, args.rows)])
+                u = torch.tensor([_distinct(plan, scratch, R)])
                 dist.broadcast(u, 0)
                 seen.append(int(u))
                 if seen[-1] == args.distinct:
@@ -466,12 +491,13 @@ def worker(rank: int, port: int, args) -> None:
     dist.barrier()
     us = {name: _median_us(g, args.replays) for name, g in graphs.items()}
     if rank == 0:
-        u = _distinct(plan, scratch, args.rows)
-        print(f"routing: {u} distinct experts over {args.rows} rows")
+        u = _distinct(plan, scratch, R)
+        print(f"routing: {u} distinct experts over {R} rows")
         f = us["fill"] if gpus < TP else 0.0
         kind = "full" if args.full else "sliding"
         print(
-            f"{gpus} GPU {kind} layer, {args.rows} rows, {args.experts} experts, "
+            f"{gpus} GPU {kind} layer, {args.requests} x {args.rows} rows, "
+            f"{args.experts} experts, "
             f"at {args.length} tokens, {args.kv_dtype} KV: "
             f"warm {us['warm'] - f:.1f} us, cold {us['cold'] - us['flush'] - f:.1f} us "
             f"per launch (graph; flush {us['flush']:.1f}, fill {f:.1f} us subtracted)"
@@ -552,6 +578,13 @@ def main() -> None:
         "--rows", type=int, default=1, help="chained rows (a verify of rows - 1 drafts)"
     )
     p.add_argument(
+        "--requests",
+        type=int,
+        default=1,
+        help="requests a launch, --rows rows each; request i at --length - 73 i "
+        "tokens, with its own page table",
+    )
+    p.add_argument(
         "--experts", type=int, default=EXPERTS, help="experts the routing picks among"
     )
     p.add_argument(
@@ -601,7 +634,8 @@ def main() -> None:
     args = p.parse_args()
     if args.distinct < 0:
         # Reachable: 8 rows cannot pick all of few experts.
-        args.distinct = min(max(8, 4 * args.rows), max(8, args.experts * 3 // 4))
+        rows = args.requests * args.rows
+        args.distinct = min(max(8, 4 * rows), max(8, args.experts * 3 // 4))
     if args.view:
         for path in args.view:
             d = torch.load(path)
