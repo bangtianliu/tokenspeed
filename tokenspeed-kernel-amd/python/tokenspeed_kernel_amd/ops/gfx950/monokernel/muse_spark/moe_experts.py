@@ -363,6 +363,11 @@ def _load_b(
                 gl.int32
             ),
             mask=(bk >= 0) & on,
+            # sc0 nt on gfx950: a slot's weights stream once a launch, so
+            # they must not evict what the launch reuses from L2 and the
+            # memory-side cache (its code, the KV, the warmed next-layer
+            # QKVG). The scales stay default: small, and read again.
+            cache=".cg",
         )
         s = gl.amd.cdna4.buffer_load(
             ws,
