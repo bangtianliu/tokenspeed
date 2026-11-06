@@ -88,6 +88,10 @@ class GroupTableSpec:
 
 # Groups one packed fill serves; a router with more launches once per group.
 _PACKED_MAX_GROUPS = 8
+# Column blocks of a request row that one program fills: the grid's third
+# axis splits the row, so a long row (thousands of pages) does not run as one
+# program's serial loop.
+_ROW_BLOCKS_PER_PROGRAM = 4
 
 
 @triton.jit
@@ -102,12 +106,15 @@ def _unpack_row(
     max_num_pages,  # kernel pages per request the leaf reads
     dst_stride_b,
     stack_max_num_pages,  # the stack's column count (widest group)
+    part,  # this program's part of the row: column blocks part * ROW_BLOCKS ..
     BLOCK_COLS: tl.constexpr,
+    ROW_BLOCKS: tl.constexpr,
 ):
-    """Expand one request row of a group's raw block table into its stack."""
+    """Expand ``ROW_BLOCKS`` column blocks of one request row of a group's
+    raw block table into its stack."""
     col_off = tl.arange(0, BLOCK_COLS)
-    for col0 in range(0, stack_max_num_pages, BLOCK_COLS):
-        col = col0 + col_off
+    for j in tl.static_range(ROW_BLOCKS):
+        col = (part * ROW_BLOCKS + j) * BLOCK_COLS + col_off
         block = col // ratio
         # Columns past this group's own max_num_pages are the padding
         # contract's tail: always the null page 0, never expansion residue
@@ -144,11 +151,12 @@ def _unpack_group_kernel(
     stack_max_num_pages,
     actual_bs,
     BLOCK_COLS: tl.constexpr,
+    ROW_BLOCKS: tl.constexpr,
 ):
     """Expand one group's raw block table into its kernel-page stack, one
-    request per program (arguments as :func:`_unpack_row`): the fill of
-    tables that do not share the bridge's packed upload."""
-    b = tl.program_id(0)  # grid == padded bs
+    part of a request row per program (arguments as :func:`_unpack_row`):
+    the fill of tables that do not share the bridge's packed upload."""
+    b = tl.program_id(0)  # grid == (padded bs, row parts)
     _unpack_row(
         src_ptr,
         dst_ptr,
@@ -160,7 +168,9 @@ def _unpack_group_kernel(
         max_num_pages,
         dst_stride_b,
         stack_max_num_pages,
+        tl.program_id(1),
         BLOCK_COLS,
+        ROW_BLOCKS,
     )
 
 
@@ -199,15 +209,17 @@ def _unpack_packed_groups_kernel(
     MAX_NUM_PAGES: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
+    ROW_BLOCKS: tl.constexpr,
 ):
-    """Every group's fill in one launch, one (request, group) per program.
+    """Every group's fill in one launch, one (request, group, part of the
+    row) per program.
 
     Group ``i`` reads the row-major ``[>= actual_bs, blocks_i]`` table at
     element ``offset_i`` of the packed upload. Offsets and block counts change
     every step, so they are plain scalars kept out of the compile key (Triton
     would specialize them inside a tuple); groups past ``NUM_GROUPS`` are 0.
     """
-    b = tl.program_id(0)  # grid == (padded bs, groups)
+    b = tl.program_id(0)  # grid == (padded bs, groups, row parts)
     g = tl.program_id(1)
     offsets = (offset0, offset1, offset2, offset3, offset4, offset5, offset6, offset7)
     blocks = (blocks0, blocks1, blocks2, blocks3, blocks4, blocks5, blocks6, blocks7)
@@ -224,7 +236,9 @@ def _unpack_packed_groups_kernel(
                 MAX_NUM_PAGES[i],
                 dst_stride_b,
                 stack_max_num_pages,
+                tl.program_id(2),
                 BLOCK_COLS,
+                ROW_BLOCKS,
             )
 
 
@@ -413,11 +427,14 @@ class GroupTableStacks:
         if self.tables.is_cuda:
             stack_max_num_pages = self.tables.shape[2]
             block_cols = 128 if stack_max_num_pages >= 128 else 64
+            parts = triton.cdiv(
+                stack_max_num_pages, block_cols * _ROW_BLOCKS_PER_PROGRAM
+            )
             packed = _packed_layout(srcs)
             if packed is not None:
                 base, offsets = packed
                 pad = [0] * (_PACKED_MAX_GROUPS - len(srcs))
-                _unpack_packed_groups_kernel[(bs, len(srcs))](
+                _unpack_packed_groups_kernel[(bs, len(srcs), parts)](
                     base,
                     self.tables,
                     *offsets,
@@ -432,12 +449,13 @@ class GroupTableStacks:
                     MAX_NUM_PAGES=self._max_num_pages,
                     NUM_GROUPS=len(srcs),
                     BLOCK_COLS=block_cols,
+                    ROW_BLOCKS=_ROW_BLOCKS_PER_PROGRAM,
                 )
                 return
             for i, src in enumerate(srcs):
                 if src.stride(1) != 1:
                     src = src.contiguous()
-                _unpack_group_kernel[(bs,)](
+                _unpack_group_kernel[(bs, parts)](
                     src,
                     self.tables[i],
                     src.shape[1],
@@ -448,6 +466,7 @@ class GroupTableStacks:
                     stack_max_num_pages,
                     actual_bs,
                     BLOCK_COLS=block_cols,
+                    ROW_BLOCKS=_ROW_BLOCKS_PER_PROGRAM,
                 )
             return
         self._fill_torch(bs, actual_bs, srcs)
