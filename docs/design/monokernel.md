@@ -110,6 +110,20 @@ moves it on as its last CTA ends (no separate kernel), and otherwise
 or step can satisfy a poll. All layers share the scratch
 buffer, and nothing clears it.
 
+**Bulk values go as plain words and one flag.** A tagged pair carries 32
+bits of payload in 64. A producer of many values per task may instead store
+them as plain words (write-through, past the caches) and then put one tagged
+flag: every wave waits until its stores land (`vmcnt` counts stores, a
+remote store until the peer's memory acknowledges it), the CTA meets at a
+barrier, then one thread puts the flag (`Mailbox.store_words` /
+`raise_flag`, and for every rank's copy `store_words_peer` /
+`raise_flag_peers`). The consumer polls the flags, meets at a barrier, then
+loads the words past the caches (`load_words`). The tag still guards reuse:
+a word is read only after this launch's flag. It pays when the consumers
+read many bytes (each pool CTA reads the whole MoE input); when the
+producer's wait for its remote stores sits on the critical path and the
+consumers read little, tagged pairs stay faster.
+
 **Polls throttle their loads.** Many waves spinning on `sc1` loads can starve
 the producers' stores. A poll issues all its loads, waits once and retries
 with `s_sleep`. A retry loads only the pairs whose tag differs, so a wide

@@ -370,6 +370,18 @@ class Peers:
         delta = gl.sum(gl.where(i == peer, self.deltas, 0), axis=0)
         return (ptrs.to(gl.int64) + delta).to(ptrs.dtype)
 
+    @gluon.jit
+    def translate_lanes(self, ptrs, peers):
+        """``ptrs`` (on this rank's heap), each as seen on the rank in
+        ``peers`` (a tensor like ``ptrs``; values past the group map to the
+        last rank)."""
+        i = gl.arange(0, self.deltas.shape[0], self.deltas.type.layout)
+        delta = gl.zeros(ptrs.shape, gl.int64, ptrs.type.layout)
+        for p in gl.static_range(self.deltas.shape[0]):
+            d = gl.sum(gl.where(i == p, self.deltas, 0), axis=0)
+            delta = gl.where(gl.minimum(peers, self.deltas.shape[0] - 1) == p, d, delta)
+        return (ptrs.to(gl.int64) + delta).to(ptrs.dtype)
+
 
 @gluon.jit
 def load_peers(bases, rank: gl.constexpr, parity, WORLD: gl.constexpr):
@@ -475,11 +487,8 @@ class Mailbox:
 
     @gluon.jit
     def _words(self, region: gl.constexpr):
-        """``int32`` base pointer of local region ``region``'s 32-bit words
-        (a region of ``n`` pairs holds ``2 n`` words)."""
-        gl.static_assert(
-            not schedule.is_peer(self.plan, region), "plain words are local only"
-        )
+        """``int32`` base pointer of this rank's copy of ``region``'s 32-bit
+        words (a region of ``n`` pairs holds ``2 n`` words)."""
         return (self.scratch + self._base(region)).to(
             gl.pointer_type(gl.int32), bitcast=True
         )
@@ -495,6 +504,10 @@ class Mailbox:
         after it sees the flag (:meth:`load_words`). Word indices count
         from row 0's copy: row ``r``'s copy starts at word
         ``2 * row_offset(r)``."""
+        gl.static_assert(
+            not schedule.is_peer(self.plan, region),
+            "store_words is local: use store_words_peer",
+        )
         gl.amd.cdna4.buffer_store(
             values.to(gl.int32, bitcast=True),
             self._words(region),
@@ -519,6 +532,46 @@ class Mailbox:
             self.tag,
             lanes == 0,
             "gpu",
+        )
+
+    @gluon.jit
+    def store_words_peer(self, region: gl.constexpr, peer, index, values):
+        """:meth:`store_words` into rank ``peer``'s copy of peer region
+        ``region`` (``peer`` may be this rank), published with
+        :meth:`raise_flag_peers`. The write-through stores cross the links
+        to the peer's memory; ``vmcnt`` counts them until they land there."""
+        gl.static_assert(
+            schedule.is_peer(self.plan, region), "store_words_peer needs a peer region"
+        )
+        base = self.peers.translate(self._words(region), peer)
+        gl.amd.cdna4.buffer_store(
+            values.to(gl.int32, bitcast=True), base, index, cache=".wt"
+        )
+
+    @gluon.jit
+    def raise_flag_peers(self, region: gl.constexpr, index):
+        """Publish the CTA's earlier :meth:`store_words_peer` with the flag
+        pair ``index`` of every rank's copy of peer region ``region``: every
+        wave waits for its stores to land (``vmcnt`` counts stores on gfx9,
+        remote ones until the peer's memory acknowledges them), the CTA
+        meets at a barrier, then thread ``p`` puts rank ``p``'s flag at
+        system scope."""
+        gl.static_assert(
+            schedule.is_peer(self.plan, region), "raise_flag_peers needs a peer region"
+        )
+        gl.inline_asm("s_waitcnt vmcnt(0)")
+        gl.barrier()
+        W: gl.constexpr = schedule.world(self.plan)
+        lanes = gl.arange(0, 64 * gl.num_warps(), lane_layout(gl.num_warps()))
+        ptrs = self.peers.translate_lanes(
+            self.scratch + self._base(region) + index + lanes * 0, lanes
+        )
+        _put(
+            ptrs,
+            gl.full(lanes.shape, 1, gl.int32, lanes.type.layout),
+            self.tag,
+            lanes < W,
+            "sys",
         )
 
     @gluon.jit
