@@ -180,8 +180,8 @@ class DFlash2(DFlash):
         target_cache_locs: torch.Tensor,
         decode_only: bool = False,
     ) -> None:
-        """The context write, as one launch for one request's verify rows
-        under --decode-monokernel."""
+        """The context write, as one launch for the verify rows of up to two
+        requests under --decode-monokernel."""
         monokernels = self.model.monokernels
         if (
             monokernels is not None
@@ -234,9 +234,11 @@ class DFlash2(DFlash):
             and monokernels.head is not None
             and takes_head(batch_size * num_steps)
         ):
-            # The launch also clamps the anchor token for the walk.
+            # The launch also clamps each request's anchor token for the walk.
+            # One request's first token is contiguous already: no copy.
             candidate_ids, scores, anchor_token_ids = monokernels.run_head(
-                hidden_states.reshape(-1, self.hidden_size), block_ids[0, :1]
+                hidden_states.reshape(-1, self.hidden_size),
+                block_ids[:, 0].contiguous(),
             )
             candidate_ids = candidate_ids.view(batch_size, num_steps, top_k)
             scores = scores.view(batch_size, num_steps, top_k, top_k)

@@ -344,8 +344,16 @@ if _muse_spark_draft_layer is not None:
         max_arch_version=ArchVersion(9, 5),
         vendors=frozenset({"amd"}),
     )
-    # One request's block of 8 rows per launch.
-    _DRAFT_TRAITS = {"rows": frozenset({_muse_spark_draft_layer.MAX_ROWS})}
+    # The blocks of one or two requests (8 rows each) per launch.
+    _DRAFT_TRAITS = {
+        "rows": frozenset(
+            range(
+                _muse_spark_draft_layer.BLOCK_ROWS,
+                _muse_spark_draft_layer.MAX_ROWS + 1,
+                _muse_spark_draft_layer.BLOCK_ROWS,
+            )
+        )
+    }
 
     @register_kernel(
         "monokernel",
@@ -396,8 +404,14 @@ if _muse_spark_draft_layer is not None:
             **operands,
         )
 
-    # One request's draft steps (the block's rows 1 .. 7) per launch.
-    _HEAD_TRAITS = {"rows": frozenset({_muse_spark_draft_head.STEPS})}
+    # The draft steps (each block's rows 1 .. 7) of one or two requests per
+    # launch.
+    _HEAD_TRAITS = {
+        "rows": frozenset(
+            _muse_spark_draft_head.STEPS * n
+            for n in range(1, _muse_spark_draft_head.MAX_REQUESTS + 1)
+        )
+    }
 
     @register_kernel(
         "monokernel",
@@ -462,8 +476,13 @@ if _muse_spark_draft_layer is not None:
             **operands,
         )
 
-    # One request's verify rows per launch.
-    _CONTEXT_TRAITS = {"rows": frozenset({_muse_spark_draft_context.ROWS})}
+    # The verify rows of one or two requests per launch.
+    _CONTEXT_TRAITS = {
+        "rows": frozenset(
+            _muse_spark_draft_context.ROWS * n
+            for n in range(1, _muse_spark_draft_context.MAX_REQUESTS + 1)
+        )
+    }
 
     @register_kernel(
         "monokernel",

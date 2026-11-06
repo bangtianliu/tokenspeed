@@ -13,7 +13,8 @@ Qwen3.8-Flash-Next (`qwen4_exp`), whose Gated DeltaNet and QSA attention
 layers each have one monokernel, and Muse Spark Open (`muse_spark`), whose
 decoder layers 1 to 60 have one monokernel per rank of a TP8 group (MoE TP8
 / EP1 or MoE TP1 / EP8). Muse Spark's DFlash2 draft (`dflash2`) has one
-monokernel per draft layer for one request's block of 8 rows, one for its
+monokernel per draft layer for the blocks of 8 rows of one or two requests
+(attention runs per request: its own length, pages and keys), one for its
 head (the vocabulary-parallel top 16 and the candidate selector) and one for
 its context write after a verify (fc, hidden_norm and the K/V of every layer).
 
