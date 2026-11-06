@@ -260,12 +260,21 @@ def slot_table_stage(mb, STAGE: gl.constexpr):
     RP: gl.constexpr = triton.next_power_of_2(R)
     NP: gl.constexpr = RP * TOP_K
     nw: gl.constexpr = gl.num_warps()
-    pk = gl.arange(0, NP, gl.SliceLayout(1, _pick_layout(NP, nw)))
-    (ids,) = mb.poll_many(
-        ("route",), (mb.row_offset(gl.minimum(pk // TOP_K, R - 1)) + pk % TOP_K,)
-    )
-    mb.stamp(STAGE, trace.READY)
-    ids, owner, slot, count, table = slots(ids)
+    if NP <= 64:
+        # A pick a lane of every wave: the slots by wave ballots.
+        pk = gl.arange(0, NP, gl.BlockedLayout([1], [64], [nw], [0]))
+        (ids,) = mb.poll_many(
+            ("route",), (mb.row_offset(gl.minimum(pk // TOP_K, R - 1)) + pk % TOP_K,)
+        )
+        mb.stamp(STAGE, trace.READY)
+        ids, owner, slot, count, table = _ballot_slots(ids, RP)
+    else:
+        pk = gl.arange(0, NP, gl.SliceLayout(1, _pick_layout(NP, nw)))
+        (ids,) = mb.poll_many(
+            ("route",), (mb.row_offset(gl.minimum(pk // TOP_K, R - 1)) + pk % TOP_K,)
+        )
+        mb.stamp(STAGE, trace.READY)
+        ids, owner, slot, count, table = slots(ids)
     lanes: gl.constexpr = ids.type.layout
     p = gl.arange(0, NP, lanes)
     word = ids | (slot << 8) | (owner << 15) | (count << 16)
@@ -294,6 +303,121 @@ def union_of(polled):
     owner = (words >> 15) & 1
     count = gl.max(words >> 16, axis=0)
     return ids, owner, slot, count, table
+
+
+@gluon.constexpr_function
+def _slots_asm(outputs, inputs):
+    """:func:`slots` of up to 64 picks (rows of 8) by wave ballots: lane
+    ``p`` holds pick ``p``'s id (``NP = 8 len(table)`` picks; lanes past
+    them repeat them). For each pick ``q`` (v_readlane), every lane compares
+    its id: a hit gives the lane's row-``q // 8`` pick (``q % 8``) and, for a
+    lane of a later row, marks its expert as seen in an earlier row. A pick
+    owns its expert unless seen; its slot is the owner picks below it
+    (v_mbcnt of the owners' ballot), the count all owner picks."""
+    (owner,), (slot,), (count,), table = outputs[0:4]
+    lane, row, seen, hit, t = (o[0] for o in outputs[4:9])
+    (sq,) = outputs[9]
+    ((ident,),) = inputs
+    RP = len(table)
+    NP = RP * 8
+    a = [
+        "s_nop 4",
+        f"v_mbcnt_lo_u32_b32 {lane}, -1, 0",
+        f"v_mbcnt_hi_u32_b32 {lane}, -1, {lane}",
+        # Past NP lanes repeat the picks: lane l holds pick l % NP.
+        f"v_and_b32 {lane}, {NP - 1}, {lane}",
+        f"v_lshrrev_b32 {row}, 3, {lane}",
+        f"v_mov_b32 {seen}, 0",
+    ]
+    a += [f"v_mov_b32 {x}, -1" for x in table]
+    for r in range(RP):
+        a += [f"v_mov_b32 {hit}, 0"]
+        for k in range(8):
+            a += [
+                f"v_readlane_b32 {sq}, {ident}, {r * 8 + k}",
+                f"v_cmp_eq_u32_e32 vcc, {sq}, {ident}",
+                f"v_cndmask_b32_e64 {table[r]}, {table[r]}, {k}, vcc",
+                f"v_cndmask_b32_e64 {hit}, {hit}, 1, vcc",
+            ]
+        # A lane of a later row saw row r's experts.
+        a += [
+            f"v_cmp_lt_u32_e32 vcc, {r}, {row}",
+            f"v_or_b32 {t}, {seen}, {hit}",
+            f"v_cndmask_b32_e32 {seen}, {seen}, {t}, vcc",
+        ]
+    a += [
+        f"v_sub_u32 {owner}, 1, {seen}",
+        # The owner picks' ballot, of the first NP lanes (the rest repeat).
+        f"v_cmp_ne_u32_e32 vcc, 0, {owner}",
+    ]
+    if NP == 64:
+        a += [
+            "s_nop 4",
+            f"s_bcnt1_i32_b64 {count}, vcc",
+            f"v_mbcnt_lo_u32_b32 {slot}, vcc_lo, 0",
+            f"v_mbcnt_hi_u32_b32 {slot}, vcc_hi, {slot}",
+        ]
+    else:
+        # A slot counts the owners below its pick: the ballot's bits below
+        # l % NP (a mask of the first NP <= 32 lanes).
+        a += [
+            "s_nop 4",
+            f"s_and_b32 vcc_lo, vcc_lo, {(1 << NP) - 1:#x}",
+            f"s_bcnt1_i32_b32 {count}, vcc_lo",
+            f"v_bfm_b32 {t}, {lane}, 0",
+            f"v_and_b32 {t}, vcc_lo, {t}",
+            f"v_bcnt_u32_b32 {slot}, {t}, 0",
+        ]
+    return "\n".join(a)
+
+
+@gluon.constexpr_function
+def _table_lanes_layout(RP, num_warps):
+    """``[pick, row]`` with a pick's row picks in its lane's registers."""
+    return gl.BlockedLayout([1, RP], [64, 1], [num_warps, 1], [1, 0])
+
+
+@gluon.jit
+def _ballot_slots(ids, RP: gl.constexpr):
+    """:func:`slots` by :func:`_slots_asm`: ``ids`` a lane each (up to 64
+    picks). Returns the same ``(ids, owner, slot, count, table)``."""
+    NP: gl.constexpr = ids.shape[0]
+    nw: gl.constexpr = gl.num_warps()
+    lanes: gl.constexpr = ids.type.layout
+    tt: gl.constexpr = gl.distributed_type(
+        gl.int32, [NP, RP], _table_lanes_layout(RP, nw)
+    )
+    out = gl.inline_asm(
+        _slots_asm,
+        (
+            "=&v",
+            "=&v",
+            "=&s",
+            "=&v",
+            "=&v",
+            "=&v",
+            "=&v",
+            "=&v",
+            "=&v",
+            "=&s",
+            "v,~{vcc},~{scc}",
+        ),
+        [ids],
+        [
+            ids.type,
+            ids.type,
+            gl.int32,
+            tt,
+            ids.type,
+            ids.type,
+            ids.type,
+            ids.type,
+            ids.type,
+            gl.int32,
+        ],
+        is_pure=True,
+    )
+    return ids, out[0], out[1], out[2], out[3]
 
 
 @gluon.jit
