@@ -393,6 +393,8 @@ def worker(rank: int, port: int, args) -> None:
                 {
                     "layers": {str(i): kind for i in range(LAUNCHES + 1)},
                     "launches": [[R, args.rows]],
+                    # The bench's launches alternate the copies and check it.
+                    "check_parity": True,
                 },
                 f,
             )

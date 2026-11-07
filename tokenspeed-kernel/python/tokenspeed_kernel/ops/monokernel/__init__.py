@@ -966,8 +966,9 @@ def describe_muse_spark_stuck(
     chain)`` of the launches they ran."""
     from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import stuck_report
 
+    # Serving's launches do not check the peer parity (see the launch).
     return stuck_report.describe(
-        record.tensor, muse_spark_layer_kinds(layers), launches
+        record.tensor, muse_spark_layer_kinds(layers), launches, False
     )
 
 

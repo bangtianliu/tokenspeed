@@ -149,7 +149,10 @@ timeout is time, not a retry count, and long: a rank whose host submits a
 launch seconds late (seen: 10 s) must only stall its peers. Given a
 stuck-poll record buffer, a poll that gives up first writes what it waited
 for (tag, pair address, observed pair, clocks) where the host can decode it
-after the process dies.
+after the process dies. A stall leaves records on every CTA downstream of
+it; the decoder groups them by wait and prints the earliest stage in plan
+order first, which by the deadlock rule is the one whose producer is
+missing.
 
 **A launch first reads its own code into the L2s.** A layer kernel's code
 (~100 KB) is larger than the instruction cache, and the weights that stream
