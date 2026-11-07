@@ -309,6 +309,11 @@ class _AutotuneExecutor:
         # vocab-shard warmup.
         self._samples_from_vocab_shard = False
 
+    # autotune() sizes and runs its traversal through these; the real methods
+    # read only the state above.
+    _warmup_num_tokens = ModelExecutor._warmup_num_tokens
+    _warmup_traversal = ModelExecutor._warmup_traversal
+
     def _model_input_kwargs(self, num_tokens, bs, rows):
         return self._model_input_kwargs_hook(num_tokens, bs, rows)
 
