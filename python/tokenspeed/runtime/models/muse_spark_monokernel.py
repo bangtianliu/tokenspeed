@@ -98,11 +98,8 @@ logger = logging.getLogger(__name__)
 
 # Token rows of one launch: a decode row a request, or a verify of up to 7
 # draft tokens (the DFlash2 drafters' block of 8) a request, for up to
-# MAX_REQUESTS requests. The kernels serve two requests' rows (16), but a
-# launch of 16 rows takes 231 us against 107 us for 8 (the expert stages
-# walk every row for each expert slot), slower than the regular path at
-# concurrency 2: one request's rows only, until the expert stages scale.
-MAX_REQUESTS = 1
+# MAX_REQUESTS requests: two requests' rows (16) a launch.
+MAX_REQUESTS = 2
 CHAIN_ROWS = 8  # a request's rows at most
 MAX_ROWS = MAX_REQUESTS * CHAIN_ROWS
 WORLD = 8
