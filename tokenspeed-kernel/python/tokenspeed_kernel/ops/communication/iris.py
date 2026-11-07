@@ -362,10 +362,10 @@ def create_iris_state(
     if min(staged_max_numel, producer_direct_max_numel) < 0:
         raise ValueError("Iris all-reduce capacities must be non-negative")
     from tokenspeed_kernel.ops.communication._iris import (
-        HEAP_HEADROOM_BYTES,
         MIN_HEAP_BYTES,
         IrisGroup,
         get_or_create_context,
+        heap_headroom_bytes,
     )
 
     device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -375,7 +375,7 @@ def create_iris_state(
             IrisAllReduce.heap_bytes(
                 staged_max_numel, producer_direct_max_numel, group.size(), dtype
             )
-            + HEAP_HEADROOM_BYTES,
+            + heap_headroom_bytes(),
         )
     ctx = get_or_create_context(heap_size=heap_size)
     peers = IrisGroup(ctx, group, rank_in_group, device)

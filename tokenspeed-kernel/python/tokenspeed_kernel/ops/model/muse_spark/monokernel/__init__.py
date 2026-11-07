@@ -49,6 +49,7 @@ __all__ = [
     "describe_muse_spark_stuck",
     "muse_spark_draft_context_decode",
     "muse_spark_draft_head_decode",
+    "muse_spark_draft_head_scratch_pairs",
     "muse_spark_draft_layer_decode",
     "muse_spark_layer_decode",
     "muse_spark_layer_kinds",
@@ -396,6 +397,29 @@ def prepare_muse_spark_draft_head(
         scratch_pairs=scratch_pairs,
         late_weights=late_weights,
     )
+
+
+def muse_spark_draft_head_scratch_pairs(
+    *, max_rows: int, override: str | None = None
+) -> int | None:
+    """The int64 mailbox pairs that :func:`prepare_muse_spark_draft_head`'s
+    head of ``max_rows`` draft steps needs, without packing it: for reserving
+    the Iris heap before the heap exists.
+
+    Args:
+        max_rows: The draft steps of one request's block.
+        override: Optional registered kernel name to force.
+
+    Returns:
+        The pairs, or None when no monokernel serves ``max_rows`` here.
+    """
+    try:
+        scratch = _select("muse_spark_draft_head_scratch", max_rows, override)
+    except NoKernelFoundError:
+        if override is not None:
+            raise
+        return None
+    return scratch(max_rows=max_rows)
 
 
 def muse_spark_draft_head_decode(
