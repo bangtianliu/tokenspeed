@@ -526,10 +526,17 @@ class DFlash2MonokernelLayer(MonokernelLayer):
         self.last = False
 
     def launch_chain(self, rows: int, ctx: ForwardContext) -> int | None:
-        state = self.monokernel_state
-        if self.fused is None or state.bases is None:
+        if self.fused is None or not takes_monokernels(rows, ctx):
             return None
-        return BLOCK_ROWS if takes_monokernels(rows, ctx) else None
+        if self.monokernel_state.bases is None:
+            # Packed, but the draft's collectives never prepared the scratch:
+            # a wiring error, not a reason to serve the regular code.
+            raise RuntimeError(
+                f"DFlash2 draft layer {self.layer_id}: a block forward before "
+                "prepare_communication_runtime allocated the draft monokernels' "
+                "scratch"
+            )
+        return BLOCK_ROWS
 
     def _decode(
         self,
@@ -731,8 +738,9 @@ def enable_draft_monokernels(model: torch.nn.Module) -> None:
             fused.append(prepared)
     if reasons:
         logger.warning(
-            f"Decode monokernel: the {name} draft keeps the regular path "
-            f"({'; '.join(reasons)})"
+            f"--decode-monokernel: the {name} draft runs its regular code on "
+            f"every step, while the target's layers launch; its layers cannot "
+            f"be packed ({'; '.join(reasons)})"
         )
         return
     context = None

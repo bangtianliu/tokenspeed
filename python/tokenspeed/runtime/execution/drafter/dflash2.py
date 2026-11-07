@@ -32,6 +32,7 @@ vocabulary) so the next round's verify can run rejection sampling against it.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -46,6 +47,8 @@ from tokenspeed.runtime.models.dflash2_monokernel import takes_head
 from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
 from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
@@ -162,9 +165,15 @@ class DFlash2(DFlash):
             fp8_weight=self.model.fp8_head,
         )
         monokernels = self.model.monokernel_state
-        if monokernels is not None and monokernels.bases is not None:
-            # --decode-monokernel: the top 16 and the selector of one
-            # request's block as one launch.
+        if monokernels is not None and monokernels.bases is None:
+            logger.warning(
+                "--decode-monokernel: the DFlash2 draft head keeps the regular "
+                "path: the draft's collectives were not prepared before the "
+                "drafter (prepare_communication_runtime)"
+            )
+        elif monokernels is not None:
+            # --decode-monokernel: the top 16 and the selector of the blocks
+            # of up to two requests as one launch.
             monokernels.enable_head(
                 self.lm_head,
                 self.candidate_selector,
