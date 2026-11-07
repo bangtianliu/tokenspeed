@@ -568,10 +568,13 @@ the prefill budget, the activation size a chunked prefill allocates anyway.
 Kernels the dummy traversal never reaches compile on the first request and
 are left so deliberately: the executor's input preparation (positions, the
 tape, decode inputs, the accepted frontier), the drafter's extend-time
-context write (its key RoPE, norm and KV store) and the arena's block copy.
-Each has one specialization, so it compiles once per process, a bounded cost
-of a few hundred milliseconds. After the first request a served run compiles
-nothing; a compile there is a kernel keyed on a per-request quantity.
+context write (its key RoPE, norm and KV store), the arena's block copy, and
+the sampled vocab-shard path (`sampled_vocab_shard.py`: the per-shard top-k,
+the two top-k merges, the Iris column all-gather and the Gumbel second
+stage). Each has one specialization, so it compiles once per process, a
+bounded cost of a few hundred milliseconds. After the first request a served
+run compiles nothing; a compile there is a kernel keyed on a per-request
+quantity.
 
 CuTe QSA keeps query rows and selected-slot row strides dynamic; model
 geometry, selection budgets and launch configurations stay static. Warmup
