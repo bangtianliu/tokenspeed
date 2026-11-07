@@ -2880,6 +2880,24 @@ def shard_expert_projection(
     return loaded_weight.narrow(dim, tp_rank * width, width)
 
 
+def _iris_unprepared(mapping: Mapping, backend, group) -> str | None:
+    """Why Muse's Iris collectives cannot be prepared for ``group`` on
+    ``backend``, or None when they can."""
+    from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+
+    if not current_platform().is_cdna4:
+        return "not gfx950 (CDNA4)"
+    if mapping.attn.tp_size not in (4, 8):
+        return f"attention TP {mapping.attn.tp_size}, not 4 or 8"
+    if group != mapping.moe.tp_ep_group:
+        return "the attention TP group is not the MoE TP x EP group"
+    if not isinstance(backend, AutoBackend):
+        return "the communication backend is not AutoBackend"
+    if not backend.can_prepare_all_reduce_buffers(group, torch.bfloat16):
+        return "the backend cannot prepare all-reduce buffers"
+    return None
+
+
 class MuseSparkForConditionalGeneration(BaseCausalLM):
     """Muse Spark conditional generation model with shared vision and audio towers."""
 
@@ -2900,24 +2918,6 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         if self.model.config.decode_monokernel:
             reserve_monokernel_heap(self.model)
 
-    def _iris_unprepared(self, backend, group) -> str | None:
-        """Why Muse's Iris collectives cannot be prepared for ``group`` on
-        ``backend``, or None when they can."""
-        from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
-
-        mapping = self.mapping
-        if not current_platform().is_cdna4:
-            return "not gfx950 (CDNA4)"
-        if mapping.attn.tp_size not in (4, 8):
-            return f"attention TP {mapping.attn.tp_size}, not 4 or 8"
-        if group != mapping.moe.tp_ep_group:
-            return "the attention TP group is not the MoE TP x EP group"
-        if not isinstance(backend, AutoBackend):
-            return "the communication backend is not AutoBackend"
-        if not backend.can_prepare_all_reduce_buffers(group, torch.bfloat16):
-            return "the backend cannot prepare all-reduce buffers"
-        return None
-
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         """Prepare and bind Muse's TP4/TP8 state before cache sizing and capture."""
         mapping = self.mapping
@@ -2926,7 +2926,7 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         down_columns = any(
             layer.mlp.down_columns is not None for layer in self.model.layers
         )
-        unprepared = self._iris_unprepared(backend, group)
+        unprepared = _iris_unprepared(mapping, backend, group)
         if unprepared is not None:
             if self.model.config.decode_monokernel:
                 # The launches' mailbox scratch lives on the Iris heap that

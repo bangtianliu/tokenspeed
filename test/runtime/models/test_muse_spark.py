@@ -363,6 +363,7 @@ class _CaptureSink:
 def _tapping_model(taps: list[int], with_sink: bool = True):
     """Three constant-adding layers and a draft capturing the layers in ``taps``."""
     model = _stub(MuseSparkForConditionalGeneration.model_cls)
+    model.config = SimpleNamespace(decode_monokernel=False)
     model.layers = torch.nn.ModuleList(_AddLayer(float(i + 1)) for i in range(3))
     model.monokernel_state = None
     model._embed_hidden = lambda input_ids, input_embeds: input_embeds
@@ -1480,7 +1481,10 @@ def test_communication_fallback_frees_the_column_split_down_copy() -> None:
     owner = SimpleNamespace(
         # Muse prepares Iris communication only at attention TP4 or TP8.
         mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
-        model=SimpleNamespace(layers=[SimpleNamespace(mlp=mlp)]),
+        model=SimpleNamespace(
+            layers=[SimpleNamespace(mlp=mlp)],
+            config=SimpleNamespace(decode_monokernel=False),
+        ),
     )
 
     prepared = MuseSparkForConditionalGeneration.prepare_communication_runtime(
@@ -1489,6 +1493,21 @@ def test_communication_fallback_frees_the_column_split_down_copy() -> None:
 
     assert prepared is False
     assert mlp.down_columns is None
+
+
+def test_decode_monokernels_without_iris_fail_startup_with_the_cause() -> None:
+    """The launches' scratch lives on the Iris heap: with --decode-monokernel,
+    a server whose Iris collectives cannot be prepared fails at startup and
+    names why, instead of at its first decode."""
+    owner = SimpleNamespace(
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
+        model=SimpleNamespace(
+            layers=[], config=SimpleNamespace(decode_monokernel=True)
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Iris collectives are not prepared"):
+        MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
 
 
 @requires_gpu
