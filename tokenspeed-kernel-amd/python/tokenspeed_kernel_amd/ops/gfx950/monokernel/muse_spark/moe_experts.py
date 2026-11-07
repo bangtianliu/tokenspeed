@@ -304,6 +304,14 @@ def slot_table_stage(mb, STAGE: gl.constexpr):
         )
         mb.stamp(STAGE, trace.READY)
         ids, owner, slot, count, table = _ballot_slots(ids, RP)
+    elif NP == 128:
+        # Two picks a lane (2 l and 2 l + 1, one row) of every wave.
+        pk = gl.arange(0, NP, gl.BlockedLayout([2], [64], [nw], [0]))
+        (ids,) = mb.poll_many(
+            ("route",), (mb.row_offset(gl.minimum(pk // TOP_K, R - 1)) + pk % TOP_K,)
+        )
+        mb.stamp(STAGE, trace.READY)
+        ids, owner, slot, count, table = _ballot_slots2(ids, RP)
     else:
         pk = gl.arange(0, NP, gl.SliceLayout(1, _pick_layout(NP, nw)))
         (ids,) = mb.poll_many(
@@ -405,6 +413,109 @@ def _slots_asm(outputs, inputs):
             f"v_bcnt_u32_b32 {slot}, {t}, 0",
         ]
     return "\n".join(a)
+
+
+@gluon.constexpr_function
+def _slots2_asm(outputs, inputs):
+    """:func:`_slots_asm` of 128 picks (16 rows of 8), two a lane: lane
+    ``l`` holds picks ``2 l`` and ``2 l + 1`` (both of row ``l // 4``). Each
+    pick ``q`` (v_readlane of its lane's pick) is compared with both of every
+    lane's picks. A pick's slot is the owner picks below it: those of the
+    lanes below (both ballots), and for ``2 l + 1`` also ``2 l``."""
+    owner, slot = outputs[0], outputs[1]
+    (count,) = outputs[2]
+    table = outputs[3]
+    lane, row = outputs[4][0], outputs[5][0]
+    seen, hit, t = outputs[6], outputs[7], outputs[8]
+    (sq,) = outputs[9]
+    (ident,) = inputs
+    RP = len(table) // 2
+    a = [
+        "s_nop 4",
+        f"v_mbcnt_lo_u32_b32 {lane}, -1, 0",
+        f"v_mbcnt_hi_u32_b32 {lane}, -1, {lane}",
+        f"v_lshrrev_b32 {row}, 2, {lane}",
+        f"v_mov_b32 {seen[0]}, 0",
+        f"v_mov_b32 {seen[1]}, 0",
+    ]
+    a += [f"v_mov_b32 {x}, -1" for x in table]
+    for r in range(RP):
+        a += [f"v_mov_b32 {hit[0]}, 0", f"v_mov_b32 {hit[1]}, 0"]
+        for k in range(8):
+            q = r * 8 + k
+            a += [f"v_readlane_b32 {sq}, {ident[q % 2]}, {q // 2}"]
+            for e in range(2):
+                a += [
+                    f"v_cmp_eq_u32_e32 vcc, {sq}, {ident[e]}",
+                    f"v_cndmask_b32_e64 {table[e * RP + r]}, {table[e * RP + r]}, {k}, vcc",
+                    f"v_cndmask_b32_e64 {hit[e]}, {hit[e]}, 1, vcc",
+                ]
+        # A lane of a later row saw row r's experts.
+        a += [f"v_cmp_lt_u32_e32 vcc, {r}, {row}"]
+        for e in range(2):
+            a += [
+                f"v_or_b32 {t[e]}, {seen[e]}, {hit[e]}",
+                f"v_cndmask_b32_e32 {seen[e]}, {seen[e]}, {t[e]}, vcc",
+            ]
+    a += [
+        f"v_sub_u32 {owner[0]}, 1, {seen[0]}",
+        f"v_sub_u32 {owner[1]}, 1, {seen[1]}",
+        # Even picks' owners: their count and the ones below each lane.
+        f"v_cmp_ne_u32_e32 vcc, 0, {owner[0]}",
+        "s_nop 4",
+        f"s_bcnt1_i32_b64 {count}, vcc",
+        f"v_mbcnt_lo_u32_b32 {t[0]}, vcc_lo, 0",
+        f"v_mbcnt_hi_u32_b32 {t[0]}, vcc_hi, {t[0]}",
+        # Odd picks' owners: added to both.
+        f"v_cmp_ne_u32_e32 vcc, 0, {owner[1]}",
+        "s_nop 4",
+        f"s_bcnt1_i32_b64 {sq}, vcc",
+        f"s_add_u32 {count}, {count}, {sq}",
+        f"v_mbcnt_lo_u32_b32 {t[0]}, vcc_lo, {t[0]}",
+        f"v_mbcnt_hi_u32_b32 {slot[0]}, vcc_hi, {t[0]}",
+        f"v_add_u32 {slot[1]}, {slot[0]}, {owner[0]}",
+    ]
+    return "\n".join(a)
+
+
+@gluon.constexpr_function
+def _slots2_constraints(RP):
+    """:func:`_slots2_asm`'s constraints as one string: a tuple repeats an
+    entry for every element of its operand, and with two picks a lane the
+    input's entry would repeat its clobbers before the second pick."""
+    two = ["=&v", "=&v"]
+    outputs = two * 2 + ["=&s"] + ["=&v"] * (2 * RP) + two * 5 + ["=&s"]
+    return ",".join(outputs + ["v", "v", "~{vcc}", "~{scc}"])
+
+
+@gluon.jit
+def _ballot_slots2(ids, RP: gl.constexpr):
+    """:func:`slots` by :func:`_slots2_asm`: ``ids`` two a lane (128
+    picks). Returns the same ``(ids, owner, slot, count, table)``."""
+    NP: gl.constexpr = ids.shape[0]
+    nw: gl.constexpr = gl.num_warps()
+    tt: gl.constexpr = gl.distributed_type(
+        gl.int32, [NP, RP], gl.BlockedLayout([2, RP], [64, 1], [nw, 1], [1, 0])
+    )
+    out = gl.inline_asm(
+        _slots2_asm,
+        _slots2_constraints(RP),
+        [ids],
+        [
+            ids.type,
+            ids.type,
+            gl.int32,
+            tt,
+            ids.type,
+            ids.type,
+            ids.type,
+            ids.type,
+            ids.type,
+            gl.int32,
+        ],
+        is_pure=True,
+    )
+    return ids, out[0], out[1], out[2], out[3]
 
 
 @gluon.constexpr_function

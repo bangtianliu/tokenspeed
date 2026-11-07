@@ -18,7 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The slot table by wave ballots matches :func:`moe_experts.slots`."""
+"""The slot table by wave ballots (a pick a lane, or two past 64 picks)
+matches :func:`moe_experts.slots`."""
 
 from __future__ import annotations
 
@@ -55,18 +56,24 @@ def _slots_kernel(ids_ptr, out_ptr, RP: gl.constexpr):
     ids = gl.load(ids_ptr + gl.arange(0, NP, lanes))
     _, owner, slot, count, table = moe_experts.slots(ids)
     _store_slots(out_ptr, owner, slot, count, table, NP, RP)
-    _, owner, slot, count, table = moe_experts._ballot_slots(ids, RP)
+    if NP <= 64:
+        _, owner, slot, count, table = moe_experts._ballot_slots(ids, RP)
+    else:
+        # Two picks a lane past 64 picks, as the slot table stage loads them.
+        two: gl.constexpr = gl.BlockedLayout([2], [64], [gl.num_warps()], [0])
+        ids2 = gl.load(ids_ptr + gl.arange(0, NP, two))
+        _, owner, slot, count, table = moe_experts._ballot_slots2(ids2, RP)
     _store_slots(out_ptr + (3 * NP + NP * RP + 1), owner, slot, count, table, NP, RP)
 
 
-@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16])
 def test_ballot_slots_match_slots(rows: int):
     rp = triton_next_power_of_2(rows)
     g = torch.Generator().manual_seed(rows)
     for trial in range(20):
         # Each row's 8 distinct picks, from a small pool so rows share
         # experts; the slot table stage repeats the last row up to rp.
-        pool = 8 + trial
+        pool = 8 + trial * (2 if rows > 8 else 1)
         picks = [torch.randperm(pool, generator=g)[:8] for _ in range(rows)]
         picks += [picks[-1]] * (rp - rows)
         ids = torch.stack(picks).flatten().to(torch.int32).cuda()

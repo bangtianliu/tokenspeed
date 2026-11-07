@@ -233,7 +233,7 @@ def _worker(rank: int, port: int, rows: int) -> None:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("rows", [1, 8])
+@pytest.mark.parametrize("rows", [1, 8, 16])
 def test_bf16_experts_match_the_route_path_math_on_its_weight_layout(rows: int):
     if torch.cuda.device_count() < WORLD:
         pytest.skip(f"requires {WORLD} GPUs")
