@@ -60,6 +60,7 @@ for bit identity with ``--compare``.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import socket
 import sys
@@ -79,7 +80,10 @@ from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
 from tokenspeed_kernel_amd._triton import tl, triton  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import plan as plan_mod  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import stuck  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import layer  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (  # noqa: E402
+    layer,
+    moe_tail,
+)
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.qkvg import (  # noqa: E402
     PROJ_WORDS,
 )
@@ -110,12 +114,19 @@ def _fill_absent_ranks(
 
 
 def _peer_slices(plan, parity: int):
-    """(offset, segment) of copy ``parity`` of each peer region."""
+    """(offset, segment) of copy ``parity`` of each rank-ordered block of
+    each peer region (:func:`moe_tail.rank_blocks`), in every row: rank
+    ``r`` writes segment ``r`` of a block."""
     sizes = dict(plan.regions)
     out = []
     for r in plan.peers:
-        assert sizes[r] % TP == 0, (r, sizes[r])
-        out.append((plan.offset(r) + parity * plan.peer_copy(r), sizes[r] // TP))
+        blocks = moe_tail.rank_blocks(r, sizes[r])
+        assert sum(n for _, n in blocks) == sizes[r], (r, blocks, sizes[r])
+        for row in range(plan.rows):
+            base = plan.offset(r) + parity * plan.peer_copy(r) + row * plan.row_pairs
+            for start, n in blocks:
+                assert n % TP == 0, (r, start, n)
+                out.append((base + start, n // TP))
     return out
 
 
@@ -371,7 +382,20 @@ def worker(rank: int, port: int, args) -> None:
 
     trace = torch.zeros(TRACE_SHAPE, dtype=torch.int64, device=dev)
     # The served launches carry a stuck-poll record buffer: so do the bench's.
-    stuck_rec = stuck.stuck_buffer(256, None, scratch.data_ptr(), rank).tensor
+    # With --stuck-dir it is a file, which outlives a trap, and a sidecar
+    # describes the launches for ``muse_spark.stuck_report``.
+    path = f"{args.stuck_dir}/rank{rank}.rec" if args.stuck_dir else None
+    stuck_rec = stuck.stuck_buffer(256, path, scratch.data_ptr(), rank).tensor
+    if path is not None:
+        kind = {"full": args.full, "bf16_experts": args.bf16_experts}
+        with open(f"{path}.json", "w") as f:
+            json.dump(
+                {
+                    "layers": {str(i): kind for i in range(LAUNCHES + 1)},
+                    "launches": [[R, args.rows]],
+                },
+                f,
+            )
     group.finish_prepare()
 
     def launch(lay: int, trace_buf=None) -> None:
@@ -628,6 +652,11 @@ def main() -> None:
         help="passes that make the absent ranks' copies consistent",
     )
     p.add_argument("--trace-out", help="save each rank's trace to PREFIX.<rank>")
+    p.add_argument(
+        "--stuck-dir",
+        help="keep each rank's stuck-poll records in DIR/rank<r>.rec (read them "
+        "with muse_spark.stuck_report after a trap)",
+    )
     p.add_argument("--out-save", help="save rank 0's outputs of a fixed launch")
     p.add_argument(
         "--view", nargs="+", metavar="TRACE", help="print saved traces and exit"
