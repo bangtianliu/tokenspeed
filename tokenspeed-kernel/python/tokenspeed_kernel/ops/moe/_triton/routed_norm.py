@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 _FLOAT_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
 
@@ -387,6 +389,24 @@ def _launch_routed_input_scale_sum(
     enable_pdl: bool,
 ) -> None:
     """Reduce routes into ``output``: one program per token, or two tiled launches."""
+    if single_pass and is_warming_up():
+        # The route switches on the token count, so a warmup forward of any
+        # size compiles the two-launch route too, into scratch.
+        _launch_routed_input_scale_sum(
+            routes,
+            permute_map,
+            row_stride,
+            route_weights,
+            norm_weight,
+            torch.empty_like(output),
+            num_tokens,
+            topk,
+            eps,
+            weight_offset,
+            block,
+            False,
+            enable_pdl,
+        )
     has_map = permute_map is not None
     map_arg = permute_map if has_map else routes
     width = norm_weight.shape[0]
@@ -425,9 +445,10 @@ def _launch_routed_input_scale_sum(
         BLOCK=block,
         num_warps=8,
     )
-    _routed_input_scale_sum_kernel[
-        (triton.cdiv(num_tokens, 4), triton.cdiv(width, 256))
-    ](
+    kernel_launcher(
+        _routed_input_scale_sum_kernel,
+        (triton.cdiv(num_tokens, 4), triton.cdiv(width, 256)),
+    )(
         routes,
         map_arg,
         route_weights,
@@ -444,6 +465,13 @@ def _launch_routed_input_scale_sum(
         BLOCK_N=256,
         num_warps=4,
     )
+
+
+# The token count is a runtime argument, keyed on whether it is a multiple of
+# 16; the two-pass route sees more than a few tokens, so both classes occur.
+register_triton_warmup(
+    _routed_input_scale_sum_kernel, variants=({"num_tokens": (16, 17)},)
+)
 
 
 @register_kernel(

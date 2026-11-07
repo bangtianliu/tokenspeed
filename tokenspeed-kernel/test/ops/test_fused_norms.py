@@ -44,6 +44,7 @@ from tokenspeed_kernel.ops.moe import bf16_moe_routes
 from tokenspeed_kernel.ops.moe._triton.routed_norm import (
     _gather_moe_routes_kernel,
     _launch_routed_input_scale_sum,
+    _routed_input_scale_sum_kernel,
 )
 from tokenspeed_kernel.ops.moe._triton.routed_norm import (
     triton_routed_input_scale_rmsnorm_sum_gathered as triton_routed_sum_gathered,
@@ -60,7 +61,9 @@ from tokenspeed_kernel.ops.residual import (
 from tokenspeed_kernel.ops.residual._triton.gated_boundary import (
     triton_post_norm_residual_pre_norm as triton_boundary,
 )
+from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_kernel.platform import current_platform
+from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(
     not (current_platform().is_amd or current_platform().is_nvidia),
@@ -540,6 +543,46 @@ def test_gathered_route_reduction_matches_materialized_routes(device: str) -> No
     normalized = scaled * torch.rsqrt(scaled.square().mean(dim=-1, keepdim=True) + 1e-8)
     reference = (normalized * route_weights[..., None]).sum(dim=1).to(routes.dtype)
     torch.testing.assert_close(expected, reference, atol=5e-4, rtol=0.0)
+
+
+@pytest.mark.parametrize("device", ["cuda"])
+def test_route_reduction_warmup_compiles_both_two_pass_token_classes(
+    device: str,
+) -> None:
+    """After one warmup launch of either route, no token count compiles the
+    two-launch reduction again: serving takes it for short prefills even when
+    every warmup forward is long enough for the one-launch route."""
+    torch.manual_seed(7)
+    topk, width = 8, 4096
+    norm_weight = torch.randn(width, device=device, dtype=torch.bfloat16) * 0.1
+
+    def reduce(tokens: int, single_pass: bool) -> None:
+        routes = (torch.randn(tokens * topk, width, device=device) * 0.5).to(
+            torch.bfloat16
+        )
+        route_weights = torch.rand(tokens, topk, device=device, dtype=torch.float32)
+        output = torch.empty((tokens, width), dtype=torch.bfloat16, device=device)
+        _launch_routed_input_scale_sum(
+            routes,
+            None,
+            width,
+            route_weights,
+            norm_weight,
+            output,
+            tokens,
+            topk,
+            1e-5,
+            1.0,
+            width,
+            single_pass,
+            False,
+        )
+
+    with kernel_warmup(enabled=True):
+        reduce(6, single_pass=True)
+    with assert_no_triton_compile(_routed_input_scale_sum_kernel):
+        for tokens in (2, 16, 31, 48, 100):
+            reduce(tokens, single_pass=False)
 
 
 @pytest.mark.parametrize("device", ["cuda"])
