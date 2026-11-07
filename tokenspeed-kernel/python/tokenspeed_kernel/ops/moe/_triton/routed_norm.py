@@ -27,6 +27,7 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 _FLOAT_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
 
@@ -425,9 +426,10 @@ def _launch_routed_input_scale_sum(
         BLOCK=block,
         num_warps=8,
     )
-    _routed_input_scale_sum_kernel[
-        (triton.cdiv(num_tokens, 4), triton.cdiv(width, 256))
-    ](
+    kernel_launcher(
+        _routed_input_scale_sum_kernel,
+        (triton.cdiv(num_tokens, 4), triton.cdiv(width, 256)),
+    )(
         routes,
         map_arg,
         route_weights,
@@ -444,6 +446,13 @@ def _launch_routed_input_scale_sum(
         BLOCK_N=256,
         num_warps=4,
     )
+
+
+# The token count is a runtime argument, keyed on whether it is a multiple of
+# 16; the two-pass route sees more than a few tokens, so both classes occur.
+register_triton_warmup(
+    _routed_input_scale_sum_kernel, variants=({"num_tokens": (16, 17)},)
+)
 
 
 @register_kernel(

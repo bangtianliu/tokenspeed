@@ -35,6 +35,7 @@ if not is_cdna4():
 
 
 from tokenspeed_kernel.ops.gemm import bmm, kimi3_router_projection, mm  # noqa: E402
+from tokenspeed_kernel.ops.tuning import kernel_warmup  # noqa: E402
 from tokenspeed_kernel.workspace import capture_session, zeroed_state  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
     launch_gluon_mm_a16w16_prefill_gfx950,
@@ -881,6 +882,26 @@ def test_decode_gemm_serves_muse_pre_expert_verify_rows() -> None:
     with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
         for rows in (72, 100, 172, 200):
             run(rows)
+
+
+# The Muse TP8 pre-expert projection (every bucket 2..256 measured) and its
+# attention output projection (buckets to 32).
+@pytest.mark.parametrize("n,k", [(512, 8192), (8192, 2048)])
+def test_warmup_compiles_every_decode_row_bucket(n: int, k: int) -> None:
+    # One warmup call of any row count compiles each bucket and both integer
+    # classes of its rows; a later eager forward of any count compiles nothing.
+    torch.manual_seed(0)
+    a = torch.randn((256, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    with kernel_warmup(enabled=True):
+        warm = mm(a[:8], b)
+    torch.testing.assert_close(warm, torch.mm(a[:8], b.T), atol=1e-4, rtol=_RTOL)
+    rows = [m for m in range(2, 257) if supports_gluon_mm_a16w16_decode_gfx950(m, n, k)]
+    assert rows
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for m in rows:
+            out = mm(a[:m], b)
+            torch.testing.assert_close(out, torch.mm(a[:m], b.T), atol=1e-4, rtol=_RTOL)
 
 
 def test_medium_coalesced_store_masks_strided_out() -> None:
