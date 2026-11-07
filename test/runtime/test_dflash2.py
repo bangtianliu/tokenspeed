@@ -48,7 +48,9 @@ from tokenspeed.runtime.models import dflash as dflash_model
 from tokenspeed.runtime.models.dflash import DFlashDraftModel
 from tokenspeed.runtime.models.dflash2 import (
     CandidateSelector,
+    DFlash2DecoderLayer,
     DFlash2DraftModel,
+    DFlash2MonokernelDecoderLayer,
     DFlashGroupedConv,
     _dflash2_mla_rope,
     _dflash2_uses_mla,
@@ -724,3 +726,17 @@ def test_a_draft_block_takes_the_last_launchs_final_norm(launched: bool) -> None
 
     assert model.monokernel_state.calls == ["start", "finish"]
     torch.testing.assert_close(out, normed if launched else -(hidden + 2))
+
+
+@pytest.mark.parametrize("switch", [False, True])
+def test_the_switch_builds_the_draft_from_the_monokernel_layer_class(
+    monkeypatch, switch: bool
+) -> None:
+    """With --decode-monokernel the draft builds its layers from the
+    monokernel class (which keeps the regular code until they are packed)."""
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "decode_monokernel", switch)
+    model = DFlash2DraftModel.__new__(DFlash2DraftModel)
+    expected = DFlash2MonokernelDecoderLayer if switch else DFlash2DecoderLayer
+    assert model.decoder_layer_cls is expected
