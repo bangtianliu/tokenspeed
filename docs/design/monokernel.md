@@ -124,7 +124,10 @@ hang. The bound is time (about a minute), not a retry count: in a
 tensor-parallel group, a rank whose host submits a launch seconds late must
 only stall its peers. Given a stuck-poll record buffer, a poll that gives up
 first writes what it waited for (the tag, the pair, what it saw, the clocks)
-where the host can read it after the process stops.
+where the host can read it after the process stops. A stall leaves records
+on every CTA downstream of it; the decoder groups them by wait and prints the
+earliest stage in plan order first, which by the deadlock rule is the one
+whose producer is missing.
 
 **A launch first reads its own code.** A layer kernel's code can be larger
 than the instruction cache, and the weights that stream through the caches

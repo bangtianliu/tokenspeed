@@ -596,6 +596,8 @@ class MuseSparkMonokernelState(MonokernelState):
         side = {
             "layers": muse_spark_layer_kinds(self.fused),
             "launches": sorted(self.launches),
+            # Serving's launches do not check the peer parity.
+            "check_parity": False,
         }
         with open(f"{path}.json.tmp", "w") as f:
             json.dump(side, f)
