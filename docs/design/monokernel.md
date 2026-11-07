@@ -28,6 +28,16 @@ forwards, launches and regular forwards follow each other freely through the
 shared caches (next rule). Each model's kernel README gives its boundary
 tensors.
 
+A model's boundary layers may keep the regular code in every forward, when
+their hand-over to the embedding or the LM head differs from the other
+layers' (Muse Spark's first and last layers, which also keep BF16 experts).
+Every other layer launches or none does, as above. The first launch after a
+boundary layer takes that layer's complete output, and the last launch before
+one returns the regular layer's boundary, so no pending state crosses
+between a launch and a regular layer. A draft model is a backbone of its
+own: when its layers cannot all be packed, all of them keep the regular code
+while the target's launch.
+
 **Same caches, same layouts.** A monokernel reads and writes the KV cache,
 the recurrent state pages, and the other per-request caches exactly as the
 regular decode path does. Prefill, the regular decode path, and the monokernel
@@ -51,8 +61,8 @@ planning do not change. A monokernel layer runs a decode step that its plans
 serve as one launch, and every other forward (prefill, larger steps) with the
 regular layer's code. Startup fails when the checkpoint's architecture has
 no monokernel (`DECODE_MONOKERNEL_ARCHITECTURES` in `server_args.py`), or
-when a layer cannot be packed after loading. The switch never serves a layer
-without its kernel. The model's layer loop is the same with and without the
+when a layer other than a boundary layer cannot be packed after loading. The
+switch never serves such a layer without its kernel. The model's layer loop is the same with and without the
 switch.
 
 **Deadlock freedom comes from the plan.** Each stage reads only regions that
