@@ -231,3 +231,14 @@ def test_draft_head_in_one_launch_matches_the_vocab_parallel_top16_and_selector(
         sock.bind(("", 0))
         port = sock.getsockname()[1]
     mp.spawn(_worker, args=(port, seed), nprocs=WORLD, join=True)
+
+
+def test_the_head_scratch_query_matches_the_heads_plan():
+    """A draft reserves the head's Iris scratch before the heap exists, from
+    the boundary's query: it must equal what the prepared head allocates
+    (its plan's pairs), and serve no other step count."""
+    from tokenspeed_kernel.ops.monokernel import muse_spark_draft_head_scratch_pairs
+
+    pairs = muse_spark_draft_head_scratch_pairs(max_rows=STEPS)
+    assert pairs == draft_head.head_plan(STEPS).scratch_pairs
+    assert muse_spark_draft_head_scratch_pairs(max_rows=STEPS + 1) is None

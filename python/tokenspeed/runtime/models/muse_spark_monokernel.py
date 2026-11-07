@@ -520,6 +520,28 @@ class MuseSparkMonokernels:
         self.compiled: set[tuple[int, int, bool]] = set()
         self.launches: set[tuple[int, int]] = set()
         self.tap_slots: dict[int, int] = {}
+        self.reserve_heap(len(model.layers_to_capture))
+
+    def reserve_heap(self, taps: int) -> None:
+        """Reserve what :meth:`prepare` allocates on the Iris heap, before the
+        heap exists: the scratch of the largest plan (``MAX_ROWS`` rows) and,
+        at most, a tap slot for each of ``taps`` captured layers. Call again
+        when the captured layers change."""
+        if not self.fused:
+            return
+        from tokenspeed_kernel.ops.communication._iris import (
+            allocation_bytes,
+            reserve_heap,
+        )
+
+        pairs = max(f.scratch_pairs for f in self.fused.values())
+        tap_bytes = (
+            allocation_bytes((MAX_ROWS, taps, HIDDEN), torch.bfloat16) if taps else 0
+        )
+        reserve_heap(
+            "muse_spark_monokernel",
+            allocation_bytes((pairs,), torch.int64) + tap_bytes,
+        )
 
     def prepare(
         self,

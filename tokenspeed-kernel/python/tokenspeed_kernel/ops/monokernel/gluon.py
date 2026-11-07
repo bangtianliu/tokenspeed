@@ -422,6 +422,19 @@ if _muse_spark_draft_layer is not None:
 
     @register_kernel(
         "monokernel",
+        "muse_spark_draft_head_scratch",
+        name="gluon_muse_spark_draft_head_scratch_gfx950",
+        solution="gluon",
+        capability=_DRAFT_GFX950,
+        signatures=format_signatures("h", "dense", {torch.bfloat16}),
+        priority=Priority.SPECIALIZED,
+        traits=_HEAD_TRAITS,
+    )
+    def gluon_muse_spark_draft_head_scratch_gfx950(*, max_rows: int) -> int:
+        return _muse_spark_draft_head.head_plan(max_rows).scratch_pairs
+
+    @register_kernel(
+        "monokernel",
         "muse_spark_draft_head_decode",
         name="gluon_muse_spark_draft_head_gfx950",
         solution="gluon",

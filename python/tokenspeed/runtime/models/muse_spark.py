@@ -2584,6 +2584,20 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
     model_cls = MuseSparkModel
     supports_aux_capture = True
 
+    def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
+        super().set_eagle3_layers_to_capture(layer_ids)
+        self._reserve_monokernel_taps()
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        super().set_dflash_layers_to_capture(layer_ids)
+        self._reserve_monokernel_taps()
+
+    def _reserve_monokernel_taps(self) -> None:
+        # The draft's target and the draft load before the Iris heap exists,
+        # in either order; the monokernels' heap reservation counts the taps.
+        if self.model.monokernels is not None:
+            self.model.monokernels.reserve_heap(len(self.model.layers_to_capture))
+
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         """Prepare and bind Muse's TP4/TP8 state before cache sizing and capture."""
         from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend

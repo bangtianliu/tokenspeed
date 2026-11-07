@@ -61,6 +61,7 @@ from tokenspeed_kernel.ops.monokernel import (
     FusedDecodeLayer,
     muse_spark_draft_context_decode,
     muse_spark_draft_head_decode,
+    muse_spark_draft_head_scratch_pairs,
     muse_spark_draft_layer_decode,
     prepare_muse_spark_draft_context,
     prepare_muse_spark_draft_head,
@@ -118,6 +119,12 @@ SELECTOR_RANK = 256
 TOPK = 16
 STEPS = BLOCK_ROWS - 1  # the block's rows 1 .. 7 draft a token each
 CONTEXT_ROWS = 8  # one request's verify rows
+# The rows each launch is packed for, which also size its Iris scratch (and
+# so the draft's heap reservation): one request's block, draft steps and
+# verify rows.
+LAYER_ROWS = BLOCK_ROWS
+HEAD_ROWS = STEPS
+CONTEXT_WRITE_ROWS = CONTEXT_ROWS
 NO_KERNEL = "no draft monokernel for this platform"
 NOT_BF16_KV = "the draft's KV cache is not BF16: the kernels read BF16 keys"
 
@@ -287,6 +294,9 @@ class DFlash2Monokernels:
             has not run yet (the head reads their step counter).
         head: The draft head's launch, from :meth:`enable_head` (None
             before it, or when the head keeps the regular path).
+        head_pairs: The mailbox pairs reserved on the Iris heap for the
+            head's scratch (0 when no head monokernel serves here);
+            :meth:`enable_head` refuses a head that needs more.
     """
 
     def __init__(
@@ -311,6 +321,25 @@ class DFlash2Monokernels:
         self.block_pending = False
         self.context_compiled = False
         self.head: DraftHeadMonokernel | None = None
+        # What prepare() and enable_head() allocate on the Iris heap, reserved
+        # before the heap exists: the layers' scratch, the context write's and
+        # the head's (enable_head runs after the heap exists).
+        from tokenspeed_kernel.ops.communication._iris import (
+            allocation_bytes,
+            reserve_heap,
+        )
+
+        self.head_pairs = muse_spark_draft_head_scratch_pairs(max_rows=HEAD_ROWS) or 0
+        pairs = max(f.scratch_pairs for f in fused)
+        context_pairs = context.scratch_pairs if context is not None else 0
+        reserve_heap(
+            "dflash2_monokernel",
+            sum(
+                allocation_bytes((n,), torch.int64)
+                for n in (pairs, context_pairs, self.head_pairs)
+                if n
+            ),
+        )
 
     def prepare(
         self, group: dist.ProcessGroup, cpu_group: dist.ProcessGroup, rank: int
@@ -490,7 +519,7 @@ class DFlash2Monokernels:
                     "succ_codebook": selector.successor_codebook.data,
                 },
                 rank=self.rank,
-                max_rows=STEPS,
+                max_rows=HEAD_ROWS,
                 scale=scale,
                 softcap=softcap,
             )
@@ -502,6 +531,11 @@ class DFlash2Monokernels:
                 f"({'; '.join(reasons)})"
             )
             return
+        if fused.scratch_pairs > self.head_pairs:
+            raise RuntimeError(
+                f"the draft head needs {fused.scratch_pairs} mailbox pairs but "
+                f"{self.head_pairs} were reserved on the Iris heap"
+            )
         self.head = DraftHeadMonokernel(
             fused, self.device_group, self.cpu_group, self.rank, self.steps.step
         )
@@ -633,7 +667,7 @@ def enable_draft_monokernels(model: torch.nn.Module) -> None:
         rank = model.mapping.attn.tp_rank
         for layer in model.layers:
             prepared = prepare_muse_spark_draft_layer(
-                tensors=layer_tensors(layer), rank=rank, max_rows=BLOCK_ROWS
+                tensors=layer_tensors(layer), rank=rank, max_rows=LAYER_ROWS
             )
             if prepared is None:
                 reasons.append(NO_KERNEL)
@@ -649,7 +683,7 @@ def enable_draft_monokernels(model: torch.nn.Module) -> None:
     reasons = context_reasons(model)
     if not reasons:
         context = prepare_muse_spark_draft_context(
-            tensors=context_tensors(model), rank=rank, max_rows=CONTEXT_ROWS
+            tensors=context_tensors(model), rank=rank, max_rows=CONTEXT_WRITE_ROWS
         )
         if context is None:
             reasons.append(NO_KERNEL)
