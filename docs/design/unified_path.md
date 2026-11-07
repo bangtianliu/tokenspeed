@@ -520,6 +520,12 @@ The dummy extend has no cached prefix, so the MHA backend, which sends such
 an extend to its prefill kernel, also runs its cached-prefix extend kernel on
 the same rows during this traversal; that kernel compiles every variant a
 later batch can pick.
+The traversal samples nothing, so startup then runs the sampling backend's
+`warmup_eager`: the decode graphs capture their own sampling routes, but an
+eager step picks its route and top-k pad (64 or 128) from the batch's
+requests, and each route, pad and window width is a separate kernel
+specialization. The warmup samples and verifies every combination once, so no
+request compiles one on the serving path.
 
 CuTe QSA keeps query rows and selected-slot row strides dynamic; model
 geometry, selection budgets and launch configurations stay static. Warmup
