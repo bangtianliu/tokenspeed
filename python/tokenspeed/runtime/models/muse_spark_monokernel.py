@@ -18,21 +18,23 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Muse Spark decode monokernel seam.
+"""Muse Spark decode monokernel seam (``docs/design/monokernel.md``).
 
-With ``--decode-monokernel``, each eligible decoder layer of a decode step of
-one request runs as one persistent launch per TP8 rank from
-``tokenspeed_kernel.ops.model.muse_spark.monokernel``. The model touches this module in four
-places:
+With ``--decode-monokernel``, the model builds every decoder layer from
+``MuseSparkMonokernelDecoderLayer`` (:class:`MuseSparkMonokernelLayer`
+before the regular layer class). A decode step that the kernels serve runs
+layers 1 to 60 as one persistent launch each per TP8 rank, from
+``tokenspeed_kernel.ops.model.muse_spark.monokernel``:
 
-* after loading, :func:`enable_decode_monokernels` packs the layers into
-  ``model.monokernels`` (:class:`MuseSparkMonokernels`);
-* before cache sizing and graph capture, :meth:`MuseSparkMonokernels.prepare`
-  allocates the mailbox scratch on the Iris symmetric heap;
-* each forward asks :meth:`MuseSparkMonokernels.plan` once for a
-  :class:`MonokernelStep`, or None for the regular path;
-* the layer loop runs ``step.layer(i)`` in place of layer ``i`` where it is
-  not None, and calls ``step.finish()`` after the loop.
+* after loading, :func:`enable_decode_monokernels` packs each layer's launch;
+  every layer but the first and the last must have one;
+* when the Iris collectives are prepared, before cache sizing and graph
+  capture, :func:`prepare_monokernel_state` gives the layers and the model
+  one :class:`MuseSparkMonokernelState` (the mailbox scratch on the Iris
+  symmetric heap);
+* the model calls ``start_step()`` before its layers and ``finish_step()``
+  after them, and asks :meth:`MuseSparkMonokernelState.serves_taps` whether
+  the launches store a draft's taps.
 
 A step serves one token row, or the rows of a speculative verify (the
 request's draft tokens, one row each; row ``t`` has length ``seq - rows + t +
@@ -54,7 +56,9 @@ FP32 residual and the whole BF16 attention input of the next layer (normed by
 that layer's input norm). The regular layers hand over the whole residual
 row. So the first launch of a run of fused layers reads its slice of that
 row, and the last one gathers the 8 slices back into a whole row for the
-regular layer after it. Layers 0 and 61 keep the regular path.
+regular layer after it. Layers 0 and 61 keep the regular code: a forward
+mixes them with the launches, which the design doc allows for a model's
+boundary layers.
 """
 
 from __future__ import annotations
@@ -82,7 +86,12 @@ from tokenspeed_kernel.ops.model.muse_spark.monokernel import (
 from tokenspeed.runtime.distributed.comm_ops import all_to_all_single
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
-from tokenspeed.runtime.models.decode_monokernel import coverage
+from tokenspeed.runtime.models.monokernel import (
+    NO_KERNEL,
+    MonokernelLayer,
+    MonokernelState,
+    unserved_error,
+)
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
@@ -136,7 +145,6 @@ OTHER_SHAPES = "model dimensions other than the kernel's"
 OTHER_CONSTANTS = "model constants other than the kernel's"
 NOT_BF16 = "a dense projection or norm gain is not BF16"
 NOT_SUPPORTED_EXPERTS = "the routed experts do not run a gluon MXFP4 kernel"
-NO_KERNEL = "no monokernel for this platform"
 OTHER_KV = (
     "the KV cache is neither BF16 nor FP8 e4m3 (--kv-cache-dtype): the kernels "
     "read those"
@@ -414,16 +422,58 @@ def projection_hand_off(
     )
 
 
-class MonokernelSteps:
-    """Model-wide monokernel state: the mailbox scratch on the Iris symmetric
-    heap, the heap bases of the TP8 group and the step counter."""
+def hands_whole_rows(
+    index: int, served, tapped: frozenset[int], store_taps: bool
+) -> bool:
+    """Whether layer ``index``'s launch stores whole residual rows on every
+    rank (no gather after it), rather than this rank's owned columns for the
+    next launch: when the next layer keeps the regular code (``served``: the
+    launching layers), or when the model's regular capture of a draft's tap
+    (``tapped``: the layers whose entering residual a draft reads) reads the
+    whole rows entering it, which it does unless the launches store the
+    taps (``store_taps``)."""
+    return index + 1 not in served or (index + 1 in tapped and not store_taps)
+
+
+def row_lengths(
+    seq_lens: torch.Tensor, row_offsets: torch.Tensor, requests: int, chain: int
+) -> torch.Tensor:
+    """Each row's length from a step's ``seq_lens`` (each request's length
+    after the step): ``seq - chain + t + 1`` for row ``t`` of a request of
+    ``chain`` rows. ``row_offsets`` is ``arange(1 - MAX_ROWS, 1)``."""
+    if chain == 1:
+        return seq_lens[:requests]
+    offsets = row_offsets[MAX_ROWS - chain :]
+    return (seq_lens[:requests, None] + offsets[None, :]).reshape(-1)
+
+
+class MuseSparkMonokernelState(MonokernelState):
+    """The state that all Muse Spark layer launches of a backbone share.
+
+    Beyond :class:`MonokernelState`, the mailbox scratch lives on the Iris
+    symmetric heap (the ranks write each other's), and the state holds the
+    heap bases of the TP8 group, the q | k | v hand-off between launches, the
+    draft's taps, and the stuck-poll record. Within a step it holds the owned
+    residual columns that the last launch wrote, while the next layer
+    launches too.
+
+    Args:
+        fused: The packed launch of each served layer, by layer index.
+        group: The TP8 device process group.
+        cpu_group: Its CPU (gloo) twin.
+        rank: This process's rank in ``group``.
+        taps: The layers whose entering residual a draft reads (the model's
+            ``layers_to_capture``). When the layer before each launches, the
+            launches store them (:meth:`serves_taps`).
+    """
 
     def __init__(
         self,
+        fused: dict[int, FusedDecodeLayer],
         group: dist.ProcessGroup,
+        cpu_group: dist.ProcessGroup,
         rank: int,
-        scratch_pairs: int,
-        tap_slots: int,
+        taps: list[int],
     ) -> None:
         from tokenspeed_kernel.ops.communication._iris import (
             MIN_HEAP_BYTES,
@@ -432,11 +482,27 @@ class MonokernelSteps:
         )
 
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        # The scratch is the Iris heap's (below), not a device buffer.
+        super().__init__(device, 0)
+        self.fused = fused
+        self.cpu_group = cpu_group
+        # The layers whose entering residual a draft reads.
+        self.tapped = frozenset(taps)
+        ordered = sorted(taps)
+        # The draft taps the launches store, by captured layer: its slot in
+        # ``taps``. Empty when some captured layer follows a layer without a
+        # launch (the regular capture then serves them all).
+        self.tap_slots: dict[int, int] = (
+            {t: i for i, t in enumerate(ordered)}
+            if ordered and all(t - 1 in fused for t in ordered)
+            else {}
+        )
         context = get_or_create_context(heap_size=MIN_HEAP_BYTES)
         iris_group = IrisGroup(context, group, rank, device)
         # Nothing clears the scratch: the tags make old pairs stale. Every
         # layer's plan lays the regions out alike (layer.layer_plan), so one
         # scratch serves both kinds of layer.
+        scratch_pairs = max(f.scratch_pairs for f in fused.values())
         self.scratch = context.zeros((scratch_pairs,), dtype=torch.int64)
         # Where a launch's poll that gives up writes what it waited for
         # before the trap: a file per rank with a record directory (it
@@ -454,103 +520,80 @@ class MonokernelSteps:
         # the layout of the concatenated captures (row, tap, column). The
         # launch before a captured layer stores it on every rank.
         self.taps: torch.Tensor | None = (
-            context.zeros((MAX_ROWS, tap_slots, HIDDEN), dtype=torch.bfloat16)
-            if tap_slots
+            context.zeros((MAX_ROWS, len(self.tap_slots), HIDDEN), dtype=torch.bfloat16)
+            if self.tap_slots
             else None
         )
         self.bases = iris_group.bases.to(device)
         # The q | k | v projection a launch hands to the next one (past one
-        # row, between two fused layers): launch ``i`` writes copy
+        # row, between two launching layers): launch ``i`` writes copy
         # ``(i + 1) & 1`` at its end, launch ``i + 1`` reads it at its start.
         self.proj = torch.zeros(
             (2, MAX_ROWS, MUSE_SPARK_PROJ_WORDS), dtype=torch.int32, device=device
         )
-        # The launches' tag base: it moves once per forward, inside the graph.
-        self.step = torch.zeros(1, dtype=torch.int32, device=device)
         # Row t of a request of c rows is c - 1 - t tokens short of the
-        # request's length: the last c values (MonokernelStep._row_lengths),
-        # made once instead of an arange every step.
+        # request's length: the last c values (row_lengths), made once
+        # instead of an arange every step.
         self.row_offsets = torch.arange(
             1 - MAX_ROWS, 1, dtype=torch.int32, device=device
         )
         iris_group.finish_prepare()
-
-    def advance(self) -> None:
-        """Give the next forward's launches a new tag (graph safe)."""
-        self.step.add_(1)
-
-
-class MuseSparkMonokernels:
-    """The decode monokernels of one Muse Spark backbone, packed after loading.
-
-    Attributes:
-        layers: The backbone's decoder layers.
-        fused: The packed launch of each served layer, by layer index.
-        unserved: The reasons of each layer without a launch, by layer index.
-            Those layers keep the regular path.
-        steps: The mailbox scratch, the heap bases and the step counter, from
-            :meth:`prepare` (None before it).
-        cpu_group: The TP8 group's CPU (gloo) process group, from
-            :meth:`prepare` (None before it).
-        compiled: The ``(layer index, rows, whole_rows)`` launches compiled on
-            every rank.
-        launches: The ``(rows, chain)`` of the launches compiled, for
-            decoding stuck-poll records.
-        tap_slots: The draft taps the launches store, by captured layer: its
-            slot in ``steps.taps``. Empty when some captured layer follows a
-            layer without a launch (the regular capture then serves them all).
-    """
-
-    def __init__(self, model: torch.nn.Module) -> None:
-        self.layers = model.layers
-        self.group = model.mapping.attn.tp_group
-        self.fused: dict[int, FusedDecodeLayer] = {}
-        self.unserved: dict[int, list[str]] = {}
-        common = model_reasons(model.config, model.mapping)
-        for index in range(len(self.layers)):
-            prepared = common or prepare_layer(model, index)
-            if isinstance(prepared, FusedDecodeLayer):
-                self.fused[index] = prepared
-            else:
-                self.unserved[index] = prepared
-                # Free an EP8 layer's expert slices that no launch reads.
-                self.layers[index].mlp.monokernel_experts = None
-        self.steps: MonokernelSteps | None = None
-        self.cpu_group: dist.ProcessGroup | None = None
+        # The (layer index, rows, whole_rows) launches compiled on every rank.
         self.compiled: set[tuple[int, int, bool]] = set()
+        # The (rows, chain) of the launches compiled, for decoding stuck-poll
+        # records.
         self.launches: set[tuple[int, int]] = set()
-        self.tap_slots: dict[int, int] = {}
+        # The current step's values; start_step resets them.
+        # Whether the launches store this step's taps.
+        self.store_taps = False
+        # The owned residual columns that the last launch wrote, while the
+        # next layer launches too.
+        self.owned: torch.Tensor | None = None
+        # Each row's length, by cache group (made once per step).
+        self.seq_lens: dict[int, torch.Tensor] = {}
+        self.write_stuck_sidecar()
+        atexit.register(self.report_stuck)
 
-    def prepare(
-        self,
-        group: dist.ProcessGroup,
-        cpu_group: dist.ProcessGroup,
-        rank: int,
-        taps: list[int],
-    ) -> None:
-        """Allocate the shared state on the Iris heap of ``group`` (the TP8
-        device process group; ``cpu_group`` its CPU twin, ``rank`` this
-        process's rank in it). ``taps`` are the layers whose entering
-        residual a draft reads (the model's ``layers_to_capture``): when the
-        layer before each is fused, the launches store them (see
-        :meth:`MonokernelStep.serves_taps`). Call once, before graph
-        capture."""
-        if self.steps is None:
-            scratch_pairs = max(f.scratch_pairs for f in self.fused.values())
-            ordered = sorted(taps)
-            if ordered and all(t - 1 in self.fused for t in ordered):
-                self.tap_slots = {t: i for i, t in enumerate(ordered)}
-            self.steps = MonokernelSteps(
-                group, rank, scratch_pairs, len(self.tap_slots)
-            )
-            self.cpu_group = cpu_group
-            self.write_stuck_sidecar()
-            atexit.register(self.report_stuck)
+    def start_step(self) -> None:
+        super().start_step()
+        self.store_taps = False
+        self.owned = None
+        self.seq_lens = {}
+
+    def serves_taps(self, rows: int, ctx: ForwardContext) -> bool:
+        """Whether this step's launches store every tap: the model then skips
+        its captures and hands the draft :meth:`tap_rows`. The model asks
+        before its first layer. A capture sink reads each tap during the
+        forward, before the collectives that order the launches' stores: it
+        keeps the regular capture."""
+        self.store_taps = (
+            bool(self.tap_slots)
+            and ctx.target_capture_sink is None
+            and takes_monokernels(rows, ctx)
+        )
+        return self.store_taps
+
+    def tap_rows(self, rows: int) -> torch.Tensor:
+        """The taps the launches stored: BF16 ``[rows, taps * 8192]``, the
+        concatenated captures."""
+        return self.taps[:rows].view(rows, -1)
+
+    def row_lengths(
+        self, group_id: int, seq_lens: torch.Tensor, requests: int, chain: int
+    ) -> torch.Tensor:
+        """Each row's length from the step's ``seq_lens`` (each request's
+        length after the step): ``seq - chain + t + 1`` for row ``t`` of a
+        request."""
+        lengths = self.seq_lens.get(group_id)
+        if lengths is None:
+            lengths = row_lengths(seq_lens, self.row_offsets, requests, chain)
+            self.seq_lens[group_id] = lengths
+        return lengths
 
     def write_stuck_sidecar(self) -> None:
         """Describe the launches next to a file-backed stuck-poll record (its
         ``.json``), for decoding the file after the process died."""
-        path = self.steps.stuck.path
+        path = self.stuck.path
         if path is None:
             return
         side = {
@@ -564,7 +607,7 @@ class MuseSparkMonokernels:
     def report_stuck(self) -> None:
         """At exit: log the stuck polls the launches recorded, if any; else
         remove a record file and its sidecar."""
-        record = self.steps.stuck
+        record = self.stuck
         if record.any():
             for line in describe_muse_spark_stuck(
                 record, self.fused, sorted(self.launches)
@@ -576,94 +619,66 @@ class MuseSparkMonokernels:
         if path is not None and os.path.exists(f"{path}.json"):
             os.remove(f"{path}.json")
 
-    def plan(
-        self, rows: int, ctx: ForwardContext, taps: list[int]
-    ) -> MonokernelStep | None:
-        """This forward's step of ``rows`` token rows, or None when the
-        monokernels do not serve it (the regular path; see
-        :func:`takes_monokernels`). ``taps`` are the layers whose entering
-        residual a draft reads (the model's ``layers_to_capture``)."""
-        if self.steps is None or not takes_monokernels(rows, ctx):
+
+class MuseSparkMonokernelLayer(MonokernelLayer):
+    """The monokernel half of a Muse Spark decoder layer whose decode steps
+    run as one launch per TP8 rank (``--decode-monokernel``). The model's
+    ``MuseSparkMonokernelDecoderLayer`` puts it before the regular layer
+    class.
+
+    Every layer of the backbone is of that class. The first and the last
+    layer keep the regular code (:data:`BOUNDARY_LAYER`): they hand over to
+    the embedding and to the LM head, and their experts are BF16. A launch
+    takes and returns the regular layer's boundary, the whole FP32 residual
+    rows and the next layer's BF16 attention input, except between two
+    launches: there the residual stays as each rank's owned columns in the
+    state (:attr:`MuseSparkMonokernelState.owned`), and the residual rows
+    the layer returns are its input, unchanged.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.layer_id: int = self.comm_manager.layer_id
+        # This layer's packed launch, set after loading by
+        # enable_decode_monokernels. None for a boundary layer.
+        self.fused: FusedDecodeLayer | None = None
+
+    def launch_chain(self, rows: int, ctx: ForwardContext) -> int | None:
+        if self.fused is None or not takes_monokernels(rows, ctx):
             return None
-        # A capture sink reads each tap during the forward, before the
-        # collectives that order the launches' stores: it keeps the regular
-        # capture.
-        store_taps = bool(self.tap_slots) and ctx.target_capture_sink is None
-        return MonokernelStep(self, rows, ctx.bs, taps, store_taps)
+        return rows // ctx.bs
 
-
-class MonokernelStep:
-    """One forward that the monokernels serve."""
-
-    def __init__(
+    def _decode(
         self,
-        monokernels: MuseSparkMonokernels,
-        rows: int,
-        requests: int,
-        taps: list[int],
-        store_taps: bool,
-    ) -> None:
-        self._monokernels = monokernels
-        self._rows = rows
-        self._requests = requests
-        # Each request's consecutive token rows.
-        self._chain = rows // requests
-        self._taps = frozenset(taps)
-        self._store_taps = store_taps
-        # The owned residual columns that the last launch wrote, while the
-        # next layer is fused too.
-        self._owned: torch.Tensor | None = None
-        # Each row's length, by cache group (computed once per forward).
-        self._seq_lens: dict[int, torch.Tensor] = {}
-
-    def layer(self, index: int) -> Callable | None:
-        """The launch that replaces decoder layer ``index``, with the layer
-        loop's arguments, or None when the layer keeps the regular path."""
-        if index not in self._monokernels.fused:
-            return None
-        return functools.partial(self._run, index)
-
-    def serves_taps(self) -> bool:
-        """Whether the launches store every tap of this forward: the model
-        then skips its captures and hands the draft :meth:`tap_rows`."""
-        return self._store_taps
-
-    def tap_rows(self) -> torch.Tensor:
-        """The taps the launches stored: BF16 ``[rows, taps * 8192]``, the
-        concatenated captures."""
-        taps = self._monokernels.steps.taps
-        return taps[: self._rows].view(self._rows, -1)
-
-    def finish(self) -> None:
-        """End the forward: give the next forward's launches a new tag."""
-        self._monokernels.steps.advance()
-
-    def _run(
-        self,
-        index: int,
+        chain: int,
         *,
+        positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        attention_input: torch.Tensor,
         ctx: ForwardContext,
+        attention_input: torch.Tensor,
+        next_input_layernorm: torch.nn.Module | None,
+        owned_global_rows: int | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run layer ``index``'s launch. Returns ``(residual, next attention
+        """Run the layer's launch. Returns ``(residual, next attention
         input)`` as the regular layer does: the whole residual rows when the
-        next layer keeps the regular path or a draft taps it, else the input
-        rows unchanged (the next launch reads the owned columns this one
-        wrote)."""
-        monokernels = self._monokernels
-        layer, fused, steps = (
-            monokernels.layers[index],
-            monokernels.fused[index],
-            monokernels.steps,
-        )
+        next layer keeps the regular code or a draft's regular capture taps
+        it, else the input rows unchanged (the next launch reads the owned
+        columns this one wrote)."""
+        if owned_global_rows is not None:
+            # The owned-row path starts at _MUSE_OWNED_MIN_ROWS rows, far past
+            # a launch's MAX_ROWS.
+            raise RuntimeError("Muse Spark monokernel: an owned-row forward")
+        state = self.monokernel_state
+        index, fused = self.layer_id, self.fused
+        served = state.fused
         rank = fused.weights.rank
-        rows = self._rows
-        if self._owned is None:
+        rows = hidden_states.shape[0]
+        requests = rows // chain
+        if state.owned is None:
             h = hidden_states[:rows, rank * OWNED : (rank + 1) * OWNED].contiguous()
         else:
-            h = self._owned
-        attn = layer.self_attn
+            h = state.owned
+        attn = self.self_attn
         group_id = attn.attn.group_id
         view = ctx.attn_backend.group_view(group_id, ctx.bs)
         if view.kernel_page_size != PAGE_SIZE:
@@ -672,7 +687,7 @@ class MonokernelStep:
                 f"the kernel reads {PAGE_SIZE}"
             )
         k_cache, v_cache = ctx.token_to_kv_pool.get_kv_buffer(
-            layer.comm_manager.layer_id
+            self.comm_manager.layer_id
         )
         leaf = ctx.attn_backend.leaves[group_id]
         slot = ctx.attn_backend.write_locations(attn.attn, ctx.forward_mode)
@@ -681,11 +696,7 @@ class MonokernelStep:
             if attn.rotary_emb is not None
             else attn.nope_cos_sin_cache
         )
-        # The next layer keeps the regular path, or a regular capture of a
-        # draft's tap reads the whole rows entering it: the launch stores
-        # whole residual rows on every rank (no gather).
-        tapped = index + 1 in self._taps and not self._store_taps
-        whole_rows = index + 1 not in monokernels.fused or tapped
+        whole_rows = hands_whole_rows(index, served, state.tapped, state.store_taps)
         h_out = h.new_empty(rows, HIDDEN if whole_rows else OWNED)
         a_out = attention_input.new_empty(rows, HIDDEN)
         operands = dict(
@@ -693,93 +704,88 @@ class MonokernelStep:
             a=attention_input[:rows],
             h_out=h_out,
             a_out=a_out,
-            seq_len=self._row_lengths(group_id, leaf.forward_decode_metadata.seq_lens),
+            seq_len=state.row_lengths(
+                group_id, leaf.forward_decode_metadata.seq_lens, requests, chain
+            ),
             slot=slot[:rows],
-            page_table=view.page_table[: self._requests],
+            page_table=view.page_table[:requests],
             k_cache=k_cache.view(-1, 2, 64),
             v_cache=v_cache.view(-1, 2, 64),
             cos_sin=cos_sin,
-            scratch=steps.scratch,
-            step=steps.step,
-            peer_bases=steps.bases,
-            stuck_rec=steps.stuck.tensor,
+            scratch=state.scratch,
+            step=state.step[:1],
+            peer_bases=state.bases,
+            stuck_rec=state.stuck.tensor,
             layer_index=index,
-            chain=self._chain,
+            chain=chain,
             whole_rows=whole_rows,
             tap=None,
             tap_slot=None,
-            # The next fused layer's launch: past one row this launch ends
-            # with its q | k | v projection (and that launch starts at its
-            # attention); for one row it warms its QKVG weights into the MALL.
-            warm_next=monokernels.fused.get(index + 1),
+            # The next launching layer: past one row this launch ends with its
+            # q | k | v projection (and that launch starts at its attention);
+            # for one row it warms its QKVG weights into the MALL.
+            warm_next=served.get(index + 1),
         )
         operands["proj_in"], operands["proj_out"] = projection_hand_off(
-            index, rows, monokernels.fused, steps.proj
+            index, rows, served, state.proj
         )
-        slot_of_next = monokernels.tap_slots.get(index + 1)
-        if self._store_taps and slot_of_next is not None:
-            operands["tap"] = steps.taps
+        slot_of_next = state.tap_slots.get(index + 1)
+        if state.store_taps and slot_of_next is not None:
+            operands["tap"] = state.taps
             operands["tap_slot"] = slot_of_next
         # A forward with a capture sink and one without differ in whole_rows
         # before a tapped layer: each variant compiles on every rank first.
-        if (index, rows, whole_rows) not in monokernels.compiled:
+        if (index, rows, whole_rows) not in state.compiled:
             # A launch traps when its peers' values do not come within about
             # a minute, and a first launch compiles for longer on some ranks
             # than on others: every rank compiles, then the ranks meet.
             muse_spark_layer_decode(fused, compile_only=True, **operands)
-            dist.barrier(group=monokernels.cpu_group)
-            monokernels.compiled.add((index, rows, whole_rows))
-            if (rows, self._chain) not in monokernels.launches:
-                monokernels.launches.add((rows, self._chain))
-                monokernels.write_stuck_sidecar()
+            dist.barrier(group=state.cpu_group)
+            state.compiled.add((index, rows, whole_rows))
+            if (rows, chain) not in state.launches:
+                state.launches.add((rows, chain))
+                state.write_stuck_sidecar()
         muse_spark_layer_decode(fused, compile_only=False, **operands)
         if whole_rows:
-            self._owned = None
+            state.owned = None
             return h_out, a_out
-        self._owned = h_out
+        state.owned = h_out
         return hidden_states, a_out
-
-    def _row_lengths(self, group_id: int, seq_lens: torch.Tensor) -> torch.Tensor:
-        """Each row's length from the step's ``seq_lens`` (each request's
-        length after the step): ``seq - chain + t + 1`` for row ``t`` of a
-        request."""
-        lengths = self._seq_lens.get(group_id)
-        if lengths is None:
-            n = self._requests
-            if self._chain == 1:
-                lengths = seq_lens[:n]
-            else:
-                offsets = self._monokernels.steps.row_offsets[MAX_ROWS - self._chain :]
-                lengths = (seq_lens[:n, None] + offsets[None, :]).reshape(-1)
-            self._seq_lens[group_id] = lengths
-        return lengths
 
 
 def enable_decode_monokernels(model: torch.nn.Module) -> None:
-    """Pack ``model``'s (a ``MuseSparkModel``) decode monokernels into
-    ``model.monokernels`` when ``--decode-monokernel`` is set, and report the
-    layers that keep the regular path, with the reasons.
+    """Pack each launching layer of ``model`` (a ``MuseSparkModel`` built
+    with the monokernel layer class) after loading.
+
+    Every layer but the first and the last must have a launch: the switch
+    never serves a layer without its kernel.
 
     Raises:
-        ValueError: No layer has a monokernel.
+        ValueError: A layer other than a boundary layer cannot be packed.
     """
-    if not global_server_args_dict["decode_monokernel"]:
-        return
-    monokernels = MuseSparkMonokernels(model)
+    layers = model.layers
+    unserved: dict[int, list[str]] = {}
+    common = model_reasons(model.config, model.mapping)
+    for index, layer in enumerate(layers):
+        prepared = common or prepare_layer(model, index)
+        if isinstance(prepared, FusedDecodeLayer):
+            layer.fused = prepared
+            continue
+        if prepared != [BOUNDARY_LAYER]:
+            unserved[index] = prepared
+        # Free an EP8 layer's expert slices that no launch reads.
+        layer.mlp.monokernel_experts = None
     name = type(model).__name__
-    warning = coverage(
-        name, len(monokernels.layers), monokernels.unserved, required=True
-    )
-    if warning is not None:
-        logger.warning(warning)
-    model.monokernels = monokernels
+    if unserved:
+        raise ValueError(unserved_error(name, unserved))
+    served = sum(layer.fused is not None for layer in layers)
     logger.info(
-        f"Decode monokernel: {len(monokernels.fused)} of {len(monokernels.layers)} "
-        f"{name} layers"
+        f"Decode monokernel: {served} of {len(layers)} {name} layers (the first "
+        "and the last keep the regular code)"
     )
     slices = [
         t
-        for layer in monokernels.layers
+        for layer in layers
         if layer.mlp.monokernel_experts is not None
         for t in layer.mlp.monokernel_experts
     ]
@@ -791,15 +797,39 @@ def enable_decode_monokernels(model: torch.nn.Module) -> None:
         )
 
 
+def prepare_monokernel_state(
+    model: torch.nn.Module,
+    group: dist.ProcessGroup,
+    cpu_group: dist.ProcessGroup,
+    rank: int,
+) -> None:
+    """Give ``model``'s launching layers and the model one
+    :class:`MuseSparkMonokernelState` on the Iris heap of ``group`` (the TP8
+    device process group; ``cpu_group`` its CPU twin, ``rank`` this
+    process's rank in it). Call once, after the Iris collectives are
+    prepared and before graph capture."""
+    if model.monokernel_state is not None:
+        return
+    fused = {i: layer.fused for i, layer in enumerate(model.layers) if layer.fused}
+    state = MuseSparkMonokernelState(
+        fused, group, cpu_group, rank, list(model.layers_to_capture)
+    )
+    for index in fused:
+        model.layers[index].monokernel_state = state
+    model.monokernel_state = state
+
+
 __all__ = [
     "MAX_ROWS",
-    "MonokernelStep",
-    "MonokernelSteps",
-    "MuseSparkMonokernels",
+    "MuseSparkMonokernelLayer",
+    "MuseSparkMonokernelState",
     "enable_decode_monokernels",
+    "hands_whole_rows",
     "model_reasons",
     "prepare_ep8_experts",
     "prepare_layer",
+    "prepare_monokernel_state",
     "projection_hand_off",
+    "row_lengths",
     "takes_monokernels",
 ]
