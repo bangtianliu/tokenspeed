@@ -55,6 +55,7 @@ from tokenspeed.runtime.models.dflash2 import (
     _grouped_conv,
     _score_edges,
 )
+from tokenspeed.runtime.models.monokernel import MonokernelState
 
 _CUDA_ONLY = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required"
@@ -200,7 +201,7 @@ def test_block_drafter_declares_only_its_sliding_mask(
 def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
     drafter = DFlash2.__new__(DFlash2)
     drafter.model = SimpleNamespace(
-        config=SimpleNamespace(vocab_size=32), fp8_head=None, monokernels=None
+        config=SimpleNamespace(vocab_size=32), fp8_head=None, monokernel_state=None
     )
     drafter.output_multiplier = 1.25
     drafter.final_logit_softcapping = 8.0
@@ -662,7 +663,9 @@ def test_preparing_the_draft_prepares_its_monokernels(fused_reduce_norm: bool) -
     model.fused_reduce_norm = object() if fused_reduce_norm else None
     if not fused_reduce_norm:
         model._prepare_fused_reduce_norm = lambda max_num_tokens: False
-    model.monokernels = SimpleNamespace(prepare=lambda *args: prepared.append(args))
+    model.monokernel_state = SimpleNamespace(
+        prepare=lambda *args: prepared.append(args)
+    )
     with (
         mock.patch.object(
             dflash2_model.process_group_manager,
@@ -679,3 +682,45 @@ def test_preparing_the_draft_prepares_its_monokernels(fused_reduce_norm: bool) -
         assert model.prepare_communication_runtime(64)
 
     assert prepared == [("device", "gloo", 3)]
+
+
+class _BlockState(MonokernelState):
+    """A draft monokernel state whose 'last launch' wrote ``normed``."""
+
+    def __init__(self, normed: torch.Tensor | None) -> None:
+        super().__init__(torch.device("cpu"), 0)
+        self.normed = normed
+        self.calls: list[str] = []
+
+    def start_step(self) -> None:
+        super().start_step()
+        self.calls.append("start")
+        self.lm_head_input = self.normed
+
+    def finish_step(self) -> torch.Tensor | None:
+        self.calls.append("finish")
+        return super().finish_step()
+
+
+class _AddOne(torch.nn.Module):
+    def forward(self, *, positions, hidden_states, ctx, residual):
+        return hidden_states + 1, residual
+
+
+@pytest.mark.parametrize("launched", [False, True])
+def test_a_draft_block_takes_the_last_launchs_final_norm(launched: bool) -> None:
+    """The draft's run_decoder brackets its layers with start_step and
+    finish_step; when the last launch ran the final norm, finish_step's
+    output is the block's, else the model's own final norm runs."""
+    model = DFlash2DraftModel.__new__(DFlash2DraftModel)
+    torch.nn.Module.__init__(model)
+    model.layers = torch.nn.ModuleList([_AddOne(), _AddOne()])
+    normed = torch.full((2, 3), 9.0)
+    model.monokernel_state = _BlockState(normed if launched else None)
+    model.final_norm = lambda hidden_states, residual: -hidden_states
+    hidden = torch.zeros(2, 3)
+
+    out = model.run_decoder(torch.zeros(2), hidden, torch.zeros(2, 3), None)
+
+    assert model.monokernel_state.calls == ["start", "finish"]
+    torch.testing.assert_close(out, normed if launched else -(hidden + 2))

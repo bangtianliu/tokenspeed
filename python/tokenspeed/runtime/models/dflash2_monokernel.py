@@ -20,25 +20,28 @@
 
 """DFlash2 draft monokernel seam (Muse Spark's draft on TP8).
 
-With ``--decode-monokernel``, a draft block forward of one request runs each
+With ``--decode-monokernel``, the draft model builds its layers from
+``DFlash2MonokernelDecoderLayer`` (:class:`DFlash2MonokernelLayer` before
+the regular layer class), and a draft block forward of one request runs each
 of the draft's layers as one launch of
-``tokenspeed_kernel.ops.model.muse_spark.monokernel.muse_spark_draft_layer_decode`` on every
-rank of the TP8 group. The draft model touches this module in three places:
+``tokenspeed_kernel.ops.model.muse_spark.monokernel.muse_spark_draft_layer_decode``
+on every rank of the TP8 group (``docs/design/monokernel.md``):
 
-* after loading, :func:`enable_draft_monokernels` packs the layers into
-  ``model.monokernels`` (:class:`DFlash2Monokernels`), or leaves it None
-  with the reasons logged;
-* ``prepare_communication_runtime`` calls :meth:`DFlash2Monokernels.prepare`,
-  which allocates the mailbox scratch on the Iris symmetric heap;
+* after loading, :func:`enable_draft_monokernels` packs every layer and gives
+  the layers and the model one :class:`DFlash2MonokernelState`, or leaves
+  the layers on their regular code with the reasons logged;
+* ``prepare_communication_runtime`` calls
+  :meth:`DFlash2MonokernelState.prepare`, which allocates the mailbox
+  scratch on the Iris symmetric heap;
+* the model's ``run_decoder`` calls ``start_step()`` before the layers and
+  takes the final norm's output, which the last launch writes, from
+  ``finish_step()``;
 * after a verify of one request, the drafter runs
-  :meth:`DFlash2Monokernels.write_context` in place of its context write
+  :meth:`DFlash2MonokernelState.write_context` in place of its context write
   (``fc`` and ``hidden_norm`` of the target's taps, then every layer's K and
   V of the verify rows into the draft cache);
-* the layer loop asks :meth:`DFlash2Monokernels.serves` whether the forward
-  takes the launches and runs :meth:`DFlash2Monokernels.forward` in place of
-  the layers when it does;
 * once the drafter is wired to the target's LM head,
-  :meth:`DFlash2Monokernels.enable_head` packs the draft head (the
+  :meth:`DFlash2MonokernelState.enable_head` packs the draft head (the
   vocabulary-parallel top 16 of each draft step and the candidate selector's
   scores) as one more launch, :class:`DraftHeadMonokernel`, which the
   drafter runs in place of its top-k and selector for one request. It keeps
@@ -73,6 +76,7 @@ from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.logits_processor import (
     should_apply_lm_head_quant_method,
 )
+from tokenspeed.runtime.models.monokernel import MonokernelLayer, MonokernelState
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
@@ -243,30 +247,19 @@ def mailbox_scratch(
     return scratch, bases
 
 
-class DraftMonokernelSteps:
-    """The draft launches' shared state: the mailbox scratch on the Iris
-    symmetric heap, the heap bases of the TP8 group and the step counter.
+class DFlash2MonokernelState(MonokernelState):
+    """The state that a DFlash2 draft's launches share: the layers' mailbox
+    scratch on the Iris symmetric heap and its heap bases, the context
+    write and the draft head with their own scratch, and the ordering marks
+    between them. Made when the layers are packed after loading;
+    :meth:`prepare` allocates the scratch.
 
     The draft keeps a scratch of its own: its tags (``step * 64 + layer +
     1``) would repeat the target's, whose step counter moves at a rate of
-    its own."""
-
-    def __init__(self, group: dist.ProcessGroup, rank: int, scratch_pairs: int) -> None:
-        self.scratch, self.bases = mailbox_scratch(group, rank, scratch_pairs)
-        # The launches' tag base: it moves once per forward, inside the graph.
-        self.step = torch.zeros(1, dtype=torch.int32, device=self.scratch.device)
-
-    def advance(self) -> None:
-        """Give the next forward's launches a new tag (graph safe)."""
-        self.step.add_(1)
-
-
-class DFlash2Monokernels:
-    """The draft monokernels of one DFlash2 draft model, packed after loading.
+    its own.
 
     Attributes:
         layers: The draft's decoder layers.
-        fused: The packed launch of each layer, in layer order.
         context: The packed context write, or None when it keeps the regular
             path.
         context_scratch: Its mailbox scratch, from :meth:`prepare`.
@@ -275,8 +268,8 @@ class DFlash2Monokernels:
             the block forward advances).
         final_gain: FP32 ``[1024]``: the final norm's gain of the rank's
             owned columns (the last launch runs the final norm).
-        steps: The mailbox scratch, the heap bases and the step counter, from
-            :meth:`prepare` (None before it).
+        bases: The TP8 group's heap bases, from :meth:`prepare` (None
+            before it: the layers keep their regular code).
         cpu_group: The TP8 group's CPU (gloo) process group, from
             :meth:`prepare` (None before it).
         device_group, rank: The TP8 device group and this process's rank in
@@ -292,18 +285,21 @@ class DFlash2Monokernels:
     def __init__(
         self,
         model: torch.nn.Module,
-        fused: list[FusedDecodeLayer],
+        scratch_pairs: int,
+        rank: int,
         context: FusedDecodeLayer | None,
     ) -> None:
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        # The scratch is the Iris heap's (prepare), not a device buffer.
+        super().__init__(device, 0)
         self.layers = model.layers
-        self.fused = fused
+        self.scratch_pairs = scratch_pairs
         self.context = context
         self.context_scratch: torch.Tensor | None = None
         self.context_pending = False
-        rank = fused[0].weights.rank
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         self.final_gain = model.norm.weight.data[own].float().contiguous()
-        self.steps: DraftMonokernelSteps | None = None
+        self.bases: torch.Tensor | None = None
         self.device_group: dist.ProcessGroup | None = None
         self.cpu_group: dist.ProcessGroup | None = None
         self.rank: int | None = None
@@ -315,12 +311,11 @@ class DFlash2Monokernels:
     def prepare(
         self, group: dist.ProcessGroup, cpu_group: dist.ProcessGroup, rank: int
     ) -> None:
-        """Allocate the shared state on the Iris heap of ``group`` (the TP8
-        device process group; ``cpu_group`` its CPU twin, ``rank`` this
-        process's rank in it). Call once, before graph capture."""
-        if self.steps is None:
-            scratch_pairs = max(f.scratch_pairs for f in self.fused)
-            self.steps = DraftMonokernelSteps(group, rank, scratch_pairs)
+        """Allocate the scratch on the Iris heap of ``group`` (the TP8 device
+        process group; ``cpu_group`` its CPU twin, ``rank`` this process's
+        rank in it). Call once, before graph capture."""
+        if self.bases is None:
+            self.scratch, self.bases = mailbox_scratch(group, rank, self.scratch_pairs)
             if self.context is not None:
                 self.context_scratch, _ = mailbox_scratch(
                     group, rank, self.context.scratch_pairs
@@ -329,81 +324,18 @@ class DFlash2Monokernels:
             self.cpu_group = cpu_group
             self.rank = rank
 
-    def serves(self, rows: int, ctx: ForwardContext) -> bool:
-        """Whether this forward runs the launches (:meth:`forward`) rather
-        than the layers."""
-        return self.steps is not None and takes_monokernels(rows, ctx)
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        ctx: ForwardContext,
-    ) -> torch.Tensor:
-        """Run every layer's launch on the block, as the layer loop and the
-        final norm would.
-
-        Args:
-            positions: The block rows' positions.
-            hidden_states: This rank's partial of the first layer's input.
-            residual: The residual entering the first layer.
-            ctx: The draft forward's context.
-
-        Returns:
-            The final norm's output, BF16 ``[rows, 8192]``.
-        """
-        steps = self.steps
-        backend = ctx.attn_backend
-        last = len(self.fused) - 1
-        positions = positions.to(torch.int32)
-        x, res = hidden_states, residual
-        for index, (layer, fused) in enumerate(zip(self.layers, self.fused)):
-            attn = layer.self_attn.attn
-            view = backend.group_view(attn.group_id, ctx.bs)
-            if view.kernel_page_size != PAGE_SIZE:
-                raise RuntimeError(
-                    f"DFlash2 draft monokernel: KV page size "
-                    f"{view.kernel_page_size}, the kernel reads {PAGE_SIZE}"
-                )
-            k_cache, v_cache = ctx.token_to_kv_pool.get_kv_buffer(attn.layer_id)
-            leaf = backend.leaves[attn.group_id]
-            out = torch.empty_like(x)
-            res_out = torch.empty_like(res)
-            operands = dict(
-                x=x,
-                residual=res,
-                residual_out=res_out,
-                out=None if index == last else out,
-                final_gain=self.final_gain if index == last else None,
-                normed=out if index == last else None,
-                # Every block row's length: the request's after the block.
-                seq_len=leaf.decode_seq_lens_buffer[:1],
-                positions=positions,
-                slots=backend.write_locations(attn, ctx.forward_mode)[:BLOCK_ROWS],
-                page_table=view.page_table[0],
-                k_cache=k_cache.view(-1, 1, k_cache.shape[-1]),
-                v_cache=v_cache.view(-1, 1, v_cache.shape[-1]),
-                cos_sin=layer.self_attn.rotary_emb.cos_sin_cache,
-                scratch=steps.scratch,
-                step=steps.step,
-                peer_bases=steps.bases,
-                layer_index=index,
-            )
-            if (index == last) not in self.compiled:
-                # A launch traps when its peers' values do not come within a
-                # few seconds, and a first launch compiles for longer on some
-                # ranks than on others: every rank compiles, then the ranks
-                # meet. The layers before the last share one binary.
-                muse_spark_draft_layer_decode(fused, compile_only=True, **operands)
-                dist.barrier(group=self.cpu_group)
-                self.compiled.add(index == last)
-            muse_spark_draft_layer_decode(fused, compile_only=False, **operands)
-            x, res = out, res_out
-        steps.advance()
-        self.block_pending = True
-        self.context_pending = False
-        return x
+    def finish_step(self) -> torch.Tensor | None:
+        """Give the next block's launches a new tag after a block that
+        launched, and return the final norm's output that the last launch
+        wrote (``lm_head_input``). The draft launches never move the step
+        counter themselves, so this moves it after every block that
+        launched (graph safe)."""
+        if self.launched:
+            self.step[:1].add_(1)
+            self.block_pending = True
+            self.context_pending = False
+        lm_head_input, self.lm_head_input = self.lm_head_input, None
+        return lm_head_input
 
     def serves_context(self, rows: int) -> bool:
         """Whether a context write of ``rows`` verify rows (decode rows only)
@@ -442,8 +374,8 @@ class DFlash2Monokernels:
             v_caches=tuple(v.view(-1, 1, v.shape[-1]) for _, v in caches),
             cos_sin=self.layers[0].self_attn.rotary_emb.cos_sin_cache,
             scratch=self.context_scratch,
-            step=self.steps.step,
-            peer_bases=self.steps.bases,
+            step=self.step[:1],
+            peer_bases=self.bases,
         )
         if not self.context_compiled:
             muse_spark_draft_context_decode(self.context, compile_only=True, **operands)
@@ -503,9 +435,92 @@ class DFlash2Monokernels:
             )
             return
         self.head = DraftHeadMonokernel(
-            fused, self.device_group, self.cpu_group, self.rank, self.steps.step
+            fused, self.device_group, self.cpu_group, self.rank, self.step[:1]
         )
         logger.info("Decode monokernel: the DFlash2 draft head (top 16 and selector)")
+
+
+class DFlash2MonokernelLayer(MonokernelLayer):
+    """The monokernel half of a DFlash2 draft layer whose block forwards run
+    as one launch per TP8 rank (``--decode-monokernel``). The draft model's
+    ``DFlash2MonokernelDecoderLayer`` puts it before the regular layer
+    class. Every layer of a packed draft launches, and the last launch also
+    runs the final norm (``lm_head_input``)."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # This layer's packed launch, set after loading by
+        # enable_draft_monokernels. None keeps the regular code.
+        self.fused: FusedDecodeLayer | None = None
+        # Whether the layer is the draft's last (its launch runs the final
+        # norm).
+        self.last = False
+
+    def launch_chain(self, rows: int, ctx: ForwardContext) -> int | None:
+        state = self.monokernel_state
+        if self.fused is None or state.bases is None:
+            return None
+        return BLOCK_ROWS if takes_monokernels(rows, ctx) else None
+
+    def _decode(
+        self,
+        chain: int,
+        *,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the layer's launch on the block. Takes this rank's partial of
+        the layer's input and the residual entering it, and returns the next
+        layer's and the residual. The last launch writes the final norm's
+        output to ``lm_head_input`` instead."""
+        state = self.monokernel_state
+        backend = ctx.attn_backend
+        attn = self.self_attn.attn
+        view = backend.group_view(attn.group_id, ctx.bs)
+        if view.kernel_page_size != PAGE_SIZE:
+            raise RuntimeError(
+                f"DFlash2 draft monokernel: KV page size "
+                f"{view.kernel_page_size}, the kernel reads {PAGE_SIZE}"
+            )
+        k_cache, v_cache = ctx.token_to_kv_pool.get_kv_buffer(attn.layer_id)
+        leaf = backend.leaves[attn.group_id]
+        out = torch.empty_like(hidden_states)
+        res_out = torch.empty_like(residual)
+        last = self.last
+        operands = dict(
+            x=hidden_states,
+            residual=residual,
+            residual_out=res_out,
+            out=None if last else out,
+            final_gain=state.final_gain if last else None,
+            normed=out if last else None,
+            # Every block row's length: the request's after the block.
+            seq_len=leaf.decode_seq_lens_buffer[:1],
+            positions=positions.to(torch.int32),
+            slots=backend.write_locations(attn, ctx.forward_mode)[:BLOCK_ROWS],
+            page_table=view.page_table[0],
+            k_cache=k_cache.view(-1, 1, k_cache.shape[-1]),
+            v_cache=v_cache.view(-1, 1, v_cache.shape[-1]),
+            cos_sin=self.self_attn.rotary_emb.cos_sin_cache,
+            scratch=state.scratch,
+            step=state.step[:1],
+            peer_bases=state.bases,
+            layer_index=self.layer_id,
+        )
+        if last not in state.compiled:
+            # A launch traps when its peers' values do not come within about
+            # a minute, and a first launch compiles for longer on some ranks
+            # than on others: every rank compiles, then the ranks meet. The
+            # layers before the last share one binary.
+            muse_spark_draft_layer_decode(self.fused, compile_only=True, **operands)
+            dist.barrier(group=state.cpu_group)
+            state.compiled.add(last)
+        muse_spark_draft_layer_decode(self.fused, compile_only=False, **operands)
+        if last:
+            state.lm_head_input = out
+        return out, res_out
 
 
 HEAD_NOT_SHARDED = "the LM head is quantized or not an exact 8-way vocabulary shard"
@@ -559,8 +574,8 @@ class DraftHeadMonokernel:
     their launches advance once a block forward, before the head runs (the
     head has its own scratch, so its tags never meet the layers'). The head
     therefore runs only after the layers' launches of the same forward
-    (:meth:`DFlash2Monokernels.forward` marks the block, the head takes the
-    mark); a head without them would repeat the last launch's tag.
+    (:meth:`DFlash2MonokernelState.finish_step` marks the block, the head
+    takes the mark); a head without them would repeat the last launch's tag.
 
     Attributes:
         fused: The packed head.
@@ -621,16 +636,15 @@ class DraftHeadMonokernel:
 
 
 def enable_draft_monokernels(model: torch.nn.Module) -> None:
-    """Pack ``model``'s (a ``DFlash2DraftModel``) draft monokernels into
-    ``model.monokernels`` when ``--decode-monokernel`` is set, or log why
-    the draft keeps the regular path."""
-    if not global_server_args_dict["decode_monokernel"]:
-        return
+    """Pack each layer of ``model`` (a ``DFlash2DraftModel`` built with the
+    monokernel layer class) after loading, and give the layers and the
+    model one :class:`DFlash2MonokernelState`; or log why the draft keeps
+    its regular code. A draft launches every layer or none."""
     name = type(model).__name__
     reasons = model_reasons(model)
     fused: list[FusedDecodeLayer] = []
+    rank = model.mapping.attn.tp_rank
     if not reasons:
-        rank = model.mapping.attn.tp_rank
         for layer in model.layers:
             prepared = prepare_muse_spark_draft_layer(
                 tensors=layer_tensors(layer), rank=rank, max_rows=BLOCK_ROWS
@@ -658,7 +672,14 @@ def enable_draft_monokernels(model: torch.nn.Module) -> None:
             f"Decode monokernel: the {name} context write keeps the regular path "
             f"({'; '.join(reasons)})"
         )
-    model.monokernels = DFlash2Monokernels(model, fused, context)
+    state = DFlash2MonokernelState(
+        model, max(f.scratch_pairs for f in fused), rank, context
+    )
+    for layer, prepared in zip(model.layers, fused):
+        layer.fused = prepared
+        layer.monokernel_state = state
+    model.layers[-1].last = True
+    model.monokernel_state = state
     logger.info(
         f"Decode monokernel: {len(fused)} of {len(fused)} {name} layers"
         + ("" if context is None else ", and the context write")
@@ -697,9 +718,9 @@ def context_tensors(model: torch.nn.Module) -> dict[str, torch.Tensor]:
 
 __all__ = [
     "BLOCK_ROWS",
-    "DFlash2Monokernels",
+    "DFlash2MonokernelLayer",
+    "DFlash2MonokernelState",
     "DraftHeadMonokernel",
-    "DraftMonokernelSteps",
     "enable_draft_monokernels",
     "head_reasons",
     "mailbox_scratch",

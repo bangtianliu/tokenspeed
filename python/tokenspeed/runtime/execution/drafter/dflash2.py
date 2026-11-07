@@ -161,8 +161,8 @@ class DFlash2(DFlash):
             dp_sampling_enabled=processor.dp_sampling_enabled,
             fp8_weight=self.model.fp8_head,
         )
-        monokernels = self.model.monokernels
-        if monokernels is not None and monokernels.steps is not None:
+        monokernels = self.model.monokernel_state
+        if monokernels is not None and monokernels.bases is not None:
             # --decode-monokernel: the top 16 and the selector of one
             # request's block as one launch.
             monokernels.enable_head(
@@ -183,7 +183,7 @@ class DFlash2(DFlash):
     ) -> None:
         """The context write, as one launch for one request's verify rows
         under --decode-monokernel."""
-        monokernels = self.model.monokernels
+        monokernels = self.model.monokernel_state
         if (
             monokernels is not None
             and decode_only
@@ -229,7 +229,7 @@ class DFlash2(DFlash):
         hidden_states = draft_hidden[:, 1:, :]
         batch_size, num_steps, _ = hidden_states.shape
         top_k = self.selector_top_k
-        monokernels = self.model.monokernels
+        monokernels = self.model.monokernel_state
         if (
             monokernels is not None
             and monokernels.head is not None
