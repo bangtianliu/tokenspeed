@@ -59,14 +59,17 @@ from tokenspeed.runtime.sampling.backends.base import (
 )
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
-from tokenspeed.runtime.sampling.sampling_params import _SAMPLING_EPS, _TOP_K_DISABLED
+from tokenspeed.runtime.sampling.sampling_params import (
+    _SAMPLING_EPS,
+    _TOP_K_DISABLED,
+    SamplingParams,
+)
 from tokenspeed.runtime.sampling.tree_verify import accepted_path_rows
 from tokenspeed.runtime.sampling.utils import gather_token_logprobs, nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.sampled_vocab_shard import SampledVocabShard
-    from tokenspeed.runtime.sampling.sampling_params import SamplingParams
     from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ, TreeVerifyBatch
 
 
@@ -111,6 +114,19 @@ _CUDA_GRAPH_VARIANT_SAMPLE_ROUTES = {
     CUDA_GRAPH_VARIANT_TRITON_TOP_P: _SAMPLE_ROUTE_GUMBEL_TOP_P,
     CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER: _SAMPLE_ROUTE_GUMBEL_NO_FILTER,
 }
+
+
+def _warmup_batch_sizes(max_bs: int, width: int) -> list[int]:
+    """One batch size of each specialization class of ``width`` rows a
+    request, up to ``max_bs``. Triton keys a runtime integer (the batch size,
+    the row count ``bs * width``) on whether it is 1 and whether it is a
+    multiple of 16, and the QRITA verify route switches at
+    ``_QRITA_VERIFY_MIN_ROWS`` rows: 1, 2 and 3 (the small classes), 15, 16
+    and 17 (around 16), the batches on both sides of the row switch, and
+    ``max_bs``."""
+    switch = -(-_QRITA_VERIFY_MIN_ROWS // width)  # the first batch at the switch
+    sizes = {1, 2, 3, 15, 16, 17, switch - 1, switch, switch + 1, max_bs}
+    return sorted(b for b in sizes if 1 <= b <= max_bs)
 
 
 class TritonSamplingBackend(SamplingBackend):
@@ -567,6 +583,103 @@ class TritonSamplingBackend(SamplingBackend):
         SamplingBackend.prepare_capture(
             self, bs=bs, num_tokens_per_req=num_tokens_per_req
         )
+
+    def warmup_eager(self, draft_q: DraftTreeQ | None) -> None:
+        """Compile every specialization the eager path can pick, before
+        serving. The decode graphs capture the top-k routes at TOPK_PAD 128,
+        but an eager step (prefill rows, or a step no graph replays) picks
+        TOPK_PAD 64 when every top_k is at most 64; each route, window width
+        and draft-q use is its own specialization, and the row count is a
+        runtime integer that Triton still specializes (1, a multiple of 16,
+        other) and that switches the QRITA verify route at 128 rows.
+        Unwarmed, the first such request compiles on the serving path
+        (seconds, on some ranks earlier than others).
+
+        Runs ``sample()`` for one-token rows and ``verify()`` at the verify
+        width (with ``draft_q``, the live draft distributions, when given and
+        speculative sampling is on), for each route and pad a request can
+        select, at one batch size of each such class (:func:`_warmup_batch_sizes`),
+        on slots 0 .. bs - 1, synchronizing after each batch as serving does
+        after each step.
+        Every attention-TP rank runs it at the same point of startup
+        (``sample()`` broadcasts). A later request resets its slot's pools in
+        ``prepare_step``, and verify only reads ``draft_q``.
+        """
+        device = self.config.device
+        vocab = self.config.vocab_size
+        max_bs = self.config.max_bs
+        widths = sorted({1, self.config.max_draft_tokens_per_req})
+        # The logits reach sample() / verify() in FP32 or BF16 (a BF16 LM head's
+        # own output): each dtype is a specialization. One buffer of FP32 bytes
+        # at the largest verify batch, viewed per dtype and sliced per case:
+        # the size of a full step's logits, which serving needs anyway.
+        logits_bytes = torch.zeros(
+            max_bs * widths[-1] * vocab * 4, dtype=torch.uint8, device=device
+        )
+        # Flat, so each batch's candidates are contiguous [bs, width] as a
+        # step's are (their strides reach the kernels as integers too).
+        candidates_buf = torch.zeros(
+            max_bs * widths[-1], dtype=torch.int32, device=device
+        )
+        offsets = torch.zeros(
+            self.config.max_req_pool_size + 1, dtype=torch.int32, device=device
+        )
+        draft_qs = [None]
+        if draft_q is not None and self.config.enable_speculative_sampling:
+            draft_qs.append(draft_q)
+        # (temperature, top_k, top_p): greedy (top_k 1), no filter, top-p,
+        # top-k at TOPK_PAD 64 and 128, with and without top-p.
+        params = (
+            (0.0, _TOP_K_DISABLED, 1.0),
+            (0.8, _TOP_K_DISABLED, 1.0),
+            (0.8, _TOP_K_DISABLED, 0.95),
+            (0.8, 20, 1.0),
+            (0.8, 20, 0.95),
+            (0.8, 100, 1.0),
+            (0.8, 100, 0.95),
+        )
+        for case, (temperature, top_k, top_p) in enumerate(params):
+            # Request ids of their own a case: a slot's pools reset when its
+            # rid changes, so each case samples with its own parameters, and
+            # any real request (another rid) resets its slot again.
+            rids = [f"warmup-{case}-{i}" for i in range(max_bs)]
+            sps = []
+            for rid in rids:
+                sp = SamplingParams(temperature=temperature, top_k=top_k, top_p=top_p)
+                sp.resolve_seed(rid)
+                sp.normalize(None)
+                sps.append(sp)
+            for width in widths:
+                for bs in _warmup_batch_sizes(max_bs, width):
+                    self.prepare_step(
+                        request_ids=rids[:bs],
+                        request_pool_indices=list(range(bs)),
+                        sampling_params_list=sps[:bs],
+                        num_tokens_per_req=width,
+                    )
+                    pool = torch.arange(bs, dtype=torch.int64, device=device)
+                    candidates = candidates_buf[: bs * width].view(bs, width)
+                    for dtype in (torch.float32, torch.bfloat16):
+                        logits = logits_bytes.view(dtype)[: bs * width * vocab]
+                        out = LogitsProcessorOutput(
+                            next_token_logits=logits.view(bs * width, vocab)
+                        )
+                        for q in draft_qs if width > 1 else [None]:
+                            info = SamplingBatchInfo(
+                                req_pool_indices=pool,
+                                valid_cache_lengths=offsets,
+                                vocab_size=vocab,
+                                device=device,
+                                draft_q=q,
+                            )
+                            if width == 1:
+                                self.sample(out, info)
+                            self.verify(out, info, candidates, tree=None)
+                    # A step's launches at a time, as serving syncs each step:
+                    # thousands queued without a sync crashed the host process
+                    # (gfx950, ~4700 verifies at max_bs 256; cause still open).
+                    torch.cuda.synchronize(device)
+        del logits_bytes, candidates_buf
 
     def cuda_graph_capture_variants(self, num_tokens_per_req: int) -> tuple[str, ...]:
         variants = (
