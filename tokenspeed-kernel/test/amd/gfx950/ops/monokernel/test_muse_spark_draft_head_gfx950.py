@@ -282,7 +282,9 @@ def test_the_head_scratch_query_matches_the_heads_plan():
     """A draft reserves the head's Iris scratch before the heap exists, from
     the boundary's query: it must equal what the prepared head allocates
     (its plan's pairs), and serve no other step count."""
-    from tokenspeed_kernel.ops.monokernel import muse_spark_draft_head_scratch_pairs
+    from tokenspeed_kernel.ops.model.muse_spark.monokernel import (
+        muse_spark_draft_head_scratch_pairs,
+    )
 
     # One request's steps, or two requests' (the head serves up to MAX_REQUESTS).
     for rows in (STEPS, draft_head.MAX_REQUESTS * STEPS):
