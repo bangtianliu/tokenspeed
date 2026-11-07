@@ -98,8 +98,13 @@ logger = logging.getLogger(__name__)
 
 # Token rows of one launch: a decode row a request, or a verify of up to 7
 # draft tokens (the DFlash2 drafters' block of 8) a request, for up to
-# MAX_REQUESTS requests: two requests' rows (16) a launch.
-MAX_REQUESTS = 2
+# MAX_REQUESTS requests. The kernels serve two requests' rows (16), but a
+# 2-request decode step took 10.6 ms on the 16-row launches against 10.0 ms
+# on the regular path with its fused layer boundaries (Muse Spark on TP8, 8
+# concurrent requests, --max-num-seqs 2, --prefill-decode-interval 384; the
+# per-step times the batch log reports): one request's rows only, until the
+# 16-row launch beats the regular path.
+MAX_REQUESTS = 1
 CHAIN_ROWS = 8  # a request's rows at most
 MAX_ROWS = MAX_REQUESTS * CHAIN_ROWS
 WORLD = 8

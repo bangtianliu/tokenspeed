@@ -123,8 +123,11 @@ SELECTOR_RANK = 256
 TOPK = 16
 STEPS = BLOCK_ROWS - 1  # the block's rows 1 .. 7 draft a token each
 CONTEXT_ROWS = 8  # one request's verify rows
-# Requests a launch serves: their rows one request after another.
-MAX_REQUESTS = 2
+# Requests a launch serves: their rows one request after another. The
+# kernels serve two requests, but the target serves one request a launch
+# (muse_spark_monokernel.MAX_REQUESTS), and a 2-request step is faster on the
+# regular path, so the draft serves one too.
+MAX_REQUESTS = 1
 # The rows each launch is packed for, which also size its Iris scratch (and
 # so the draft's heap reservation): up to MAX_REQUESTS requests' blocks,
 # draft steps and verify rows.

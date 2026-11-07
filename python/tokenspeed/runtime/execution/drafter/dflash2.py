@@ -173,7 +173,7 @@ class DFlash2(DFlash):
             )
         elif monokernels is not None:
             # --decode-monokernel: the top 16 and the selector of the blocks
-            # of up to two requests as one launch.
+            # of up to MAX_REQUESTS requests as one launch.
             monokernels.enable_head(
                 self.lm_head,
                 self.candidate_selector,
@@ -190,8 +190,8 @@ class DFlash2(DFlash):
         target_cache_locs: torch.Tensor,
         decode_only: bool = False,
     ) -> None:
-        """The context write, as one launch for the verify rows of up to two
-        requests under --decode-monokernel."""
+        """The context write, as one launch for the verify rows of up to
+        MAX_REQUESTS requests under --decode-monokernel."""
         monokernels = self.model.monokernel_state
         if (
             monokernels is not None

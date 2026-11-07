@@ -82,7 +82,7 @@ def _ctx(mode: ForwardMode, bs: int, rows: int) -> ForwardContext:
     )
 
 
-def test_decode_steps_of_up_to_two_requests_take_the_kernels() -> None:
+def test_decode_steps_of_up_to_max_requests_take_the_kernels() -> None:
     """A launch computes the rows of up to MAX_REQUESTS requests: a decode
     token each, or a speculative verify's tokens each, MAX_ROWS rows at
     most. Prefill, more requests and wider verifies keep the regular path."""
