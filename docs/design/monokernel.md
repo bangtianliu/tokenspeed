@@ -70,6 +70,27 @@ CUDA graph, after the forward's last fused layer. So no write from an earlier
 layer or step can satisfy a poll. All layers share the scratch buffer, and
 nothing clears it.
 
+**A tensor-parallel group runs one plan.** In a plan of several ranks, every
+rank runs the same stages, and a stage can put into another rank's copy of
+a peer region. The deadlock rule then holds across ranks: the earliest
+unfinished stage on any rank reads only regions that earlier stages on every
+rank wrote, and all CTAs of all ranks are resident. The scratch lives on a
+symmetric heap, so a region has the same offset on every rank. A rank can
+start its next launch while another still reads this one, but not two
+launches ahead, because finishing the next launch needs every rank's part of
+it. So a peer region holds two copies, which the launches pick by a parity
+that alternates on every rank. Puts and polls of a peer region use system
+scope: another GPU's store does not update the local caches.
+
+**Bulk values go as plain words and one flag.** A tagged pair carries 32 bits
+of payload in 64. A producer of many values per task may instead store them
+as plain words past the caches, wait until its stores land, and then put one
+tagged flag. The consumer polls the flag and then loads the words past the
+caches. The tag still guards reuse: a word is read only after this launch's
+flag. It pays when the consumers read many bytes. When the producer's wait
+for its remote stores is on the critical path and the consumers read little,
+tagged pairs stay faster.
+
 **A step starts and ends in the model.** One step is one forward. The model
 calls `start_step()` on its monokernel state before its layers and
 `finish_step()` after them. The values that cross layers within a step live in
@@ -87,9 +108,20 @@ after a short sleep. A retry loads only the pairs whose tag differs, so a wide
 poll sees its last pairs one round trip after they land.
 
 **A stuck poll stops the process.** A poll stops the kernel with an error
-after a bounded number of retries, which take far longer than a launch. A
-deadlock or a missing producer then gives a GPU error and the process stops,
-instead of a hang.
+after a bounded wait, which is far longer than a launch. A deadlock or a
+missing producer then gives a GPU error and the process stops, instead of a
+hang. The bound is time (about a minute), not a retry count: in a
+tensor-parallel group, a rank whose host submits a launch seconds late must
+only stall its peers. Given a stuck-poll record buffer, a poll that gives up
+first writes what it waited for (the tag, the pair, what it saw, the clocks)
+where the host can read it after the process stops.
+
+**A launch first reads its own code.** A layer kernel's code can be larger
+than the instruction cache, and the weights that stream through the caches
+evict it during a launch. Each stage would then wait on its instructions
+from memory, one stage after another on the critical path. So a launch's
+first tasks may read its own code into the caches as data, and stages that
+run once a launch keep compute-light loops rolled, not unrolled.
 
 **Compile-time plans are canonical text.** A plan is a compile-time argument
 of the kernel, and Triton's compile hooks serialize every compile-time
