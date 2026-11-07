@@ -37,10 +37,13 @@ with redirect_triton_to_tokenspeed_triton():
 logger = logging.getLogger(__name__)
 
 MIN_HEAP_BYTES = 256 << 20
-# Heap beyond the communication buffers. The decode monokernels' mailbox
-# scratch lives here: Muse Spark's target layers take 16.9 MiB (8 rows; 34
-# MiB for 16) and its DFlash2 draft launches 22 MiB more.
+# Heap beyond the communication buffers: at least HEAP_HEADROOM_BYTES, or
+# what the decode monokernels reserved for their mailbox scratch
+# (reserve_heap, sized from their plans) plus HEAP_MARGIN_BYTES for the
+# allocator's alignment.
 HEAP_HEADROOM_BYTES = 48 << 20
+HEAP_MARGIN_BYTES = 4 << 20
+_reserved: dict[str, int] = {}
 _context = None
 _heap_size: int | None = None
 _allocator_type: str | None = None
@@ -135,6 +138,23 @@ def discover_world() -> bool:
 def maps_world() -> bool | None:
     """``discover_world``'s answer, or None before it ran."""
     return None if _spans_hosts is None else _unmapped_reason is None
+
+
+def reserve_heap(owner: str, nbytes: int) -> None:
+    """Reserve ``nbytes`` of the shared heap for ``owner`` (replacing its
+    earlier reservation). Call before the heap exists: a live heap does not
+    grow."""
+    if _context is not None:
+        raise RuntimeError(
+            f"{owner} reserved {nbytes} bytes of the Iris heap after it was "
+            "created; reserve before preparing communication buffers"
+        )
+    _reserved[owner] = int(nbytes)
+
+
+def heap_headroom_bytes() -> int:
+    """The heap beyond the communication buffers (see HEAP_HEADROOM_BYTES)."""
+    return max(HEAP_HEADROOM_BYTES, sum(_reserved.values()) + HEAP_MARGIN_BYTES)
 
 
 def get_or_create_context(*, heap_size: int):

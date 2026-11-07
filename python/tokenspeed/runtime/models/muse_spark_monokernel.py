@@ -778,6 +778,7 @@ def enable_decode_monokernels(model: torch.nn.Module) -> None:
     name = type(model).__name__
     if unserved:
         raise ValueError(unserved_error(name, unserved))
+    reserve_monokernel_heap(model)
     served = sum(layer.fused is not None for layer in layers)
     logger.info(
         f"Decode monokernel: {served} of {len(layers)} {name} layers (the first "
@@ -795,6 +796,30 @@ def enable_decode_monokernels(model: torch.nn.Module) -> None:
             f"Decode monokernel: {size:.1f} GiB per rank of TP8 expert slices "
             "(EP8 server)"
         )
+
+
+def reserve_monokernel_heap(model: torch.nn.Module) -> None:
+    """Reserve what :class:`MuseSparkMonokernelState` allocates on the Iris
+    heap, before the heap exists: the scratch of the largest plan (``MAX_ROWS``
+    rows) and, at most, a tap slot for each of the model's captured layers.
+    :func:`enable_decode_monokernels` calls it after packing, and the model
+    again when its captured layers change."""
+    pairs = [layer.fused.scratch_pairs for layer in model.layers if layer.fused]
+    if not pairs:
+        return
+    from tokenspeed_kernel.ops.communication._iris import (
+        allocation_bytes,
+        reserve_heap,
+    )
+
+    taps = len(model.layers_to_capture)
+    tap_bytes = (
+        allocation_bytes((MAX_ROWS, taps, HIDDEN), torch.bfloat16) if taps else 0
+    )
+    reserve_heap(
+        "muse_spark_monokernel",
+        allocation_bytes((max(pairs),), torch.int64) + tap_bytes,
+    )
 
 
 def prepare_monokernel_state(
@@ -829,6 +854,7 @@ __all__ = [
     "prepare_ep8_experts",
     "prepare_layer",
     "prepare_monokernel_state",
+    "reserve_monokernel_heap",
     "projection_hand_off",
     "row_lengths",
     "takes_monokernels",

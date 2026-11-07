@@ -124,6 +124,7 @@ from tokenspeed.runtime.models.muse_spark_monokernel import (
     enable_decode_monokernels,
     prepare_ep8_experts,
     prepare_monokernel_state,
+    reserve_monokernel_heap,
 )
 from tokenspeed.runtime.models.muse_spark_vision import MuseSparkVisionTower
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
@@ -2884,6 +2885,20 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
 
     model_cls = MuseSparkModel
     supports_aux_capture = True
+
+    def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
+        super().set_eagle3_layers_to_capture(layer_ids)
+        self._reserve_monokernel_taps()
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        super().set_dflash_layers_to_capture(layer_ids)
+        self._reserve_monokernel_taps()
+
+    def _reserve_monokernel_taps(self) -> None:
+        # The draft's target and the draft load before the Iris heap exists,
+        # in either order; the monokernels' heap reservation counts the taps.
+        if self.model.config.decode_monokernel:
+            reserve_monokernel_heap(self.model)
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         """Prepare and bind Muse's TP4/TP8 state before cache sizing and capture."""
