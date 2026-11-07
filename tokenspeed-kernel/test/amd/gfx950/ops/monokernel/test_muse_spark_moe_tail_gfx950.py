@@ -134,11 +134,15 @@ def _reference(parts, w, hp, pen, w_post, post, alpha, beta, ing):
     y = (combined.float() @ w_post.float().T).to(torch.bfloat16).float() * post
     y = y * torch.rsqrt(y.pow(2).mean() + 1e-8)
     h2 = beta * y + alpha * hp
-    a = (h2 * torch.rsqrt(h2.pow(2).mean() + 1e-5) * ing).to(torch.bfloat16)
-    return combined, h2, a, (beta * y).abs()
+    scale = torch.rsqrt(h2.pow(2).mean() + 1e-5)
+    a = (h2 * scale * ing).to(torch.bfloat16)
+    return combined, h2, a, (beta * y).abs(), scale
 
 
-def _worker(rank: int, port: int, rows: int) -> None:
+def _worker(rank: int, port: int, rows: int, source_rows: int, out: str) -> None:
+    """Run two launches of ``rows`` rows, row ``r`` taking the inputs of row
+    ``r % source_rows``, check them against the reference, and save each
+    launch's ``a_out`` and ``h_next`` to ``out``."""
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "gloo",
@@ -161,12 +165,12 @@ def _worker(rank: int, port: int, rows: int) -> None:
                 ("hp", OWNED),
                 ("rr", WORLD * TOP_K * OWNED_POOL // 2),
             )
-            + moe_tail.regions(),
+            + moe_tail.regions(rows),
             rows=rows,
             chain=rows,
             external=("route", "hp", "rr"),
             world=WORLD,
-            peers=("rr",) + moe_tail.PEERS,
+            peers=("rr",) + moe_tail.peers(rows),
         )
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         group.finish_prepare()
@@ -175,7 +179,11 @@ def _worker(rank: int, port: int, rows: int) -> None:
         for launch in range(2):
             step = 20 + launch
             tag = launch_tag(step, 0)
-            parts, w, hp, pen, w_post, post, alpha, beta, ing = _inputs(launch, rows)
+            parts, w, hp, pen, w_post, post, alpha, beta, ing = _inputs(
+                launch, source_rows
+            )
+            src = torch.arange(rows) % source_rows
+            parts, w, hp = parts[src], w[src], hp[src]
             for row in range(rows):
                 route = torch.cat(
                     [torch.zeros(TOP_K, dtype=torch.int32), w[row].view(torch.int32)]
@@ -214,7 +222,7 @@ def _worker(rank: int, port: int, rows: int) -> None:
             torch.cuda.synchronize()
             dist.barrier()
             for row in range(rows):
-                combined, h2, a, gated = _reference(
+                combined, h2, a, gated, scale = _reference(
                     parts[row], w[row], hp[row], pen, w_post, post, alpha, beta, ing
                 )
                 cmb = payloads(
@@ -233,20 +241,50 @@ def _worker(rank: int, port: int, rows: int) -> None:
                 bound = 2**-7 * h2[own].abs() + 2**-7 * gated[own] + 1e-4
                 assert torch.all(err <= bound), row
                 # Four BF16 roundings lie between the route partials and this
-                # output: one step in an early one can make two here.
-                torch.testing.assert_close(
-                    a_out[row].float().cpu(), a.float(), rtol=2**-6, atol=2e-3
-                )
+                # output: one step in an early one can make two here. A few
+                # elements may also carry the projection's one-step flip
+                # (bounded as for h_next, through the norm) plus one of a's.
+                err = (a_out[row].float().cpu() - a.float()).abs()
+                tight = 2e-3 + 2**-6 * a.float().abs()
+                flip = 2**-7 * (scale * ing * gated + a.float().abs())
+                assert torch.all(err <= tight + flip), row
+                assert int((err > tight).sum()) <= 4, row
+            torch.save(
+                (a_out.cpu(), h_next.cpu()), f"{out}/rank{rank}-launch{launch}.pt"
+            )
             dist.barrier()
     finally:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("rows", [1, 8])
-def test_moe_tail_combines_projects_and_closes_the_layer(rows: int):
-    if torch.cuda.device_count() < WORLD:
-        pytest.skip(f"requires {WORLD} GPUs")
+def _spawn(rows: int, source_rows: int, out) -> None:
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port, rows), nprocs=WORLD, join=True)
+    mp.spawn(_worker, args=(port, rows, source_rows, str(out)), nprocs=WORLD, join=True)
+
+
+@pytest.mark.parametrize("rows", [1, 8, 16])
+def test_moe_tail_combines_projects_and_closes_the_layer(rows: int, tmp_path):
+    if torch.cuda.device_count() < WORLD:
+        pytest.skip(f"requires {WORLD} GPUs")
+    _spawn(rows, rows, tmp_path)
+
+
+def test_ffn_words_past_8_rows_match_the_tagged_pairs(tmp_path):
+    """16 rows hand ffn to out as words and flags, 8 rows as tagged pairs:
+    two requests of the same 8 rows give each row the 8-row launch's bits."""
+    if torch.cuda.device_count() < WORLD:
+        pytest.skip(f"requires {WORLD} GPUs")
+    assert moe_tail.ffn_words(16) and not moe_tail.ffn_words(8)
+    (tmp_path / "pairs").mkdir()
+    (tmp_path / "words").mkdir()
+    _spawn(8, 8, tmp_path / "pairs")
+    _spawn(16, 8, tmp_path / "words")
+    for rank in range(WORLD):
+        for launch in range(2):
+            name = f"rank{rank}-launch{launch}.pt"
+            pairs = torch.load(tmp_path / "pairs" / name)
+            words = torch.load(tmp_path / "words" / name)
+            for got, want in zip(words, pairs):
+                assert torch.equal(got, torch.cat([want, want])), (rank, launch)
