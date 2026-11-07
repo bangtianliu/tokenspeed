@@ -27,9 +27,9 @@ of the draft's layers as one launch of
 ``tokenspeed_kernel.ops.model.muse_spark.monokernel.muse_spark_draft_layer_decode``
 on every rank of the TP8 group (``docs/design/monokernel.md``):
 
-* after loading, :func:`enable_draft_monokernels` packs every layer and gives
-  the layers and the model one :class:`DFlash2MonokernelState`, or leaves
-  the layers on their regular code with the reasons logged;
+* after loading, :func:`enable_draft_monokernels` packs every layer and the
+  context write and gives the layers and the model one
+  :class:`DFlash2MonokernelState`;
 * ``prepare_communication_runtime`` calls
   :meth:`DFlash2MonokernelState.prepare`, which allocates the mailbox
   scratch on the Iris symmetric heap;
@@ -47,6 +47,11 @@ on every rank of the TP8 group (``docs/design/monokernel.md``):
   drafter runs in place of its top-k and selector for one request. It keeps
   a tiled copy of the rank's LM-head shard (414 MB a GPU): the tiles stream
   faster than the row-major weight the target's verify reads.
+
+The draft follows the target's rule (``docs/design/monokernel.md``): the
+switch never serves a piece without its kernel. When the layers, the context
+write or the head cannot be packed, startup fails with
+:func:`unserved_draft_error`, which names each piece and why.
 
 The launches hand each other this rank's partial of the layer output and its
 owned residual columns (``1024 rank ..``), so the layers are served all
@@ -134,6 +139,7 @@ LAYER_ROWS = MAX_REQUESTS * BLOCK_ROWS
 HEAD_ROWS = MAX_REQUESTS * STEPS
 CONTEXT_WRITE_ROWS = MAX_REQUESTS * CONTEXT_ROWS
 NO_KERNEL = "no draft monokernel for this platform"
+MLA_DRAFT = "an MLA draft: the kernels serve GQA attention"
 NOT_BF16_KV = "the draft's KV cache is not BF16: the kernels read BF16 keys"
 
 
@@ -145,6 +151,8 @@ def _config_value(config, key: str):
 def model_reasons(model: torch.nn.Module) -> list[str]:
     """Why the layers of ``model`` (a ``DFlash2DraftModel``) cannot have
     draft monokernels; empty when they can."""
+    if model._uses_mla:
+        return [MLA_DRAFT]
     config, mapping = model.config, model.mapping
     reasons = []
     if not (
@@ -289,8 +297,7 @@ class DFlash2MonokernelState(MonokernelState):
 
     Attributes:
         layers: The draft's decoder layers.
-        context: The packed context write, or None when it keeps the regular
-            path.
+        context: The packed context write.
         context_scratch: Its mailbox scratch, from :meth:`prepare`.
         context_pending: Whether a context write ran whose block forward
             has not run yet (the write reads the layers' step counter, which
@@ -311,7 +318,7 @@ class DFlash2MonokernelState(MonokernelState):
         block_pending: Whether the layers' launches ran a block whose head
             has not run yet (the head reads their step counter).
         head: The draft head's launch, from :meth:`enable_head` (None
-            before it, or when the head keeps the regular path).
+            before it).
         head_pairs: The mailbox pairs reserved on the Iris heap for the
             head's scratch (0 when no head monokernel serves here);
             :meth:`enable_head` refuses a head that needs more.
@@ -322,7 +329,7 @@ class DFlash2MonokernelState(MonokernelState):
         model: torch.nn.Module,
         scratch_pairs: int,
         rank: int,
-        context: FusedDecodeLayer | None,
+        context: FusedDecodeLayer,
     ) -> None:
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
         # The scratch is the Iris heap's (prepare), not a device buffer.
@@ -353,12 +360,11 @@ class DFlash2MonokernelState(MonokernelState):
         )
 
         self.head_pairs = muse_spark_draft_head_scratch_pairs(max_rows=HEAD_ROWS) or 0
-        context_pairs = context.scratch_pairs if context is not None else 0
         reserve_heap(
             "dflash2_monokernel",
             sum(
                 allocation_bytes((n,), torch.int64)
-                for n in (scratch_pairs, context_pairs, self.head_pairs)
+                for n in (scratch_pairs, context.scratch_pairs, self.head_pairs)
                 if n
             ),
         )
@@ -371,10 +377,9 @@ class DFlash2MonokernelState(MonokernelState):
         rank in it). Call once, before graph capture."""
         if self.bases is None:
             self.scratch, self.bases = mailbox_scratch(group, rank, self.scratch_pairs)
-            if self.context is not None:
-                self.context_scratch, _ = mailbox_scratch(
-                    group, rank, self.context.scratch_pairs
-                )
+            self.context_scratch, _ = mailbox_scratch(
+                group, rank, self.context.scratch_pairs
+            )
             self.device_group = group
             self.cpu_group = cpu_group
             self.rank = rank
@@ -475,10 +480,12 @@ class DFlash2MonokernelState(MonokernelState):
         (``lm_head``, vocabulary-parallel) and the draft's candidate
         ``selector``, after :meth:`prepare`. ``top_k_exact``: whether the
         shard-local top-k is exact for the head's shard geometry
-        (``VocabParallelTopK.enabled``). Logs why the head keeps the regular
-        path otherwise."""
+        (``VocabParallelTopK.enabled``).
+
+        Raises:
+            ValueError: The head cannot be packed (:func:`unserved_draft_error`).
+        """
         reasons = head_reasons(lm_head, selector, top_k_exact, softcap)
-        fused = None
         if not reasons:
             fused = prepare_muse_spark_draft_head(
                 tensors={
@@ -495,11 +502,7 @@ class DFlash2MonokernelState(MonokernelState):
             if fused is None:
                 reasons.append(NO_KERNEL)
         if reasons:
-            logger.warning(
-                f"Decode monokernel: the DFlash2 draft head keeps the regular path "
-                f"({'; '.join(reasons)})"
-            )
-            return
+            raise ValueError(unserved_draft_error("DFlash2", {"head": reasons}))
         if fused.scratch_pairs > self.head_pairs:
             raise RuntimeError(
                 f"the draft head needs {fused.scratch_pairs} mailbox pairs but "
@@ -720,12 +723,31 @@ class DraftHeadMonokernel:
         return operands["cand_ids"], operands["scores"], operands["anchor"]
 
 
+def unserved_draft_error(name: str, unserved: dict[str, list[str]]) -> str:
+    """The startup error of a draft ``name`` whose pieces ``unserved``
+    (``"layers"``, ``"context write"`` or ``"head"`` -> reasons) have no
+    monokernel."""
+    report = "; ".join(f"{piece}: {', '.join(r)}" for piece, r in unserved.items())
+    return (
+        f"--decode-monokernel: the {name} draft's {' and '.join(unserved)} have "
+        f"no monokernel ({report}). The draft follows the target's rule: the "
+        "switch never serves a piece without its kernel. Serve without "
+        "--decode-monokernel."
+    )
+
+
 def enable_draft_monokernels(model: torch.nn.Module) -> None:
-    """Pack each layer of ``model`` (a ``DFlash2DraftModel`` built with the
-    monokernel layer class) after loading, and give the layers and the
-    model one :class:`DFlash2MonokernelState`; or log why the draft keeps
-    its regular code. A draft launches every layer or none."""
+    """Pack each layer and the context write of ``model`` (a
+    ``DFlash2DraftModel`` built with the monokernel layer class) after
+    loading, and give the layers and the model one
+    :class:`DFlash2MonokernelState`. A draft launches every layer or none.
+
+    Raises:
+        ValueError: The layers or the context write cannot be packed
+            (:func:`unserved_draft_error` names both pieces' reasons).
+    """
     name = type(model).__name__
+    unserved: dict[str, list[str]] = {}
     reasons = model_reasons(model)
     fused: list[FusedDecodeLayer] = []
     rank = model.mapping.attn.tp_rank
@@ -739,25 +761,19 @@ def enable_draft_monokernels(model: torch.nn.Module) -> None:
                 break
             fused.append(prepared)
     if reasons:
-        logger.warning(
-            f"--decode-monokernel: the {name} draft runs its regular code on "
-            f"every step, while the target's layers launch; its layers cannot "
-            f"be packed ({'; '.join(reasons)})"
-        )
-        return
-    context = None
-    reasons = context_reasons(model)
-    if not reasons:
+        unserved["layers"] = reasons
+    # An MLA draft has no fc and hidden_norm of the kernel's kind to check.
+    reasons = [] if model._uses_mla else context_reasons(model)
+    if not reasons and not unserved:
         context = prepare_muse_spark_draft_context(
             tensors=context_tensors(model), rank=rank, max_rows=CONTEXT_WRITE_ROWS
         )
         if context is None:
             reasons.append(NO_KERNEL)
     if reasons:
-        logger.warning(
-            f"Decode monokernel: the {name} context write keeps the regular path "
-            f"({'; '.join(reasons)})"
-        )
+        unserved["context write"] = reasons
+    if unserved:
+        raise ValueError(unserved_draft_error(name, unserved))
     state = DFlash2MonokernelState(
         model, max(f.scratch_pairs for f in fused), rank, context
     )
@@ -767,8 +783,8 @@ def enable_draft_monokernels(model: torch.nn.Module) -> None:
     model.layers[-1].last = True
     model.monokernel_state = state
     logger.info(
-        f"Decode monokernel: {len(fused)} of {len(fused)} {name} layers"
-        + ("" if context is None else ", and the context write")
+        f"Decode monokernel: {len(fused)} of {len(fused)} {name} layers, and the "
+        "context write"
     )
 
 
@@ -815,4 +831,5 @@ __all__ = [
     "model_reasons",
     "takes_head",
     "takes_monokernels",
+    "unserved_draft_error",
 ]

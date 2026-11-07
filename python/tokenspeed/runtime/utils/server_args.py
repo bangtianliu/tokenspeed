@@ -3870,8 +3870,9 @@ class ServerArgs:
                 "verify of up to 4 token rows). Models: "
                 f"{', '.join(DECODE_MONOKERNEL_ARCHITECTURES)} on gfx950, "
                 "without attention or expert parallelism. Startup fails when "
-                "a layer cannot be packed for its monokernel. Larger steps "
-                "keep the regular path."
+                "a layer cannot be packed for its monokernel, the speculative "
+                "draft's layers, context write and head included. Larger "
+                "steps keep the regular path."
             ),
         )
         parser.add_argument(

@@ -754,6 +754,10 @@ class DFlash2DraftModel(DFlashDraftModel):
             )
         for layer in self.layers:
             absorb_mla_kv_b_proj(layer.self_attn)
+        if global_server_args_dict["decode_monokernel"]:
+            # Refuses an MLA draft: the switch never serves a draft without
+            # its kernels.
+            enable_draft_monokernels(self)
 
     @torch.no_grad()
     def forward(self, *args, input_embeds: torch.Tensor | None = None, **kwargs):
