@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -389,6 +390,24 @@ def _launch_routed_input_scale_sum(
     enable_pdl: bool,
 ) -> None:
     """Reduce routes into ``output``: one program per token, or two tiled launches."""
+    if single_pass and is_warming_up():
+        # The route switches on the token count, so a warmup forward of any
+        # size compiles the two-launch route too, into scratch.
+        _launch_routed_input_scale_sum(
+            routes,
+            permute_map,
+            row_stride,
+            route_weights,
+            norm_weight,
+            torch.empty_like(output),
+            num_tokens,
+            topk,
+            eps,
+            weight_offset,
+            block,
+            False,
+            enable_pdl,
+        )
     has_map = permute_map is not None
     map_arg = permute_map if has_map else routes
     width = norm_weight.shape[0]
