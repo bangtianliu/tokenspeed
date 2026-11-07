@@ -210,7 +210,7 @@ def layer_plan(
         + moe_route.regions()
         + moe_pool.regions()
         + moe_experts.regions()
-        + moe_tail.regions()
+        + moe_tail.regions(rows)
         + ((("parity", 1),) if check_parity else ())
     )
     nq = next_qkvg
@@ -243,7 +243,7 @@ def layer_plan(
         + moe_route.PEERS
         + moe_pool.PEERS
         + moe_experts.PEERS
-        + moe_tail.PEERS
+        + moe_tail.peers(rows)
     )
     return Plan(
         grid=256,
