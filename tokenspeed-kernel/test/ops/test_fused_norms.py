@@ -546,13 +546,17 @@ def test_gathered_route_reduction_matches_materialized_routes(device: str) -> No
 
 
 @pytest.mark.parametrize("device", ["cuda"])
-def test_two_pass_route_reduction_warms_both_token_classes(device: str) -> None:
-    """After one warmup launch, no token count compiles the reduction again."""
+def test_route_reduction_warmup_compiles_both_two_pass_token_classes(
+    device: str,
+) -> None:
+    """After one warmup launch of either route, no token count compiles the
+    two-launch reduction again: serving takes it for short prefills even when
+    every warmup forward is long enough for the one-launch route."""
     torch.manual_seed(7)
     topk, width = 8, 4096
     norm_weight = torch.randn(width, device=device, dtype=torch.bfloat16) * 0.1
 
-    def reduce(tokens: int) -> None:
+    def reduce(tokens: int, single_pass: bool) -> None:
         routes = (torch.randn(tokens * topk, width, device=device) * 0.5).to(
             torch.bfloat16
         )
@@ -570,15 +574,15 @@ def test_two_pass_route_reduction_warms_both_token_classes(device: str) -> None:
             1e-5,
             1.0,
             width,
-            False,
+            single_pass,
             False,
         )
 
     with kernel_warmup(enabled=True):
-        reduce(6)
+        reduce(6, single_pass=True)
     with assert_no_triton_compile(_routed_input_scale_sum_kernel):
         for tokens in (2, 16, 31, 48, 100):
-            reduce(tokens)
+            reduce(tokens, single_pass=False)
 
 
 @pytest.mark.parametrize("device", ["cuda"])
