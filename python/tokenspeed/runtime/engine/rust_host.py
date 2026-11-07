@@ -1255,10 +1255,7 @@ class HostBootstrap:
                 specs,
                 storage_config=storage_config,
                 max_scheduled_tokens=server_args.chunked_prefill_size,
-                # The scheduler's running bound; max_batch_size (from
-                # --max-num-seqs) sizes the device side.
-                max_batch_size=server_args.max_running_requests
-                // max(mapping.attn.dp_size, 1),
+                max_batch_size=max_batch_size,
                 decode_input_tokens=decode_input_tokens,
                 overlap_schedule_depth=overlap_schedule_depth,
                 enable_kv_cache_events=kv_events,

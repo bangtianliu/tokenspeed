@@ -409,7 +409,6 @@ class ServerArgs:
     # Memory and scheduling
     gpu_memory_utilization: float | None = None
     max_num_seqs: int | None = None
-    max_running_requests: int | None = None
     max_total_tokens: int | None = None
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
@@ -1137,9 +1136,6 @@ class ServerArgs:
                 self.max_num_seqs = 80
             else:
                 self.max_num_seqs = 160
-        # Unset, the scheduler runs as many requests as max_num_seqs sizes.
-        if self.max_running_requests is None:
-            self.max_running_requests = self.max_num_seqs
 
     def resolve_kernel_backends(self):
         _require_choice(
@@ -2757,17 +2753,6 @@ class ServerArgs:
             raise ValueError(
                 f"max_num_seqs must be >= attn_dp_size: {self.max_num_seqs=} < {self.mapping.attn.dp_size=}"
             )
-        # The running cap bounds only the scheduler's batch: max_num_seqs
-        # still sizes the speculative warmup, the device graphs and the
-        # per-request device state, so the cap may not exceed it.
-        if not (
-            self.mapping.attn.dp_size <= self.max_running_requests <= self.max_num_seqs
-        ):
-            raise ValueError(
-                f"--max-running-requests ({self.max_running_requests}) must be "
-                f"at least the attention-DP size ({self.mapping.attn.dp_size}) "
-                f"and at most --max-num-seqs ({self.max_num_seqs})"
-            )
 
         self.validate_model_update_options()
 
@@ -3025,16 +3010,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_num_seqs,
             help="Maximum number of sequences to process concurrently.",
-        )
-        parser.add_argument(
-            "--max-running-requests",
-            type=int,
-            default=ServerArgs.max_running_requests,
-            help="The most requests the scheduler runs at once (split across "
-            "attention-DP ranks like --max-num-seqs). Defaults to --max-num-seqs. "
-            "Unlike --max-num-seqs it sizes nothing: a lower cap keeps the "
-            "speculative warmup, device graphs and per-request state sized by "
-            "--max-num-seqs, and further requests wait in the queue.",
         )
         parser.add_argument(
             "--max-total-tokens",
