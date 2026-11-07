@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.gemm import (
 from tokenspeed_kernel.ops.gemm._gluon.gemv import gluon_simt_gemm_fp32
 from tokenspeed_kernel.ops.gemm.triton import MXFP4_LINEAR_SIGNATURES
 from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -96,6 +97,9 @@ if platform.is_amd:
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
         supports_gluon_mm_a16w16_prefill_gfx950 as _supports_mm_a16w16_prefill,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        DECODE_M_BUCKETS as _MM_A16W16_DECODE_M_BUCKETS,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         gluon_grouped_mm_a16w16_decode_num_counters_gfx950 as _grouped_decode_counters,
@@ -348,12 +352,42 @@ if platform.is_amd:
         Returns:
             ``[M, N]`` output in ``x``'s dtype.
         """
+        if is_warming_up():
+            _warm_mm_a16w16_decode_buckets(x, weight)
         counters = zeroed_state(
             _mm_a16w16_decode_counters(x.shape[0], weight.shape[0], x.shape[1]),
             dtype=torch.int32,
             device=x.device,
         )
         return _mm_a16w16_decode_impl(x, weight, x.dtype, counters=counters, out=out)
+
+    _warmed_mm_a16w16_decode: set[tuple] = set()
+
+    def _warm_mm_a16w16_decode_buckets(x: torch.Tensor, weight: torch.Tensor) -> None:
+        """Compile every M bucket of this weight's decode GEMM during warmup.
+
+        The row count picks a measured tile per M bucket, and Triton keys the
+        runtime ``M`` on whether it is a multiple of 16: a batch reaches each
+        bucket with either class. One launch per bucket bound and the row
+        below it covers both, so no eager forward compiles one later.
+        """
+        n, k = weight.shape
+        key = (n, k, x.dtype, x.device)
+        if key in _warmed_mm_a16w16_decode:
+            return
+        _warmed_mm_a16w16_decode.add(key)
+        for bound in _MM_A16W16_DECODE_M_BUCKETS:
+            for m in (bound - 1, bound):
+                if not _supports_mm_a16w16_decode(m, n, k):
+                    continue
+                counters = zeroed_state(
+                    _mm_a16w16_decode_counters(m, n, k),
+                    dtype=torch.int32,
+                    device=x.device,
+                )
+                _mm_a16w16_decode_impl(
+                    x.new_zeros((m, k)), weight, x.dtype, counters=counters
+                )
 
     @register_kernel(
         "gemm",
