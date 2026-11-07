@@ -149,6 +149,9 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
             if has_draft and not prefill_only:
                 self.warmup_decode_path(batch_sizes=(1,), graph_phase=False)
 
+        def warmup_serving_pool(self):
+            events.append(("serving_pool_warmup", self.generation))
+
         def release_graphs(self):
             events.append(("release", self.generation))
 
@@ -262,11 +265,18 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
             assert events.index(("warmup", 0, (1,), False)) < probe_index
         if expected_rewarm:
             assert rebind_index < events.index(rebound_warmup)
+        # The serving pool's own warmup follows the rebind, before any rewarm
+        # or final capture.
+        pool_warmup = events.index(("serving_pool_warmup", 1))
+        assert rebind_index < pool_warmup
+        if expected_rewarm:
+            assert pool_warmup < events.index(rebound_warmup)
         if warmup_fails:
             assert ("capture", 1, None) not in events
         else:
             assert events[-1] == ("capture", 1, None)
     else:
+        assert ("serving_pool_warmup", 0) not in events
         assert events[-1] == ("capture", 0, None)
 
 
