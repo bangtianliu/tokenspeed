@@ -22,7 +22,7 @@
 
 With ``--decode-monokernel``, each eligible decoder layer of a decode step of
 one request runs as one persistent launch per TP8 rank from
-``tokenspeed_kernel.ops.monokernel``. The model touches this module in four
+``tokenspeed_kernel.ops.model.muse_spark.monokernel``. The model touches this module in four
 places:
 
 * after loading, :func:`enable_decode_monokernels` packs the layers into
@@ -68,7 +68,7 @@ from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.monokernel import (
+from tokenspeed_kernel.ops.model.muse_spark.monokernel import (
     MUSE_SPARK_PROJ_WORDS,
     FusedDecodeLayer,
     MonokernelStuckRecord,

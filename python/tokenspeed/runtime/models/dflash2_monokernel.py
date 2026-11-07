@@ -22,7 +22,7 @@
 
 With ``--decode-monokernel``, a draft block forward of one request runs each
 of the draft's layers as one launch of
-``tokenspeed_kernel.ops.monokernel.muse_spark_draft_layer_decode`` on every
+``tokenspeed_kernel.ops.model.muse_spark.monokernel.muse_spark_draft_layer_decode`` on every
 rank of the TP8 group. The draft model touches this module in three places:
 
 * after loading, :func:`enable_draft_monokernels` packs the layers into
@@ -57,7 +57,7 @@ import logging
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.monokernel import (
+from tokenspeed_kernel.ops.model.muse_spark.monokernel import (
     FusedDecodeLayer,
     muse_spark_draft_context_decode,
     muse_spark_draft_head_decode,
