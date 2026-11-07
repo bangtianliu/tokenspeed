@@ -35,6 +35,7 @@ import os
 import sys
 from contextlib import nullcontext
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Literal, get_args
 
 import pytest
@@ -280,6 +281,13 @@ class _ForwardStepDouble:
         self.max_tokens_per_req = max_tokens_per_req
 
 
+class _NoEagerSamplingVariants:
+    """A sampling backend without eager variants to compile."""
+
+    def warmup_eager(self, draft_q) -> None:
+        pass
+
+
 class _AutotuneExecutor:
     """The ModelExecutor state autotune() reads, without the GPU boot."""
 
@@ -304,6 +312,10 @@ class _AutotuneExecutor:
         self._model_input_kwargs_hook = model_input_kwargs
         self._events = events
         self.device = "cpu"
+        # autotune() also compiles the eager sampling variants
+        # (SamplingBackend.warmup_eager); this executor's backend has none.
+        self.sampling_backend = _NoEagerSamplingVariants()
+        self.runtime_states = SimpleNamespace(future_draft_q=None)
 
     def _model_input_kwargs(self, num_tokens, bs, rows):
         return self._model_input_kwargs_hook(num_tokens, bs, rows)
