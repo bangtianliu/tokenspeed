@@ -55,11 +55,13 @@ from tokenspeed.runtime.models.dflash import (
     _get_dflash_layer_sliding_window,
 )
 from tokenspeed.runtime.models.dflash2_monokernel import (
-    DFlash2Monokernels,
+    DFlash2MonokernelLayer,
+    DFlash2MonokernelState,
     enable_draft_monokernels,
 )
 from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkAttention
 from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
@@ -443,10 +445,19 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
         return hidden_states, residual
 
 
+class DFlash2MonokernelDecoderLayer(DFlash2MonokernelLayer, DFlash2DecoderLayer):
+    """DFlash2 draft layer whose block forwards run as one monokernel launch."""
+
+
 class DFlash2DraftModel(DFlashDraftModel):
     """DFlash2 checkpoint entry class."""
 
-    decoder_layer_cls = DFlash2DecoderLayer
+    @property
+    def decoder_layer_cls(self) -> type:
+        """The layer class: the monokernel class with --decode-monokernel."""
+        if global_server_args_dict["decode_monokernel"]:
+            return DFlash2MonokernelDecoderLayer
+        return DFlash2DecoderLayer
 
     def __init__(
         self,
@@ -480,8 +491,10 @@ class DFlash2DraftModel(DFlashDraftModel):
             params_dtype=dtype,
             prefix=add_prefix("candidate_selector", prefix),
         )
-        # The draft monokernels (--decode-monokernel), packed after loading.
-        self.monokernels: DFlash2Monokernels | None = None
+        # The state that the monokernel layers share (--decode-monokernel),
+        # set when enable_draft_monokernels packs them after loading. None
+        # runs every forward on the regular code.
+        self.monokernel_state: DFlash2MonokernelState | None = None
 
     def run_decoder(
         self,
@@ -490,15 +503,24 @@ class DFlash2DraftModel(DFlashDraftModel):
         residual: torch.Tensor | None,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        """The layers and the final norm, or their monokernel launches (the
-        last one runs the final norm) for one request's block."""
-        if (
-            self.monokernels is not None
-            and residual is not None
-            and self.monokernels.serves(hidden_states.shape[0], ctx)
-        ):
-            return self.monokernels.forward(positions, hidden_states, residual, ctx)
-        return super().run_decoder(positions, hidden_states, residual, ctx)
+        """The layers and the final norm. A block forward of one request that
+        the monokernels serve launches every layer, and the last launch runs
+        the final norm (``finish_step`` returns its output)."""
+        state = self.monokernel_state
+        if state is None:
+            return super().run_decoder(positions, hidden_states, residual, ctx)
+        state.start_step()
+        for layer in self.layers:
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                ctx=ctx,
+                residual=residual,
+            )
+        lm_head_input = state.finish_step()
+        if lm_head_input is not None:
+            return lm_head_input
+        return self.final_norm(hidden_states, residual)
 
     def configure_target(self, target_model, target_config) -> None:
         """Install the capture inputs, and the FP8 head copy if quantized.
@@ -553,10 +575,10 @@ class DFlash2DraftModel(DFlashDraftModel):
             Whether the draft prepared anything.
         """
         prepared = self._prepare_fused_reduce_norm(max_num_tokens)
-        if self.monokernels is None:
+        if self.monokernel_state is None:
             return prepared
         group = self.mapping.attn.tp_group
-        self.monokernels.prepare(
+        self.monokernel_state.prepare(
             process_group_manager.get_device_process_group(group),
             process_group_manager.get_process_group("gloo", group),
             group.index(dist.get_rank()),
@@ -661,7 +683,8 @@ class DFlash2DraftModel(DFlashDraftModel):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         if not self._uses_mla:
             loaded = super().load_weights(weights)
-            enable_draft_monokernels(self)
+            if global_server_args_dict["decode_monokernel"]:
+                enable_draft_monokernels(self)
             return loaded
 
         params = dict(self.named_parameters())
