@@ -24,7 +24,11 @@ for one decode row or a speculative verify's chained rows."""
 from __future__ import annotations
 
 import dataclasses
+import os
 import socket
+import subprocess
+import sys
+import textwrap
 from datetime import timedelta
 
 import muse_spark_reference as ref
@@ -42,7 +46,12 @@ from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
     IrisGroup,
     get_or_create_context,
 )
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import layer  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel import stuck  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (  # noqa: E402
+    layer,
+    moe_tail,
+    stuck_report,
+)
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.qkvg import (  # noqa: E402
     PROJ_WORDS,
 )
@@ -824,6 +833,84 @@ def test_both_kinds_of_layer_lay_the_scratch_out_alike(
         assert sliding.offset(name) == full.offset(name), name
     for name in sliding.peers:
         assert sliding.peer_copy(name) == full.peer_copy(name), name
+
+
+@pytest.mark.parametrize("bf16_experts", [False, True])
+@pytest.mark.parametrize("full", [False, True])
+@pytest.mark.parametrize("rows", range(1, layer.MAX_ROWS + 1))
+def test_peer_regions_split_into_rank_ordered_blocks_without_gaps(
+    rows: int, full: bool, bf16_experts: bool
+):
+    """A launch with absent ranks (the layer bench's --gpus 1, 2 or 4) fills
+    their share of every peer region from :func:`moe_tail.rank_blocks`: the
+    blocks must cover each region's row exactly once, in order, and split
+    evenly over the ranks, or the present ranks poll pairs nobody writes."""
+    plan = layer.layer_plan(full, rows, rows, False, True, False, bf16_experts, False)
+    sizes = dict(plan.regions)
+    for name in plan.peers:
+        at = 0
+        for start, pairs in moe_tail.rank_blocks(name, sizes[name]):
+            assert start == at, (name, start, at)
+            assert pairs > 0 and pairs % WORLD == 0, (name, start, pairs)
+            at = start + pairs
+        assert at == sizes[name], (name, at, sizes[name])
+
+
+# The layer bench with one present rank (--gpus 1): it writes the absent
+# ranks' segments of every peer region before each launch. Polls give up
+# after ~14 ms (11 << 17 ticks of the 100 MHz clock), far past any wait of a
+# ~100 us launch, so a segment the bench misses fails the run at once
+# instead of after a minute. The mp.spawn worker runs this file as its main
+# module, so it shortens the timeout too, before it compiles.
+_ONE_GPU_BENCH = textwrap.dedent("""
+    import sys
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox
+
+    mailbox.POLL_CHECK = 64
+    mailbox.POLL_TIMEOUT_SHIFT = 17
+
+    if __name__ == "__main__":
+        import muse_spark_layer_bench
+
+        sys.argv = ["muse_spark_layer_bench", *sys.argv[1:]]
+        muse_spark_layer_bench.main()
+    """)
+
+
+@pytest.mark.parametrize("full", [False, True])
+@pytest.mark.parametrize("rows, requests", [(1, 1), (8, 1), (8, 2)])
+def test_one_gpu_bench_launches_find_every_absent_rank_segment(
+    tmp_path, full: bool, rows: int, requests: int
+):
+    """With fewer GPUs than ranks the bench stands in for the absent ranks:
+    a launch must find every pair they would have written (each of ffn's
+    rank-ordered blocks, every row), or a poll gives up and records what
+    it waited for."""
+    script = tmp_path / "one_gpu_bench.py"  # a spawned worker needs a file
+    script.write_text(_ONE_GPU_BENCH)
+    args = ["--gpus", "1", "--kv-dtype", "fp8", "--length", "3000"]
+    args += ["--rows", str(rows), "--requests", str(requests)]
+    args += ["--distinct", "0", "--replays", "1", "--stuck-dir", str(tmp_path)]
+    args += ["--full"] if full else []
+    # A cache of its own: the short timeout is in the compiled code. The
+    # script runs from tmp_path, so this directory (the bench and its
+    # helpers) goes on its path.
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.pathsep.join(p for p in (here, os.environ.get("PYTHONPATH")) if p)
+    env = dict(os.environ, TRITON_CACHE_DIR=str(tmp_path / "cache"), PYTHONPATH=path)
+    result = subprocess.run(
+        [sys.executable, str(script), *args],
+        capture_output=True,
+        text=True,
+        timeout=1200,
+        env=env,
+        cwd=os.path.dirname(__file__),
+    )
+    record = str(tmp_path / "rank0.rec")
+    assert not stuck.records(stuck.read_file(record)), "\n".join(
+        stuck_report.describe_file(record)
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
 
 
 def test_the_packer_names_every_tensor_of_another_layout():
