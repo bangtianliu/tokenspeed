@@ -1325,6 +1325,10 @@ class ModelExecutor:
                     self._warmup_vocab_shard_sampling()
         finally:
             set_autotune_process_group(None)
+        # The dummy traversal samples nothing: compile the eager sampling
+        # variants here too (the decode graphs capture only theirs).
+        with torch.no_grad(), kernel_warmup(enabled=True):
+            self.sampling_backend.warmup_eager(self.runtime_states.future_draft_q)
 
         torch.get_device_module(self.device).synchronize()
         if tune_mode:
