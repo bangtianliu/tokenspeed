@@ -538,6 +538,14 @@ request is admitted, as a capture's do; they are never prefix-matched, and
 an allocated block is written before it is read. The pass is one extend at
 the prefill budget, the activation size a chunked prefill allocates anyway.
 
+Kernels the dummy traversal never reaches compile on the first request and
+are left so deliberately: the executor's input preparation (positions, the
+tape, decode inputs, the accepted frontier), the drafter's extend-time
+context write (its key RoPE, norm and KV store) and the arena's block copy.
+Each has one specialization, so it compiles once per process, a bounded cost
+of a few hundred milliseconds. After the first request a served run compiles
+nothing; a compile there is a kernel keyed on a per-request quantity.
+
 CuTe QSA keeps query rows and selected-slot row strides dynamic; model
 geometry, selection budgets and launch configurations stay static. Warmup
 covers encountered static signatures, including aligned and partial stream
