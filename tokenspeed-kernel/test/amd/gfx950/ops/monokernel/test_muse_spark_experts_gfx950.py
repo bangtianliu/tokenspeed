@@ -318,7 +318,10 @@ def _worker(rank: int, port: int, rows: int, exr: int, exr_parts: int) -> None:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("rows, exr, exr_parts", [(1, 192, 1), (8, 0, 4), (8, 128, 2)])
+@pytest.mark.parametrize(
+    "rows, exr, exr_parts",
+    [(1, 192, 1), (8, 0, 4), (8, 128, 2), (16, 0, 4), (16, 128, 2)],
+)
 def test_experts_match_the_regular_path_math_on_its_weight_layout(
     rows: int, exr: int, exr_parts: int
 ):
