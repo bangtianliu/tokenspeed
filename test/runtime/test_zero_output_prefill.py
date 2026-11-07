@@ -351,6 +351,8 @@ def test_selected_logits_do_not_gather_original_input_indices():
         _resolve_logits_layout_plan=lambda *args: None,
         _get_logits=lambda h, *args, **kwargs: h,
         do_argmax=False,
+        # Whole sampled rows, not the vocabulary-sharded layout.
+        _sampled_shard_start=None,
     )
     output = forward(processor, torch.arange(257), hidden, None, metadata)
     assert output.next_token_logits is hidden

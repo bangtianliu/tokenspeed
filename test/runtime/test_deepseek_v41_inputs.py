@@ -894,6 +894,13 @@ def test_target_runner_passes_model_kwargs_not_context_tensors(buffers, mode):
     assert vars(ctx) == original
 
 
+class _NoEagerSamplingVariants:
+    """A sampling backend without eager variants to compile."""
+
+    def warmup_eager(self, draft_q) -> None:
+        pass
+
+
 @pytest.mark.parametrize(
     ("context_len", "lengths"), [(3, [3, 3]), (4, [4, 3]), (5, [4, 3]), (8, [7])]
 )
@@ -985,6 +992,9 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     )
     executor.input_buffers = ib
     executor.runtime_states = runtime
+    # autotune() also compiles the eager sampling variants
+    # (SamplingBackend.warmup_eager); this executor's backend has none.
+    executor.sampling_backend = _NoEagerSamplingVariants()
     executor.model_runner = runner
     executor.drafter = None
     executor._samples_from_vocab_shard = False
