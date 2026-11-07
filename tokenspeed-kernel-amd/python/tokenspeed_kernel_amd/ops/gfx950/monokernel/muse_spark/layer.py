@@ -134,9 +134,18 @@ CHAINED_BASES = {
 # work, so halving each CTA's share removes it.
 NEXT_BASES = {**CHAINED_BASES, "qnext": 192, "out": 96, "exr": 128}
 
+# Past 8 rows (two requests) the attention tail takes CTAs 64 .. 191 (8 tasks
+# a row), and the router's 128 tasks from CTA 160 waited behind tail tasks
+# there (~10 us at 8.7k) or wrapped to CTAs behind oproj. The router and topk
+# take CTAs 192 .. 255 and 0 .. 63, whose last earlier task is oproj or an
+# attention task.
+WIDE = {"router": 192, "topk": 192}
+
 
 def _bases(rows: int, next_qkvg: bool, *names: str) -> dict[str, int]:
     table = NEXT_BASES if next_qkvg else BASES if rows == 1 else CHAINED_BASES
+    if rows > 8:
+        table = {**table, **WIDE}
     return {name: table[name] for name in names}
 
 
