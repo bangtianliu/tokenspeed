@@ -21,9 +21,11 @@
 """Stuck-poll records of Muse Spark layer launches, decoded under the plans
 the launches ran (``monokernel.stuck``).
 
-The serving seam describes its launches in a sidecar next to a file-backed
-record buffer (``<file>.json``): each served layer's kind and the ``(rows,
-chain)`` of every launch it compiled. Then, after a run that trapped::
+The serving seam (and the layer bench's ``--stuck-dir``) describes its
+launches in a sidecar next to a file-backed record buffer (``<file>.json``):
+each layer's kind, the ``(rows, chain)`` of every launch it compiled, and
+whether the launches check the peer parity (``check_parity``). Then, after
+a run that trapped::
 
     python -m tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.stuck_report FILE...
 """
@@ -38,11 +40,15 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel import stuck
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.layer import layer_plan
 
 
-def plans_of(layers: dict[int, dict], launches: list[tuple[int, int]]):
+def plans_of(
+    layers: dict[int, dict], launches: list[tuple[int, int]], check_parity: bool
+):
     """``plan_of(layer)`` for :func:`stuck.decode`: the plan of each
     compiled ``(rows, chain)`` launch of layer ``layer`` (its kind from
     ``layers``: ``{"full": bool, "bf16_experts": bool}``). Every variant of
-    a row count lays the scratch out alike, so one variant serves."""
+    a row count lays the scratch out alike, so one variant serves, except
+    ``check_parity`` (the layer bench's launches check it; serving's do
+    not), which moves the regions."""
 
     def plan_of(layer: int):
         kind = layers.get(layer)
@@ -57,7 +63,7 @@ def plans_of(layers: dict[int, dict], launches: list[tuple[int, int]]):
                 True,
                 False,
                 kind["bf16_experts"],
-                False,
+                check_parity,
             )
             for rows, chain in launches
         ]
@@ -65,9 +71,14 @@ def plans_of(layers: dict[int, dict], launches: list[tuple[int, int]]):
     return plan_of
 
 
-def describe(t: torch.Tensor, layers: dict[int, dict], launches) -> list[str]:
-    """The records of buffer ``t`` decoded under the launches' plans."""
-    return stuck.decode(t, plans_of(layers, [tuple(x) for x in launches]))
+def describe(
+    t: torch.Tensor, layers: dict[int, dict], launches, check_parity: bool
+) -> list[str]:
+    """The records of buffer ``t`` decoded under the launches' plans, one
+    group a wait, the first stalled wait first (:func:`stuck.summarize`)."""
+    return stuck.summarize(
+        t, plans_of(layers, [tuple(x) for x in launches], check_parity)
+    )
 
 
 def describe_file(path: str) -> list[str]:
@@ -75,7 +86,10 @@ def describe_file(path: str) -> list[str]:
     with open(f"{path}.json") as f:
         side = json.load(f)
     layers = {int(k): v for k, v in side["layers"].items()}
-    return describe(stuck.read_file(path), layers, side["launches"])
+    # A sidecar without the key is serving's (from before the bench wrote
+    # sidecars), and serving's launches never check the parity.
+    check_parity = side.get("check_parity", False)
+    return describe(stuck.read_file(path), layers, side["launches"], check_parity)
 
 
 def main(paths: list[str]) -> int:

@@ -176,21 +176,45 @@ def stages_at(plan: Plan, cta: int, region: str) -> list[str]:
     ]
 
 
-def describe(rec: dict, plan: Plan, scratch_ptr: int, rank: int) -> str:
-    """One line on record ``rec``: where its poll waited and for what."""
+def tasks_on(plan: Plan, cta: int) -> list[str]:
+    """``stage#task`` of every task of ``plan`` that runs on CTA ``cta``
+    (tasks wrap the grid from the stage's base)."""
+    out = []
+    for s in plan.stages:
+        for task in range((cta - s.base) % plan.grid, s.tasks, plan.grid):
+            out.append(f"{s.name}#{task}")
+    return out
+
+
+def _where(rec: dict, plan: Plan | None, scratch_ptr: int):
+    """``(region, row, index, copy)`` of the pair record ``rec`` waited
+    for, or None outside ``plan``'s scratch (or with no plan)."""
+    pair, rem = divmod(rec["address"] - scratch_ptr, 8)
+    return None if rem or plan is None else locate(plan, pair)
+
+
+def describe(rec: dict, plan: Plan | None, scratch_ptr: int, rank: int) -> str:
+    """One line on record ``rec``: where its poll waited and for what. When
+    no stage of ``plan`` that reads the region runs on the record's CTA (a
+    record decoded under another launch's layout, say), the line names the
+    CTA's tasks and the plan instead of a stage."""
     step, layer = tag_launch(rec["expected"])
     ostep, olayer = tag_launch(rec["observed"])
-    pair, rem = divmod(rec["address"] - scratch_ptr, 8)
-    where = None if rem or plan is None else locate(plan, pair)
+    where = _where(rec, plan, scratch_ptr)
     if where is None:
         place = f"address {rec['address']:#x} (outside the scratch)"
-        stages = []
+        stage = "?"
     else:
         region, row, index, copy = where
         place = f"region {region} row {row} pair {index}" + (
             f" (copy {copy})" if plan.is_peer(region) else ""
         )
-        stages = stages_at(plan, rec["cta"], region)
+        stage = "/".join(stages_at(plan, rec["cta"], region)) or (
+            f"? (no stage that reads {region} runs on CTA {rec['cta']}; its "
+            f"tasks under the plan of {plan.rows} rows, chain {plan.chain}, "
+            f"{plan.row_pairs} pairs a row: "
+            f"{', '.join(tasks_on(plan, rec['cta'])) or 'none'})"
+        )
     waited = (rec["trap"] - rec["start"]) / TICKS_PER_SECOND
     seen = (
         "never written"
@@ -198,11 +222,16 @@ def describe(rec: dict, plan: Plan, scratch_ptr: int, rank: int) -> str:
         else f"tag {rec['observed']} (step {ostep} layer {olayer}), payload {rec['payload']:#x}"
     )
     return (
-        f"rank {rank} CTA {rec['cta']}: stage {'/'.join(stages) or '?'} waited for "
+        f"rank {rank} CTA {rec['cta']}: stage {stage} waited for "
         f"{place}: expected tag {rec['expected']} (step {step} layer {layer}, "
         f"parity {layer & 1}), saw {seen}; waited {waited:.1f} s from clock "
         f"{rec['start']} (operand {rec['operand']})"
     )
+
+
+def _plans(rec: dict, plan_of) -> list[Plan | None]:
+    _, layer = tag_launch(rec["expected"])
+    return plan_of(layer) or [None]
 
 
 def decode(t: torch.Tensor, plan_of) -> list[str]:
@@ -211,14 +240,76 @@ def decode(t: torch.Tensor, plan_of) -> list[str]:
     may have run (one per row count): a record is described under each
     whose layout holds its address."""
     h = header(t)
+    return [
+        describe(rec, plan, h["scratch_ptr"], h["rank"])
+        for rec in sorted(records(t), key=lambda r: r["start"])
+        for plan in _plans(rec, plan_of)
+    ]
+
+
+def _ranges(values: list[int]) -> str:
+    """``1-4, 7`` of sorted distinct ``values``."""
+    out, run = [], []
+    for v in sorted(set(values)):
+        if run and v != run[-1] + 1:
+            out.append(run)
+            run = []
+        run.append(v)
+    if run:
+        out.append(run)
+    return ", ".join(f"{r[0]}-{r[-1]}" if len(r) > 1 else f"{r[0]}" for r in out)
+
+
+def summarize(t: torch.Tensor, plan_of) -> list[str]:
+    """:func:`decode` with the records of one wait grouped: the same plan,
+    stage, region, copy and tags (any rows). A group prints its earliest
+    record, then how many CTAs waited there in all, on which rows and
+    pairs.
+
+    Groups come in plan order of their stages, then of their first check:
+    by the deadlock rule (``Plan``) the earliest stage that waits reads only
+    regions that earlier stages, on every rank, should have written, so it
+    names the cause, and the later groups wait downstream of it. The first
+    check alone would not: a stage that polls from the launch's start (an
+    expert stage on ``route``) checks first but waits on the stall."""
+    h = header(t)
+    groups: dict[tuple, list] = {}
+    for rec in records(t):
+        for i, plan in enumerate(_plans(rec, plan_of)):
+            where = _where(rec, plan, h["scratch_ptr"])
+            stages = (
+                () if where is None else tuple(stages_at(plan, rec["cta"], where[0]))
+            )
+            region = None if where is None else (where[0], where[3])
+            key = (i, stages, region, rec["expected"], rec["observed"])
+            groups.setdefault(key, []).append((rec, plan, where))
+
+    def order(members):
+        rec, plan, where = members[0]
+        names = [] if plan is None else [s.name for s in plan.stages]
+        waiting = [] if where is None else stages_at(plan, rec["cta"], where[0])
+        first = min((names.index(n) for n in waiting), default=len(names))
+        return first, min(m[0]["start"] for m in members)
+
     lines = []
-    for rec in sorted(records(t), key=lambda r: r["start"]):
-        _, layer = tag_launch(rec["expected"])
-        plans = plan_of(layer)
-        for plan in plans:
-            lines.append(describe(rec, plan, h["scratch_ptr"], h["rank"]))
-        if not plans:
-            lines.append(describe(rec, None, h["scratch_ptr"], h["rank"]))
+    for members in sorted(groups.values(), key=order):
+        members.sort(key=lambda m: m[0]["start"])
+        rec, plan, _ = members[0]
+        lines.append(describe(rec, plan, h["scratch_ptr"], h["rank"]))
+        if len(members) > 1:
+            ctas = _ranges([m[0]["cta"] for m in members])
+            located = [m[2] for m in members if m[2] is not None]
+            span = (members[-1][0]["start"] - rec["start"]) / TICKS_PER_SECOND * 1e6
+            lines.append(
+                f"  {len(members)} CTAs in all ({ctas})"
+                + (
+                    f" on rows {_ranges([w[1] for w in located])}, pairs "
+                    f"{_ranges([w[2] for w in located])}"
+                    if located
+                    else ""
+                )
+                + f", first checks within {span:.1f} us"
+            )
     return lines
 
 
@@ -234,5 +325,7 @@ __all__ = [
     "records",
     "stages_at",
     "stuck_buffer",
+    "summarize",
     "tag_launch",
+    "tasks_on",
 ]
