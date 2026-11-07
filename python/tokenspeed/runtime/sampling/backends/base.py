@@ -44,7 +44,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.sampling.dp_sampling_config import DpSamplingRuntimeConfig
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
-    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
+    from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ, TreeVerifyBatch
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -505,6 +505,14 @@ class SamplingBackend(ABC):
             bs=len(request_pool_indices),
             request_pool_indices=request_pool_indices,
         )
+
+    def warmup_eager(self, draft_q: DraftTreeQ | None) -> None:
+        """Compile, before serving, every kernel specialization the eager
+        (non-graph) sampling path can select, so no request compiles one on
+        the serving path. ``draft_q``: the live draft distributions
+        (``RuntimeStates.future_draft_q``), or None. Called once at startup on
+        every attention-TP rank (the startup kernel warmup). Backends without
+        such variants keep this no-op."""
 
     def prepare_capture(self, bs: int, num_tokens_per_req: int = 1) -> None:
         """Refill buffers before capture/warm-up without slot ownership changes.
