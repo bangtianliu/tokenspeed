@@ -62,8 +62,10 @@ each row's 8 picks as for one row.
   intermediates of its lane's first 8 slots at once (every row of each)
   into LDS, its first 4 slots' weights issued before that poll, then runs
   those slots with each slot's weights 4 slots ahead and no poll between
-  them. The BF16 partials go to the rank that owns those columns (``rr``),
-  which sums the 8 ranks' partials.
+  them. Past one row the gather also keeps each slot's row picks in LDS, so
+  a slot reads them in one load rather than a reduction a row. The BF16
+  partials go to the rank that owns those columns (``rr``), which sums the
+  8 ranks' partials.
 
 The slot table (:func:`slots`: each pick's slot, whether it owns its
 expert, every row's pick of it) is built once, by one task after the
@@ -1152,7 +1154,7 @@ def _ex2_gather(mb, union, expert):
 
 
 @gluon.jit
-def _ex2_gather_lane(mb, union, lane, S: gl.constexpr):
+def _ex2_gather_lane(mb, union, lane, S: gl.constexpr, KEEP_PICKS: gl.constexpr):
     """The polls of ex2 lane ``lane``'s first ``S`` slots in one round trip:
     each slot's MXFP4 intermediates (:func:`exr_stage`) of every row that
     picked its expert, MFMA row ``r`` row ``r`` (the other rows zero), into
@@ -1162,7 +1164,11 @@ def _ex2_gather_lane(mb, union, lane, S: gl.constexpr):
     The picks of all ``S`` slots come from the slot table in one reduction.
     A slot past the lane's last, and a row that did not pick the slot's
     expert, poll words that are published (the lane's first slot, the
-    slot's first routed row)."""
+    slot's first routed row). With ``KEEP_PICKS`` (past one row) it also
+    returns those picks in LDS, ``int32 [S, 16]``: row ``k`` is slot
+    ``lane + 8 k``, column ``r`` row ``r``'s pick of its expert, or -1 (a
+    row that did not pick it, a row past the launch's, or a slot past the
+    lane's last), from the same reduction."""
     R: gl.constexpr = schedule.rows(mb.plan)
     RP: gl.constexpr = triton.next_power_of_2(R)
     nw: gl.constexpr = gl.num_warps()
@@ -1179,6 +1185,19 @@ def _ex2_gather_lane(mb, union, lane, S: gl.constexpr):
     t3 = gl.convert_layout(table, gl.SliceLayout(0, l3))[None, :, :]
     picks = gl.max(gl.where((own > 0) & (mine == want), t3, -1), axis=1)  # [S, RP]
     tl: gl.constexpr = picks.type.layout
+    if KEEP_PICKS:
+        ks = gl.arange(0, S, gl.SliceLayout(1, tl))[:, None]
+        plain_p: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+        picks_smem = gl.allocate_shared_memory(gl.int32, [S, M_DUP], plain_p)
+        picks_smem.slice(0, RP, dim=1).store(
+            gl.where(lane + ks * LANES < count, picks, -1)
+        )
+        if RP < M_DUP:
+            # MFMA rows past the launch's rows: no pick.
+            fill: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [nw, 1], [1, 0])
+            picks_smem.slice(RP, M_DUP - RP, dim=1).store(
+                gl.full([S, M_DUP - RP], -1, gl.int32, fill)
+            )
     r = gl.arange(0, RP, gl.SliceLayout(0, tl))[None, :]
     routed = picks >= 0
     first = gl.min(gl.where(routed, r, RP), axis=1)[:, None]
@@ -1222,10 +1241,46 @@ def _ex2_gather_lane(mb, union, lane, S: gl.constexpr):
                 gl.zeros([S, RP << k, NB1 // 2], gl.int32, sl)
             )
     gl.barrier()
-    return (
+    out = (
         p_smem.reinterpret(gl.uint8, [S * M_DUP, INTER // 2], plain),
         s_smem.reinterpret(gl.uint8, [S * M_DUP, INTER // 32], plain),
     )
+    if KEEP_PICKS:
+        out += (picks_smem,)
+    return out
+
+
+@gluon.jit
+def _ex2_compute_picked(mb, task, loads, a, picks_smem, RANK: gl.constexpr):
+    """:func:`_ex2_compute` past one row, with the slot's row picks from LDS
+    (``picks_smem`` ``[1, 16]``, kept by :func:`_ex2_gather_lane`): MFMA row ``r`` is
+    row ``r``, as there."""
+    TASKS_PER_LANE: gl.constexpr = NB2 // EX2_BLOCKS
+    blk0 = (task % TASKS_PER_LANE) * EX2_BLOCKS
+    p_smem, s_smem = a
+    owner = (blk0 * BLOCK_N) // OWNED_OUT
+    for b in gl.static_range(EX2_BLOCKS):
+        acc = _mma_rows(p_smem, s_smem, loads[b])
+        out = gl.reshape(acc.to(gl.bfloat16), [M_DUP, BLOCK_N // 2, 2])
+        word = mx.pack_bf16_pairs(out)
+        wl: gl.constexpr = word.type.layout
+        mm = gl.arange(0, M_DUP, gl.SliceLayout(1, wl))[:, None]
+        p = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, wl))[None, :]
+        rl: gl.constexpr = gl.BlockedLayout(
+            [1, 1], [1, 64], [gl.num_warps(), 1], [1, 0]
+        )
+        pick_of = gl.convert_layout(
+            gl.reshape(picks_smem.load(rl), [M_DUP]), gl.SliceLayout(1, wl)
+        )[:, None]
+        col = ((blk0 + b) * BLOCK_N) % OWNED_OUT
+        at = ((RANK * TOP_K + pick_of) * OWNED_OUT + col) // 2 + p
+        mb.put_peer(
+            "rr",
+            owner,
+            mb.row_offset(mm) + at,
+            word,
+            mask=(pick_of >= 0) & (p >= 0),
+        )
 
 
 @gluon.jit
@@ -1340,7 +1395,13 @@ def ex2_finish(
                 stride_snb,
             ),
         )
-    p_smem, s_smem = _ex2_gather_lane(mb, union, lane, S)
+    if R > 1:
+        # Past one row, each slot's row picks come from LDS (kept by the
+        # gather from its one reduction): per slot, the R row scalars of
+        # _row_picks were R cross-lane reductions.
+        p_smem, s_smem, picks_smem = _ex2_gather_lane(mb, union, lane, S, True)
+    else:
+        p_smem, s_smem = _ex2_gather_lane(mb, union, lane, S, False)
     mb.stamp(STAGE, trace.READY)
     # MFMA row r is row r (rows that did not pick the slot's expert are zero).
     rows = ()
@@ -1363,12 +1424,17 @@ def ex2_finish(
                 ),
             )
         if i < count:
-            picks = _row_picks(union, _slot_expert(union, i), R)
             a = (
                 p_smem.slice(k * M_DUP, M_DUP, dim=0),
                 s_smem.slice(k * M_DUP, M_DUP, dim=0),
             )
-            _ex2_compute(mb, task, tiles[k], (a, picks, rows), RANK)
+            if R > 1:
+                _ex2_compute_picked(
+                    mb, task, tiles[k], a, picks_smem.slice(k, 1, dim=0), RANK
+                )
+            else:
+                picks = _row_picks(union, _slot_expert(union, i), R)
+                _ex2_compute(mb, task, tiles[k], (a, picks, rows), RANK)
     if S < RP:
         following = _slot_expert(union, lane + S * LANES)
         more = _ex2_loads(
