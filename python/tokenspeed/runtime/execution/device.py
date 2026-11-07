@@ -1512,6 +1512,12 @@ def build_device_side(
                 requested_backends,
                 startup_resident_bytes=sum(startup_memory.samples.get("startup", ())),
             )
+        # The first traversal compiled against the probe pool's tensors.
+        with (
+            startup_phase("kernels.serving_pool_warmup"),
+            current_platform().restore_stack_limit(),
+        ):
+            executor.warmup_serving_pool()
         if (
             draft is not None
             and server_args.speculative_algorithm == "DFLASH"

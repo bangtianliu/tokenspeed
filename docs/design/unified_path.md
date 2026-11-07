@@ -527,6 +527,17 @@ requests, and each route, pad and window width is a separate kernel
 specialization. The warmup samples and verifies every combination once, so no
 request compiles one on the serving path.
 
+A boot with the CUDA-graph memory reserve tunes on the probe build's cache
+pool, then rebuilds the serving pool. Variants compile against the traversal's
+real tensors, and Triton on AMD keys each tensor on whether its storage fits
+2 GiB (`tt.pointer_range`), so a kernel that reads the probe cache does not
+match the larger serving cache. After the rebind, startup runs the traversal
+again on the serving pool (`warmup_serving_pool`), compiling without tuning.
+Its KV writes go to the dummy tables' blocks (never block 0) before any
+request is admitted, as a capture's do; they are never prefix-matched, and
+an allocated block is written before it is read. The pass is one extend at
+the prefill budget, the activation size a chunked prefill allocates anyway.
+
 CuTe QSA keeps query rows and selected-slot row strides dynamic; model
 geometry, selection budgets and launch configurations stay static. Warmup
 covers encountered static signatures, including aligned and partial stream
