@@ -1194,33 +1194,36 @@ class ModelExecutor:
             num_tokens, bs, self.draft_attn_backend
         )
 
-    def autotune(self, *, keep_loaded_tactics: bool) -> None:
-        """Warm encountered kernels and optionally tune missing FlashInfer tactics; a reload keeps the tactics this process holds."""
-
-        per_rank_max_batch = max(
-            1,
-            int(self.config.max_num_seqs)
-            // max(int(self.config.data_parallel_size), 1),
-        )
-        if self.model_runner is None:
-            return
+    def _warmup_num_tokens(self) -> int:
+        """Token count of the startup traversal: the forwards this engine runs."""
         ib = self.input_buffers
         # The one traversal that discovers each operator is shaped like the
         # forwards this engine runs: an extend over the prefill budget, or,
         # on a disaggregated Decode worker, a decode step at the largest batch
         # -- the shape capture records later.
-        decode_only = self.config.decode_only_attention
-        if decode_only:
-            num_tokens = (
+        if self.config.decode_only_attention:
+            return (
                 self.forward_step.max_decode_bs * self.forward_step.max_tokens_per_req
             )
-        else:
-            num_tokens = min(
-                ib.input_ids_buf.numel(),
-                int(self.config.context_len) * per_rank_max_batch,
-            )
-            if self.config.chunked_prefill_size > 0:
-                num_tokens = min(num_tokens, int(self.config.chunked_prefill_size))
+        per_rank_max_batch = max(
+            1,
+            int(self.config.max_num_seqs)
+            // max(int(self.config.data_parallel_size), 1),
+        )
+        num_tokens = min(
+            ib.input_ids_buf.numel(),
+            int(self.config.context_len) * per_rank_max_batch,
+        )
+        if self.config.chunked_prefill_size > 0:
+            num_tokens = min(num_tokens, int(self.config.chunked_prefill_size))
+        return num_tokens
+
+    def autotune(self, *, keep_loaded_tactics: bool) -> None:
+        """Warm encountered kernels and optionally tune missing FlashInfer tactics; a reload keeps the tactics this process holds."""
+
+        if self.model_runner is None:
+            return
+        num_tokens = self._warmup_num_tokens()
         set_autotune_max_num_tokens(num_tokens)
         cpu_group = None
         if self.config.world_size > 1:
@@ -1252,7 +1255,7 @@ class ModelExecutor:
         # Prefill stays inside the actual buffer/request limits.
         logger.info(
             f"Kernel startup warmup with {num_tokens} "
-            f"{'decode' if decode_only else 'prefill'} tokens"
+            f"{'decode' if self.config.decode_only_attention else 'prefill'} tokens"
         )
 
         tic = time.time()
@@ -1264,63 +1267,7 @@ class ModelExecutor:
                 kernel_warmup(enabled=True),
                 autotune(tune_mode=tune_mode, tuning_buckets=None, round_up=None),
             ):
-                # Dummy forwards must not borrow live Engram history or masks.
-                ib.fill_dummy_decode_buffers(
-                    batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
-                )
-                if decode_only:
-                    # This role never runs an extend forward; the decode step
-                    # reaches the target and, through the speculative forward,
-                    # the draft.
-                    if self.drafter is not None:
-                        self._autotune_draft_experts(num_tokens)
-                    self.forward_step.warmup_decode_path(
-                        batch_sizes=(self.forward_step.max_decode_bs,),
-                        graph_phase=False,
-                    )
-                else:
-                    bs = dummy_batch_size(num_tokens, self.config.context_len)
-                    ctx = self.prefill_graph.make_dummy_batch(num_tokens, bs)
-                    # The model's rows: the span, or this rank's query shard of
-                    # it, as on a real extend (_run_target_forward).
-                    rows = (
-                        slice(0, num_tokens)
-                        if ctx.query_shard is None
-                        else ctx.query_shard.local_row_ids
-                    )
-                    positions = (
-                        ib.mrope_positions_buf[:, rows]
-                        if self.config.model_is_mrope
-                        else ib.positions_buf[rows]
-                    )
-                    with active_forward(ctx):
-                        self.model_runner.forward(
-                            ctx=ctx,
-                            input_ids=ib.input_ids_buf[rows],
-                            positions=positions,
-                            **self._model_input_kwargs(num_tokens, ctx.bs, rows),
-                        )
-                    if self.drafter is not None:
-                        self._autotune_draft_experts(num_tokens)
-                    if self.drafter is not None and not self.config.prefill_only:
-                        # Prefill-only roles do not allocate decode/verify scratch.
-                        # The draft model is reached through the shared speculative
-                        # forward, not model_runner.forward above. One request
-                        # per attention TP rank keeps sequence-parallel router
-                        # GEMMs nonempty on every peer for FlashInfer's lockstep
-                        # distributed tuning; on NVIDIA, server-argument
-                        # validation keeps the request cap at least that large.
-                        # Other platforms tune no cross-rank collectives, so a
-                        # smaller cap bounds the warmup to the decode state.
-                        self.forward_step.warmup_decode_path(
-                            batch_sizes=(
-                                min(
-                                    self.config.attention_tp_size,
-                                    self.forward_step.max_decode_bs,
-                                ),
-                            ),
-                            graph_phase=False,
-                        )
+                self._warmup_traversal(num_tokens)
                 if self._samples_from_vocab_shard:
                     self._warmup_vocab_shard_sampling()
         finally:
@@ -1363,6 +1310,94 @@ class ModelExecutor:
             draft_q=self.runtime_states.future_draft_q,
             with_vocab_mask=self.config.grammar_backend != "none",
         )
+
+    def warmup_serving_pool(self) -> None:
+        """Warm the traversal's kernels again on the cache pool that serves.
+
+        Startup tunes on the probe build's pool, then rebinds a larger one
+        (``reserve_and_rebind``). Triton on AMD keys each tensor on whether
+        its storage fits 2 GiB (``tt.pointer_range``), so every variant the
+        first traversal compiled for a cache-reading kernel misses on the
+        serving pool. This repeats the traversal there, compiling without
+        tuning; tactics come from the first pass. Its KV writes go to the
+        dummy tables' blocks before any request is admitted, as capture's do.
+        """
+        if self.model_runner is None or self.config.pp_size > 1:
+            return
+        device_module = torch.get_device_module(self.device)
+        device_module.synchronize()
+        device_module.reset_peak_memory_stats()
+        tic = time.time()
+        with torch.no_grad(), kernel_warmup(enabled=True):
+            self._warmup_traversal(self._warmup_num_tokens())
+        device_module.synchronize()
+        free, _ = device_module.mem_get_info()
+        logger.info(
+            f"Serving-pool kernel warmup finished in {time.time() - tic:.1f}s "
+            f"(peak allocated {device_module.max_memory_allocated() / 2**30:.2f} GiB, "
+            f"{free / 2**30:.2f} GiB free after)"
+        )
+
+    def _warmup_traversal(self, num_tokens: int) -> None:
+        """The startup dummy forwards that reach every operator once."""
+        ib = self.input_buffers
+        # Dummy forwards must not borrow live Engram history or masks.
+        ib.fill_dummy_decode_buffers(
+            batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
+        )
+        if self.config.decode_only_attention:
+            # This role never runs an extend forward; the decode step
+            # reaches the target and, through the speculative forward,
+            # the draft.
+            if self.drafter is not None:
+                self._autotune_draft_experts(num_tokens)
+            self.forward_step.warmup_decode_path(
+                batch_sizes=(self.forward_step.max_decode_bs,),
+                graph_phase=False,
+            )
+            return
+        bs = dummy_batch_size(num_tokens, self.config.context_len)
+        ctx = self.prefill_graph.make_dummy_batch(num_tokens, bs)
+        # The model's rows: the span, or this rank's query shard of
+        # it, as on a real extend (_run_target_forward).
+        rows = (
+            slice(0, num_tokens)
+            if ctx.query_shard is None
+            else ctx.query_shard.local_row_ids
+        )
+        positions = (
+            ib.mrope_positions_buf[:, rows]
+            if self.config.model_is_mrope
+            else ib.positions_buf[rows]
+        )
+        with active_forward(ctx):
+            self.model_runner.forward(
+                ctx=ctx,
+                input_ids=ib.input_ids_buf[rows],
+                positions=positions,
+                **self._model_input_kwargs(num_tokens, ctx.bs, rows),
+            )
+        if self.drafter is not None:
+            self._autotune_draft_experts(num_tokens)
+        if self.drafter is not None and not self.config.prefill_only:
+            # Prefill-only roles do not allocate decode/verify scratch.
+            # The draft model is reached through the shared speculative
+            # forward, not model_runner.forward above. One request
+            # per attention TP rank keeps sequence-parallel router
+            # GEMMs nonempty on every peer for FlashInfer's lockstep
+            # distributed tuning; on NVIDIA, server-argument
+            # validation keeps the request cap at least that large.
+            # Other platforms tune no cross-rank collectives, so a
+            # smaller cap bounds the warmup to the decode state.
+            self.forward_step.warmup_decode_path(
+                batch_sizes=(
+                    min(
+                        self.config.attention_tp_size,
+                        self.forward_step.max_decode_bs,
+                    ),
+                ),
+                graph_phase=False,
+            )
 
     def _autotune_draft_experts(self, num_tokens: int) -> None:
         """Warm the draft model's routed-expert kernels inside the startup window.

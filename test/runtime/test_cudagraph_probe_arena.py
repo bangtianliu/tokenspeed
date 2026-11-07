@@ -370,6 +370,9 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
             free[0] -= tune_keeps + (1 << 30)
             stack[0] += 1 << 30
 
+        def warmup_serving_pool(self):
+            pass
+
         def capture_graphs(self, *, entries, observer):
             raise _ServingCapture
 
@@ -524,6 +527,7 @@ def test_the_boot_probes_rebuilds_and_captures_in_order() -> None:
         "build_components",
         "autotune",
         "_rebind_under_reserve",
+        "warmup_serving_pool",
         "_capture_serving_graphs",
     }
     calls = sorted(
@@ -535,9 +539,12 @@ def test_the_boot_probes_rebuilds_and_captures_in_order() -> None:
         "build_components",
         "autotune",
         "_rebind_under_reserve",
+        # Kernels warmed on the probe pool keyed on its tensors: warm again on
+        # the serving pool before anything serves.
+        "warmup_serving_pool",
         "_capture_serving_graphs",
     ]
-    refusal, probe_build, _, _, _ = calls
+    refusal, probe_build, _, _, _, _ = calls
     # The serving capture, which a forward reload repeats, then reseeds the generator.
     capture = _function("execution/device.py", "_capture_serving_graphs")
     serving, seed = sorted(

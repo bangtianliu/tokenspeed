@@ -1651,6 +1651,12 @@ def build_device_side(
                 requested_backends,
                 startup_resident_bytes=sum(startup_memory.samples.get("startup", ())),
             )
+        # The first traversal compiled against the probe pool's tensors.
+        with (
+            startup_phase("kernels.serving_pool_warmup"),
+            current_platform().restore_stack_limit(),
+        ):
+            executor.warmup_serving_pool()
         _warm_rebound_draft(executor, server_args, has_draft=draft is not None)
 
     with startup_phase("graph.capture"):
