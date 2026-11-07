@@ -14,7 +14,7 @@ That file also gives the launch contract and the rules for writing a stage.
 | `gluon_muse_spark_layer_gfx950` | A decoder layer with MXFP4 routed experts: sliding-window (RoPE) or full (NoPE) attention, by the `full` flag. |
 
 `layer.py` holds the kernel, its plans (`layer_plan(full)`) and its launcher
-`launch_gluon_muse_spark_layer_gfx950`. `tokenspeed_kernel/ops/monokernel/`
+`launch_gluon_muse_spark_layer_gfx950`. `tokenspeed_kernel/ops/model/muse_spark/monokernel/`
 registers them as `prepare_muse_spark_layer` and `muse_spark_layer_decode`.
 
 ### Contract
