@@ -105,6 +105,21 @@ def ffn_words(rows: int) -> bool:
     return int(rows) > 8
 
 
+def rank_blocks(region: str, pairs: int) -> tuple[tuple[int, int], ...]:
+    """``(start, pairs)`` of each block of peer region ``region`` (``pairs``
+    pairs a row) that the ranks split in rank order: rank ``r`` writes the
+    ``r``-th ``WORLD``-th of every block. ``ffn`` holds three such blocks
+    (``p``, ``alpha h'``, the sums); the other regions are one block."""
+    if region != "ffn":
+        return ((0, pairs),)
+    world, hidden = int(WORLD), int(HIDDEN)
+    return (
+        (0, hidden // 2),
+        (int(AH_AT), hidden),
+        (int(SUMS_AT), world * int(UNPOOL_TASKS) * int(SUMS)),
+    )
+
+
 def peers(rows: int) -> tuple[str, ...]:
     """The peer regions of ``rows`` token rows."""
     return PEERS + (WORDS_PEERS if ffn_words(rows) else ())
