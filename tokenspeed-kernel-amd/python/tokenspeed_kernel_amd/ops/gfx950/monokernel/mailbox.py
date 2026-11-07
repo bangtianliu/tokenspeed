@@ -706,7 +706,7 @@ class Mailbox:
         )
 
     @gluon.jit
-    def store_words_peer(self, region: gl.constexpr, peer, index, values):
+    def store_words_peer(self, region: gl.constexpr, peer, index, values, mask=None):
         """:meth:`store_words` into rank ``peer``'s copy of peer region
         ``region`` (``peer`` may be this rank), published with
         :meth:`raise_flag_peers`. The write-through stores cross the links
@@ -716,7 +716,7 @@ class Mailbox:
         )
         base = self.peers.translate(self._words(region), peer)
         gl.amd.cdna4.buffer_store(
-            values.to(gl.int32, bitcast=True), base, index, cache=".wt"
+            values.to(gl.int32, bitcast=True), base, index, mask=mask, cache=".wt"
         )
 
     @gluon.jit

@@ -91,11 +91,30 @@ AH_AT = gl.constexpr(int(HIDDEN) // 2)  # where ``alpha h'`` starts in ``ffn``
 SUMS_AT = gl.constexpr(3 * int(HIDDEN) // 2)  # where the sums start in ``ffn``
 
 PEERS = ("ss3", "cmb", "ffn")
+# Past 8 rows (two requests) unpool publishes ``ffn`` as plain words and one
+# flag per task in ``ffnf``: the link is the limit there (1.8 MB a launch
+# out of each GPU as tagged pairs). Up to 8 rows it keeps tagged pairs: a
+# flag waits for the remote stores' acknowledgments, on the tail's
+# critical path (measured: the same words + flag hand-off lost on cmb).
+WORDS_PEERS = ("ffnf",)
 
 
-def regions() -> tuple[tuple[str, int], ...]:
+@gluon.constexpr_function
+def ffn_words(rows: int) -> bool:
+    """Whether unpool hands ``ffn`` to out as plain words and flags."""
+    return int(rows) > 8
+
+
+def peers(rows: int) -> tuple[str, ...]:
+    """The peer regions of ``rows`` token rows."""
+    return PEERS + (WORDS_PEERS if ffn_words(rows) else ())
+
+
+def regions(rows: int) -> tuple[tuple[str, int], ...]:
+    """The regions of ``rows`` token rows (past 8 rows also ``ffnf``)."""
     world, k = int(WORLD), int(TOP_K)
-    return (
+    flags = (("ffnf", world * int(UNPOOL_TASKS)),) if ffn_words(rows) else ()
+    return flags + (
         ("ss3", world * int(COMB_TASKS) * k),  # FP32 [rank][task][route]
         ("cmb", int(POOLED) // 2),  # BF16 pairs of the combined row
         # BF16 pairs of p, FP32 alpha h' [column], then the FP32 sums:
@@ -119,15 +138,16 @@ def stages(
         raise ValueError(f"out tasks a row: 8 or 16, got {out_per_row}")
     comb, unpool, out = placement(bases, ("comb", "unpool", "out"))
     c, u = int(COMB_TASKS) * rows, int(UNPOOL_TASKS) * unpool_halves(rows)
+    ffn = ("ffn", "ffnf") if ffn_words(rows) else ("ffn",)
     return (
         Stage("comb1", c, comb, reads=("rr", "route"), writes=("ss3",)),
         Stage("comb2", c, comb, reads=("ss3",), writes=("cmb",)),
-        Stage("unpool", u, unpool, reads=("cmb", "hp"), writes=("ffn",)),
+        Stage("unpool", u, unpool, reads=("cmb", "hp"), writes=ffn),
         Stage(
             "out",
             out_per_row * rows,
             out,
-            reads=("ffn",),
+            reads=ffn,
             writes=("anx", "anxf") if publish else (),
         ),
     )
@@ -225,6 +245,20 @@ def _ffn_norms(mb):
     _pre_poll_sums(mb)
     (got,) = mb.poll_many(("ffn",), (_ffn_sums_index(),))
     return _ffn_scales(got)
+
+
+@gluon.jit
+def _ffn_word_flags(mb, first):
+    """Past 8 rows: poll every rank's and unpool task's flag of the row
+    group whose first row is ``first`` rows from ``mb``'s (``ffnf`` sits in
+    that row), then meet at a barrier: the words load after."""
+    lanes = gl.arange(0, 64 * gl.num_warps(), mailbox.lane_layout(gl.num_warps()))
+    N: gl.constexpr = WORLD * UNPOOL_TASKS
+    at = first * schedule.row_pairs(mb.plan)
+    mb.pre_poll("ffnf", at + gl.minimum(lanes * N // 64, N - 1))
+    f = gl.arange(0, N, lanes.type.layout)
+    mb.poll_many(("ffnf",), (at + f,))
+    gl.barrier()
 
 
 @gluon.jit
@@ -399,8 +433,16 @@ def unpool_stages(
     )
     word = vals.to(gl.int32, bitcast=True)
     put = ((k < 3) | ((k == 3) & (j3 < SUMS))) & (r3 < R)
-    for p in gl.static_range(WORLD):
-        mb.put_peer("ffn", p, idx, word, mask=put)
+    if ffn_words(schedule.rows(mb.plan)):
+        # Plain words (row r's copy at word 2 row_offset(r)), then one flag:
+        # the stores go out before any later load (vmcnt is in order).
+        widx = 2 * mb.row_offset(r3) + (idx - mb.row_offset(r3))
+        for p in gl.static_range(WORLD):
+            mb.store_words_peer("ffn", p, widx, word, mask=put)
+        mb.raise_flag_peers("ffnf", RANK * UNPOOL_TASKS + task)
+    else:
+        for p in gl.static_range(WORLD):
+            mb.put_peer("ffn", p, idx, word, mask=put)
     mb.stamp("unpool", trace.END)
 
 
@@ -461,12 +503,23 @@ def out_stage(
     b_hi = gl.load(beta + c + 1)
     in_lo = gl.load(in_gain + c)
     in_hi = gl.load(in_gain + c + 1)
-    # Each unpool task puts its columns and its sums in one store, so the
-    # columns' poll after the sums' barely waits.
-    inv, inv2 = _ffn_norms(mb)
-    pw, ah_lo, ah_hi = mb.poll_many(
-        ("ffn", "ffn", "ffn"), (i, AH_AT + c, AH_AT + c + 1)
-    )
+    if ffn_words(schedule.rows(mb.plan)):
+        # Past 8 rows: the row group's flags, then the words.
+        G: gl.constexpr = schedule.rows(mb.plan) // unpool_halves(
+            schedule.rows(mb.plan)
+        )
+        _ffn_word_flags(mb, (row // G) * G - row)
+        inv, inv2 = _ffn_scales(mb.load_words("ffn", _ffn_sums_index()))
+        pw = mb.load_words("ffn", i)
+        ah_lo = mb.load_words("ffn", AH_AT + c)
+        ah_hi = mb.load_words("ffn", AH_AT + c + 1)
+    else:
+        # Each unpool task puts its columns and its sums in one store, so the
+        # columns' poll after the sums' barely waits.
+        inv, inv2 = _ffn_norms(mb)
+        pw, ah_lo, ah_hi = mb.poll_many(
+            ("ffn", "ffn", "ffn"), (i, AH_AT + c, AH_AT + c + 1)
+        )
     mb.stamp(STAGE, trace.READY)
     # y as unpool computed it: the BF16 projection times the gain.
     y_lo = (pw << 16).to(gl.float32, bitcast=True) * post_lo
