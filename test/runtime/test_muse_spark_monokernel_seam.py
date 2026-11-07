@@ -24,6 +24,7 @@ and which models the kernels serve. CPU only."""
 from __future__ import annotations
 
 import os
+import re
 import sys
 from types import SimpleNamespace
 
@@ -57,11 +58,13 @@ from tokenspeed.runtime.models.muse_spark_monokernel import (  # noqa: E402
     OTHER_KV,
     OTHER_SHAPES,
     SCALED_KV,
-    MonokernelStep,
     _rank_slices,
+    enable_decode_monokernels,
+    hands_whole_rows,
     kv_reasons,
     model_reasons,
     projection_hand_off,
+    row_lengths,
     takes_monokernels,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict  # noqa: E402
@@ -118,21 +121,29 @@ def test_launches_between_fused_layers_hand_the_projection_on() -> None:
     assert projection_hand_off(30, 1, fused, proj) == (None, None)
 
 
+def test_a_launch_hands_whole_rows_where_the_model_reads_them() -> None:
+    """Between two launches the residual stays owned columns; a launch
+    gathers whole rows before a regular layer, and before a layer that a
+    draft taps unless the launches store the taps themselves."""
+    served = set(range(1, 61))
+    assert not hands_whole_rows(5, served, frozenset(), False)
+    assert hands_whole_rows(60, served, frozenset(), False)
+    # A tapped layer whose taps the model captures (the launches store none,
+    # for example because another tapped layer follows layer 0).
+    assert hands_whole_rows(5, served, frozenset({1, 6}), False)
+    assert not hands_whole_rows(5, served, frozenset({1, 6}), True)
+
+
 def test_a_verify_step_gives_each_row_its_token_length() -> None:
     """Verify metadata holds each request's length after the step; row t of
     a request's rows is its token at position seq - chain + t."""
-    # MonokernelSteps' row offsets (its other state needs the Iris heap).
     offsets = torch.arange(1 - MAX_ROWS, 1, dtype=torch.int32)
-    monokernels = SimpleNamespace(steps=SimpleNamespace(row_offsets=offsets))
     seq_lens = torch.tensor([100, 7], dtype=torch.int32)
-    verify = MonokernelStep(monokernels, 8, 1, [], False)
-    assert verify._row_lengths(0, seq_lens).tolist() == list(range(93, 101))
+    assert row_lengths(seq_lens, offsets, 1, 8).tolist() == list(range(93, 101))
     # Two requests: each request's rows end at its own length.
-    both = MonokernelStep(monokernels, 6, 2, [], False)
-    assert both._row_lengths(0, seq_lens).tolist() == [98, 99, 100, 5, 6, 7]
+    assert row_lengths(seq_lens, offsets, 2, 3).tolist() == [98, 99, 100, 5, 6, 7]
     # One decode row a request reads the metadata as is.
-    decode = MonokernelStep(monokernels, 2, 2, [], False)
-    assert decode._row_lengths(0, seq_lens).tolist() == [100, 7]
+    assert row_lengths(seq_lens, offsets, 2, 1).tolist() == [100, 7]
 
 
 def _text_config(**overrides) -> dict:
@@ -232,6 +243,29 @@ def test_muse_spark_open_at_tp8_has_monokernels(moe_tp, moe_ep) -> None:
 @pytest.mark.parametrize("moe_tp, moe_ep", [(4, 2), (2, 4)])
 def test_other_moe_splits_keep_the_regular_path(moe_tp, moe_ep) -> None:
     assert model_reasons(_config(), _mapping(moe_tp, moe_ep)) == [NOT_TP8]
+
+
+class _UnpackedLayer(torch.nn.Module):
+    """What enable_decode_monokernels touches of a monokernel decoder layer:
+    its launch and, on an EP8 server, its MoE's expert slices."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fused = None
+        self.mlp = torch.nn.Module()
+        self.mlp.monokernel_experts = None
+
+
+def test_a_model_the_kernels_cannot_pack_fails_startup() -> None:
+    """--decode-monokernel never serves a layer without its kernel: on a
+    split the kernels do not serve, loading fails and names every layer
+    with the reason (docs/design/monokernel.md)."""
+    model = torch.nn.Module()
+    model.config = _config()
+    model.mapping = _mapping(4, 2)
+    model.layers = torch.nn.ModuleList(_UnpackedLayer() for _ in range(4))
+    with pytest.raises(ValueError, match=re.escape(f"{NOT_TP8}: layers 0, 1, 2, 3")):
+        enable_decode_monokernels(model)
 
 
 def test_an_fp8_kv_cache_takes_the_kernels(monkeypatch) -> None:

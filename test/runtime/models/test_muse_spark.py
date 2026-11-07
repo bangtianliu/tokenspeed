@@ -62,6 +62,7 @@ from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 from tokenspeed.runtime.models import muse_spark as module
 from tokenspeed.runtime.models.base.weight_update import weight_update_session
+from tokenspeed.runtime.models.monokernel import MonokernelState
 from tokenspeed.runtime.models.muse_spark import (
     RESIDUAL_GATE_EPS,
     MuseSparkAttention,
@@ -327,7 +328,7 @@ class _AddLayer(torch.nn.Module):
 def test_forward_threads_attention_input_rows_between_layers() -> None:
     model = _stub(MuseSparkForConditionalGeneration.model_cls)
     model.layers = torch.nn.ModuleList(_AddLayer(float(i + 1)) for i in range(3))
-    model.monokernels = None
+    model.monokernel_state = None
     hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     model._embed_hidden = lambda input_ids, input_embeds: input_embeds
     model.embed_tokens = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
@@ -363,7 +364,7 @@ def _tapping_model(taps: list[int], with_sink: bool = True):
     """Three constant-adding layers and a draft capturing the layers in ``taps``."""
     model = _stub(MuseSparkForConditionalGeneration.model_cls)
     model.layers = torch.nn.ModuleList(_AddLayer(float(i + 1)) for i in range(3))
-    model.monokernels = None
+    model.monokernel_state = None
     model._embed_hidden = lambda input_ids, input_embeds: input_embeds
     model.embed_tokens = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
     model.norm = lambda value, out_dtype: -value.to(out_dtype)
@@ -408,36 +409,58 @@ def test_forward_taps_the_residual_stream_after_each_draft_target_layer(
     assert sink.captures[0][1] is aux[0] and sink.captures[1][1] is aux[1]
 
 
-def test_a_tap_entering_a_fused_layer_reads_the_rows_the_step_returned() -> None:
-    # The step gathers the whole rows before a layer a draft taps; the tap
-    # must read what the fused run before it returned, and the plan must
-    # know the tapped layers.
+class _StepState(MonokernelState):
+    """A monokernel state that records the model's calls; its launches
+    store the taps when ``stores_taps``."""
+
+    def __init__(self, stores_taps: bool, taps: torch.Tensor | None) -> None:
+        super().__init__(torch.device("cpu"), 0)
+        self.stores_taps = stores_taps
+        self.taps = taps
+        self.calls: list[str] = []
+
+    def start_step(self) -> None:
+        super().start_step()
+        self.calls.append("start")
+
+    def finish_step(self) -> torch.Tensor | None:
+        self.calls.append("finish")
+        return super().finish_step()
+
+    def serves_taps(self, rows, ctx) -> bool:
+        self.calls.append("serves_taps")
+        return self.stores_taps
+
+    def tap_rows(self, rows: int) -> torch.Tensor:
+        return self.taps[:rows]
+
+
+def test_a_monokernel_step_brackets_the_layers_and_keeps_the_regular_capture() -> None:
+    # With a capture sink, the launches do not store the taps: the model
+    # captures the rows the layer before the tap returned, as without
+    # monokernels, between start_step and finish_step.
     model, sink, ctx = _tapping_model([0])  # taps the stream entering layer 1
-    planned = []
-
-    def fused(*, hidden_states, attention_input, ctx):
-        return hidden_states + 10.0, attention_input
-
-    # The forward has a capture sink, so the model, not the launches, takes
-    # the taps.
-    step = SimpleNamespace(
-        layer=lambda index: fused if index == 0 else None,
-        finish=lambda: None,
-        serves_taps=lambda: False,
-    )
-
-    def plan(rows, ctx, taps):
-        planned.append(list(taps))
-        return step
-
-    model.monokernels = SimpleNamespace(plan=plan)
+    state = _StepState(stores_taps=False, taps=None)
+    model.monokernel_state = state
     hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
 
     model.forward(torch.tensor([0, 1]), torch.tensor([0, 1]), ctx, hidden)
 
-    assert planned == [model.layers_to_capture]
+    assert state.calls == ["start", "serves_taps", "finish"]
     # A sink gets full rows unrounded (it rounds as it copies).
-    torch.testing.assert_close(sink.captures[0][1], hidden + 10.0, rtol=0, atol=0)
+    torch.testing.assert_close(sink.captures[0][1], hidden + 1.0, rtol=0, atol=0)
+
+
+def test_taps_the_launches_store_replace_the_models_captures() -> None:
+    model, sink, ctx = _tapping_model([0], with_sink=False)
+    stored = torch.full((2, 3), 7.0, dtype=torch.bfloat16)
+    model.monokernel_state = _StepState(stores_taps=True, taps=stored)
+    hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    _, aux = model.forward(torch.tensor([0, 1]), torch.tensor([0, 1]), ctx, hidden)
+
+    assert len(aux) == 1 and aux[0] is not None
+    torch.testing.assert_close(aux[0], stored, rtol=0, atol=0)
 
 
 def test_idle_forward_taps_nothing() -> None:

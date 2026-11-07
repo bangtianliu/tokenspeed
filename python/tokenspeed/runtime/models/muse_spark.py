@@ -119,9 +119,11 @@ from tokenspeed.runtime.models.base import BaseCausalLM, BaseTransformerModel
 from tokenspeed.runtime.models.base.transformer_model import notify_target_capture
 from tokenspeed.runtime.models.muse_spark_audio import MuseSparkAudioTower
 from tokenspeed.runtime.models.muse_spark_monokernel import (
-    MuseSparkMonokernels,
+    MuseSparkMonokernelLayer,
+    MuseSparkMonokernelState,
     enable_decode_monokernels,
     prepare_ep8_experts,
+    prepare_monokernel_state,
 )
 from tokenspeed.runtime.models.muse_spark_vision import MuseSparkVisionTower
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
@@ -2359,10 +2361,16 @@ def _widen_modelopt_exclusions(quant_config: QuantizationConfig | None) -> None:
     ]
 
 
+class MuseSparkMonokernelDecoderLayer(MuseSparkMonokernelLayer, MuseSparkDecoderLayer):
+    """Muse Spark layer whose decode steps run as one monokernel launch."""
+
+
 class MuseSparkModel(BaseTransformerModel):
     """Text decoder using TokenSpeed's ordinary MHA cache route."""
 
     layer_cls = MuseSparkDecoderLayer
+    # The layer class with --decode-monokernel.
+    monokernel_layer_cls = MuseSparkMonokernelDecoderLayer
 
     def __init__(
         self,
@@ -2391,10 +2399,10 @@ class MuseSparkModel(BaseTransformerModel):
             weight_offset=OUTPUT_GAIN_OFFSET,
         )
         self.iris_state: MuseIrisState | None = None
-        # The decode monokernels (--decode-monokernel), packed after loading
-        # by enable_decode_monokernels. None runs every step on the regular
-        # path.
-        self.monokernels: MuseSparkMonokernels | None = None
+        # The state that the monokernel layers share (--decode-monokernel),
+        # set by prepare_monokernel_state once the Iris collectives exist.
+        # None with the regular layers.
+        self.monokernel_state: MuseSparkMonokernelState | None = None
 
     def resolve_layers(
         self,
@@ -2410,9 +2418,12 @@ class MuseSparkModel(BaseTransformerModel):
             if torch.cuda.is_available() and not current_platform().is_cdna4
             else None
         )
+        layer_cls = (
+            self.monokernel_layer_cls if config.decode_monokernel else self.layer_cls
+        )
         return make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: self.layer_cls(
+            lambda idx, prefix: layer_cls(
                 config=config,
                 layer_id=idx,
                 mapping=self.mapping,
@@ -2501,13 +2512,9 @@ class MuseSparkModel(BaseTransformerModel):
         )
         rows, width = hidden_states.shape
         owned_global_rows = rows if self._can_use_owned_rows(rows, ctx) else None
-        # Decode monokernels: a plan for this forward, or None for the
-        # regular path.
-        step = (
-            self.monokernels.plan(rows, ctx, self.layers_to_capture)
-            if self.monokernels is not None and owned_global_rows is None
-            else None
-        )
+        state = self.monokernel_state
+        if state is not None:
+            state.start_step()
         attention_input = None
         if owned_global_rows is not None:
             local_rows = (
@@ -2528,7 +2535,11 @@ class MuseSparkModel(BaseTransformerModel):
         # An idle forward captures no hidden states, as in the base model's loop.
         taps_live = owned_global_rows is not None or not ctx.forward_mode.is_idle()
         # The launches may store the draft's taps themselves.
-        launch_taps = step is not None and step.serves_taps()
+        launch_taps = (
+            state is not None
+            and owned_global_rows is None
+            and state.serves_taps(rows, ctx)
+        )
         for layer_index, layer in enumerate(self.layers):
             if taps_live and not launch_taps and layer_index in self.layers_to_capture:
                 self._capture(
@@ -2538,16 +2549,6 @@ class MuseSparkModel(BaseTransformerModel):
                     aux_hidden_states,
                     ctx,
                 )
-            fused = None if step is None else step.layer(layer_index)
-            if fused is not None:
-                # The step gathers the whole rows before a tapped layer, so
-                # the capture above read the current residual.
-                hidden_states, attention_input = fused(
-                    hidden_states=hidden_states,
-                    attention_input=attention_input,
-                    ctx=ctx,
-                )
-                continue
             # Each FFN boundary emits the next layer's attention input rows.
             next_input_layernorm = (
                 self.layers[layer_index + 1].input_layernorm
@@ -2556,18 +2557,20 @@ class MuseSparkModel(BaseTransformerModel):
             )
             # Preserve the owned path's direct call without Module hooks.
             layer_forward = layer.forward if owned_global_rows is not None else layer
+            # A launch before a layer that a draft taps hands over the whole
+            # rows, so the capture above read the current residual.
             hidden_states, attention_input = layer_forward(
-                positions,
-                hidden_states,
-                ctx,
-                attention_input,
-                next_input_layernorm,
-                owned_global_rows,
+                positions=positions,
+                hidden_states=hidden_states,
+                ctx=ctx,
+                attention_input=attention_input,
+                next_input_layernorm=next_input_layernorm,
+                owned_global_rows=owned_global_rows,
             )
-        if step is not None:
-            step.finish()
+        if state is not None:
+            state.finish_step()
         if launch_taps:
-            aux_hidden_states = [step.tap_rows()]
+            aux_hidden_states = [state.tap_rows(rows)]
         if taps_live:
             final_layer_index = len(self.layers) + 1
             if final_layer_index in self.layers_to_capture:
@@ -3005,13 +3008,13 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 state.intermediate_gather_min_rows,
                 intermediate_gather_max_rows,
             )
-        if self.model.monokernels is not None:
+        if self.model.config.decode_monokernel:
             # The mailbox scratch lives on the same Iris heap.
-            self.model.monokernels.prepare(
+            prepare_monokernel_state(
+                self.model,
                 process_group_manager.get_device_process_group(group),
                 process_group_manager.get_process_group("gloo", group),
                 group.index(dist.get_rank()),
-                list(self.model.layers_to_capture),
             )
         return True
 
@@ -3289,7 +3292,8 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             if self._loaded_audio != audio_parameters:
                 missing = sorted(audio_parameters - self._loaded_audio)
                 raise ValueError(f"checkpoint is missing audio tensors: {missing[:5]}")
-        enable_decode_monokernels(self.model)
+        if self.model.config.decode_monokernel:
+            enable_decode_monokernels(self.model)
         bf16_mlps = [
             layer.mlp for layer in self.model.layers if not layer.mlp.quantized_experts
         ]
