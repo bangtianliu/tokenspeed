@@ -61,6 +61,7 @@ __all__ = [
 ]
 
 
+@dataclass(frozen=True)
 class FusedDecodeLayer:
     """A decoder layer packed for its monokernel.
 

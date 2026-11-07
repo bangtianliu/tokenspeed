@@ -205,6 +205,19 @@ def _pack(
 ):
     """Pack ``rank``'s layer from the regular path's tensors (``length``: the
     last row's length), with MXFP4 or BF16 experts."""
+    return pack_layer(**_layer_tensors(rank, dev, sh, length, full, bf16_experts))
+
+
+def _layer_tensors(
+    rank: int,
+    dev: torch.device,
+    sh: dict,
+    length: int,
+    full: bool,
+    bf16_experts: bool = False,
+) -> dict:
+    """The packer's tensors by role (:func:`pack_layer`'s arguments, which the
+    kernel boundary's ``prepare_muse_spark_layer`` takes as ``tensors``)."""
     w = _rank_weights(rank, length)
     if bf16_experts:
         # Every expert's room, as the regular path holds them (the routing
@@ -220,7 +233,7 @@ def _pack(
     # The packer takes the regular path's tensors: the replicated pooler
     # and post-expert weights, and the router as the regular path stores
     # it (logits are x @ router); it slices this rank's part.
-    return pack_layer(
+    return dict(
         rank=rank,
         full=full,
         qkvg=w["w_qkvg"].to(dev),
@@ -417,6 +430,29 @@ def _worker(
         dist.barrier()
     finally:
         dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_the_kernel_boundary_packs_a_layer_for_its_launches(full):
+    """The runtime packs a layer through the kernel boundary
+    (``prepare_muse_spark_layer``): it returns the packed layer and the
+    mailbox scratch that the plans of every row count up to the launch's
+    rows need."""
+    from tokenspeed_kernel.ops.model.muse_spark.monokernel import (
+        FusedDecodeLayer,
+        prepare_muse_spark_layer,
+    )
+
+    dev = torch.device("cuda:0")
+    tensors = _layer_tensors(0, dev, _shared(42, 3000, 1), 3000, full)
+    fused = prepare_muse_spark_layer(tensors=tensors, max_rows=layer.MAX_ROWS)
+
+    assert isinstance(fused, FusedDecodeLayer)
+    assert fused.weights.full is full and fused.weights.rank == 0
+    widest = layer.layer_plan(
+        full, layer.MAX_ROWS, layer.MAX_ROWS, True, True, False, False, False
+    )
+    assert fused.scratch_pairs >= widest.scratch_pairs
 
 
 @pytest.mark.parametrize("rows", [1, 8])
