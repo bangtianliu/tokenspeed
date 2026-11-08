@@ -58,6 +58,7 @@ from tokenspeed.runtime.models.muse_spark_monokernel import (  # noqa: E402
     OTHER_KV,
     OTHER_SHAPES,
     SCALED_KV,
+    CompiledLaunches,
     _rank_slices,
     enable_decode_monokernels,
     hands_whole_rows,
@@ -97,6 +98,19 @@ def test_decode_steps_of_up_to_max_requests_take_the_kernels() -> None:
     assert not takes_monokernels(3, _ctx(ForwardMode.DECODE, 3, 3))
     assert not takes_monokernels(1, _ctx(ForwardMode.EXTEND, 1, 1))
     assert not takes_monokernels(1, _ctx(ForwardMode.IDLE, 1, 1))
+
+
+def test_each_request_split_of_the_same_rows_compiles_ahead_once() -> None:
+    # 2 rows are two decode requests (chain 1) or one 2-token verify (chain 2),
+    # 8 rows one 8-token verify or two 4-token ones: different binaries, each
+    # compiled on every rank before its first launch, and only then.
+    compiled = CompiledLaunches()
+    for rows, chain in ((2, 1), (2, 2), (8, 8), (8, 4)):
+        assert compiled.first(5, rows, chain, False)
+    for rows, chain in ((2, 1), (2, 2), (8, 8), (8, 4)):
+        assert not compiled.first(5, rows, chain, False)
+    assert compiled.first(5, 2, 1, True)
+    assert compiled.first(6, 2, 1, False)
 
 
 def test_launches_between_fused_layers_hand_the_projection_on() -> None:

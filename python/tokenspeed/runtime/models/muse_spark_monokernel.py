@@ -394,11 +394,31 @@ def prepare_ep8_experts(mlp: torch.nn.Module) -> tuple[torch.Tensor, ...] | None
     )
 
 
+class CompiledLaunches:
+    """The layer launches every rank has compiled. A launch's binary is set by
+    its layer, its rows, the rows of each request (chain) and whether it hands
+    whole rows on; one not compiled yet must compile on every rank before
+    any rank runs it (a first launch that compiles inside the real launch
+    leaves the faster ranks polling for it)."""
+
+    def __init__(self) -> None:
+        self._done: set[tuple[int, int, int, bool]] = set()
+
+    def first(self, index: int, rows: int, chain: int, whole_rows: bool) -> bool:
+        """Whether this is the first launch of its binary, which the caller
+        then compiles on every rank. Records it as compiled."""
+        key = (index, rows, chain, whole_rows)
+        if key in self._done:
+            return False
+        self._done.add(key)
+        return True
+
+
 def takes_monokernels(rows: int, ctx: ForwardContext) -> bool:
     """Whether a forward of ``rows`` token rows takes the monokernels: a
-    decode step of one request, with one token or a speculative verify of at
-    most ``MAX_ROWS`` tokens. Prefill and several requests keep the regular
-    path."""
+    decode step of 1 to ``MAX_REQUESTS`` requests of equal rows (one token
+    each, or a speculative verify), at most ``MAX_ROWS`` rows in all. Prefill
+    and more requests keep the regular path."""
     return (
         ctx.forward_mode.is_decode()
         and 1 <= ctx.bs <= MAX_REQUESTS
@@ -540,8 +560,8 @@ class MuseSparkMonokernelState(MonokernelState):
             1 - MAX_ROWS, 1, dtype=torch.int32, device=device
         )
         iris_group.finish_prepare()
-        # The (layer index, rows, whole_rows) launches compiled on every rank.
-        self.compiled: set[tuple[int, int, bool]] = set()
+        # The launches compiled on every rank.
+        self.compiled = CompiledLaunches()
         # The (rows, chain) of the launches compiled, for decoding stuck-poll
         # records.
         self.launches: set[tuple[int, int]] = set()
@@ -738,14 +758,15 @@ class MuseSparkMonokernelLayer(MonokernelLayer):
             operands["tap"] = state.taps
             operands["tap_slot"] = slot_of_next
         # A forward with a capture sink and one without differ in whole_rows
-        # before a tapped layer: each variant compiles on every rank first.
-        if (index, rows, whole_rows) not in state.compiled:
+        # before a tapped layer, and the same rows can be requests of
+        # different chains (2 rows: two decodes or one 2-token verify): each
+        # variant compiles on every rank first.
+        if state.compiled.first(index, rows, chain, whole_rows):
             # A launch traps when its peers' values do not come within about
             # a minute, and a first launch compiles for longer on some ranks
             # than on others: every rank compiles, then the ranks meet.
             muse_spark_layer_decode(fused, compile_only=True, **operands)
             dist.barrier(group=state.cpu_group)
-            state.compiled.add((index, rows, whole_rows))
             if (rows, chain) not in state.launches:
                 state.launches.add((rows, chain))
                 state.write_stuck_sidecar()
