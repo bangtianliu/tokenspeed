@@ -546,7 +546,13 @@ FlashInfer tactic profiling. Pipeline parallelism skips this traversal.
 The dummy extend has no cached prefix, so the MHA backend, which sends such
 an extend to its prefill kernel, also runs its cached-prefix extend kernel on
 the same rows during this traversal; that kernel compiles every variant a
-later batch can pick.
+later batch can pick. Shorter extends follow, halving down to 8 tokens, then
+one of 9: a request's last chunk can be any length, and a layer picks its
+kernels by its rows (extends too short to split over the ranks take Muse Spark's
+fused router and expert-input launches; longer ones the split-K router's row
+blocks; a GEMM specializes on a row count's divisibility by 16), so every row
+bucket compiles at startup, not on the first request whose last chunk lands in
+it.
 The traversal samples nothing, so startup then runs the sampling backend's
 `warmup_eager`: the decode graphs capture their own sampling routes, but an
 eager step picks its route and top-k pad (64 or 128) from the batch's
@@ -562,8 +568,9 @@ match the larger serving cache. After the rebind, startup runs the traversal
 again on the serving pool (`warmup_serving_pool`), compiling without tuning.
 Its KV writes go to the dummy tables' blocks (never block 0) before any
 request is admitted, as a capture's do; they are never prefix-matched, and
-an allocated block is written before it is read. The pass is one extend at
-the prefill budget, the activation size a chunked prefill allocates anyway.
+an allocated block is written before it is read. The pass runs the same two
+extends, the larger at the prefill budget, the activation size a chunked
+prefill allocates anyway.
 
 Kernels the dummy traversal never reaches compile on the first request and
 are left so deliberately: the executor's input preparation (positions, the

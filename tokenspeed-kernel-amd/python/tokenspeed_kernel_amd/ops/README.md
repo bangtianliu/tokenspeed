@@ -239,6 +239,11 @@ GEMM's, with its program ids offset by `P`. Neither half waits on the other.
 The split-K router reads 32 KB of activations per program, where a GEMV
 program reads all of them, so both weight streams finish together.
 
+The binary depends on the decode GEMM's row bucket only; `M` is a runtime
+argument. Under `kernel_warmup`, the registered op launches every supported
+bucket bound once per shape, so a later launch of any row count compiles
+nothing.
+
 ### gfx950 dense BF16 decode GEMV
 
 `gluon_gemv_a16w16_gfx950` (`gemm/fp16/gemv.py`) computes `x @ w.T` for

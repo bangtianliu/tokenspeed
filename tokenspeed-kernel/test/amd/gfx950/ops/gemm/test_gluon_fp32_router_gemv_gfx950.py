@@ -40,6 +40,7 @@ from tokenspeed_kernel.ops.gemm import (  # noqa: E402
     fp32_router_gemv_with_mm_supported,
     mm,
 )
+from tokenspeed_kernel.ops.tuning import kernel_warmup  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (  # noqa: E402
     MAX_K,
     MAX_ROWS,
@@ -380,3 +381,40 @@ def test_router_with_mm_compiles_once_per_row_bucket() -> None:
     with assert_no_triton_compile(gluon_fp32_router_gemv_mm_a16w16_gfx950):
         for rows in (5, 7, 9, 12, 15, 16, 8):
             run(rows)
+
+
+def test_warmup_compiles_every_router_with_mm_row_bucket() -> None:
+    """One warmup launch of any row count compiles each row bucket: a short
+    extend's rows, of any count the launch takes, compile nothing later. The
+    multiplier (compiled in) is this test's own, so no other test's binaries
+    serve these launches."""
+    multiplier = 0.25
+    plan = _router_plan()
+    x, weight = _problem(16, 8192, 256, 20261107)
+    prepared = fp32_router_gemv_process_weight(plan, weight)
+    mm_b = torch.randn(512, 8192, device="cuda").bfloat16()
+
+    def run(rows: int) -> None:
+        mm_a = torch.randn(rows, 8192, device="cuda").bfloat16()
+        mm_out = torch.empty((rows, 512), dtype=torch.bfloat16, device="cuda")
+        fp32_router_gemv_execute_with_mm(
+            plan, x[:rows].contiguous(), prepared, multiplier, mm_a, mm_b, mm_out
+        )
+        assert torch.equal(mm_out, mm(mm_a, mm_b))
+
+    with kernel_warmup(enabled=True):
+        run(8)
+    rows = [
+        m
+        for m in range(1, 17)
+        if fp32_router_gemv_with_mm_supported(
+            plan,
+            x[:m].contiguous(),
+            torch.empty((m, 8192), dtype=torch.bfloat16, device="cuda"),
+            mm_b,
+        )
+    ]
+    assert rows == list(range(5, 17))
+    with assert_no_triton_compile(gluon_fp32_router_gemv_mm_a16w16_gfx950):
+        for m in rows:
+            run(m)

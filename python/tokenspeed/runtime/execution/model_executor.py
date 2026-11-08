@@ -317,6 +317,32 @@ def select_dspark_context_producer(
     return None
 
 
+def warmup_extend_sizes(num_tokens: int) -> list[int]:
+    """The token counts of the startup dummy extends: the prefill budget, then
+    halving down to 8 tokens, then 9 (a row count that is not a multiple of 16).
+
+    A request's last chunk can be any length, and a layer picks its kernels by
+    its rows: short extends that a model does not split over its ranks take
+    its small-row routes (Muse Spark below 192 tokens: the fused router plus
+    expert-input launch and the fused all-gather, RMS norm, MXFP4 and top-k
+    launch, at most 16 rows), longer ones split rows a rank into row blocks
+    (the split-K router's), and a row count's divisibility by 16 is a separate
+    specialization of a GEMM. An extend at the budget reaches only the largest;
+    each halving lands in the next row bucket down, so every bucket compiles
+    at startup instead of on the first request whose last chunk lands in it."""
+    sizes = [num_tokens]
+    tokens = num_tokens // 2
+    while tokens >= 8:
+        sizes.append(tokens)
+        tokens //= 2
+    # A budget that is not a power of two halves past 8 without landing on it.
+    if sizes[-1] > 8:
+        sizes.append(8)
+    if 9 < num_tokens:
+        sizes.append(9)
+    return sizes
+
+
 @runtime_checkable
 class RopeTableModel(Protocol):
     """A model that sizes its RoPE table itself (Beam's covers the
@@ -1356,27 +1382,8 @@ class ModelExecutor:
                 graph_phase=False,
             )
             return
-        bs = dummy_batch_size(num_tokens, self.config.context_len)
-        ctx = self.prefill_graph.make_dummy_batch(num_tokens, bs)
-        # The model's rows: the span, or this rank's query shard of
-        # it, as on a real extend (_run_target_forward).
-        rows = (
-            slice(0, num_tokens)
-            if ctx.query_shard is None
-            else ctx.query_shard.local_row_ids
-        )
-        positions = (
-            ib.mrope_positions_buf[:, rows]
-            if self.config.model_is_mrope
-            else ib.positions_buf[rows]
-        )
-        with active_forward(ctx):
-            self.model_runner.forward(
-                ctx=ctx,
-                input_ids=ib.input_ids_buf[rows],
-                positions=positions,
-                **self._model_input_kwargs(num_tokens, ctx.bs, rows),
-            )
+        for tokens in warmup_extend_sizes(num_tokens):
+            self._warmup_extend(tokens)
         if self.drafter is not None:
             self._autotune_draft_experts(num_tokens)
         if self.drafter is not None and not self.config.prefill_only:
@@ -1397,6 +1404,31 @@ class ModelExecutor:
                     ),
                 ),
                 graph_phase=False,
+            )
+
+    def _warmup_extend(self, num_tokens: int) -> None:
+        """One dummy extend of ``num_tokens`` tokens through the target."""
+        ib = self.input_buffers
+        bs = dummy_batch_size(num_tokens, self.config.context_len)
+        ctx = self.prefill_graph.make_dummy_batch(num_tokens, bs)
+        # The model's rows: the span, or this rank's query shard of
+        # it, as on a real extend (_run_target_forward).
+        rows = (
+            slice(0, num_tokens)
+            if ctx.query_shard is None
+            else ctx.query_shard.local_row_ids
+        )
+        positions = (
+            ib.mrope_positions_buf[:, rows]
+            if self.config.model_is_mrope
+            else ib.positions_buf[rows]
+        )
+        with active_forward(ctx):
+            self.model_runner.forward(
+                ctx=ctx,
+                input_ids=ib.input_ids_buf[rows],
+                positions=positions,
+                **self._model_input_kwargs(num_tokens, ctx.bs, rows),
             )
 
     def _autotune_draft_experts(self, num_tokens: int) -> None:
