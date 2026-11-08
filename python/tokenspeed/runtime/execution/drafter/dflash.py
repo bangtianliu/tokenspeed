@@ -670,6 +670,20 @@ class DFlash(BaseDrafter):
                 attn_backend=self.attn_backend,
             )
 
+    def warmup_extend(self, num_tokens: int) -> None:
+        """Project ``num_tokens`` rows of zero taps, as an extend's context
+        write does (``_write_native_cache``). The projection ends in a column
+        all-gather over the attention TP group; a decode warmup whose context
+        write takes the draft monokernels never reaches it."""
+        model = self.draft_model_runner.model
+        taps = torch.zeros(
+            (num_tokens, model.context_in_features),
+            dtype=model.context_dtype,
+            device=self.device,
+        )
+        with torch.inference_mode():
+            model.project_target_hidden(taps)
+
     def set_cache_pool(self, token_to_kv_pool: CachePool | None) -> None:
         """The stacked KV views and their raw pointers name the old arena."""
         super().set_cache_pool(token_to_kv_pool)

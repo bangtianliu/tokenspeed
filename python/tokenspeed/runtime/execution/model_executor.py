@@ -1384,6 +1384,8 @@ class ModelExecutor:
             return
         for tokens in warmup_extend_sizes(num_tokens):
             self._warmup_extend(tokens)
+            if self.drafter is not None:
+                self.drafter.warmup_extend(tokens)
         if self.drafter is not None:
             self._autotune_draft_experts(num_tokens)
         if self.drafter is not None and not self.config.prefill_only:
