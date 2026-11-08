@@ -37,6 +37,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     iris_arch_policy,
 )
 from tokenspeed_kernel.ops.communication.iris import _PRODUCER_DIRECT_GL_DTYPES
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import current_platform
 
 hip_utils = triton.language.extra.hip.utils
@@ -66,6 +67,8 @@ class IrisAllGather:
             (84, producer.peers.world_size), dtype=torch.int32
         )
         self.output = torch.empty_like(producer.data)
+        # The (columns a rank, dtype) whose gathers warmup has compiled.
+        self._warmed: set[tuple[int, torch.dtype]] = set()
 
     def can_run(self, tensor: torch.Tensor) -> bool:
         """Check prepared TP4/TP8 storage for a possibly chunked hidden-shard gather."""
@@ -100,6 +103,20 @@ class IrisAllGather:
             tensor.is_contiguous()
         ), "Iris column all-gather requires contiguous input"
         num_tokens, local_hidden_size = tensor.shape
+        if is_warming_up() and (local_hidden_size, tensor.dtype) not in self._warmed:
+            # Compile each binary a gather of these columns can pick, whatever
+            # rows serving brings (column_gather_warmup_rows); every rank warms
+            # alike, as it gathers alike. Its first gather here may be the only
+            # one warmup makes.
+            self._warmed.add((local_hidden_size, tensor.dtype))
+            for rows in column_gather_warmup_rows(
+                local_hidden_size,
+                self.producer.peers.world_size,
+                tensor.element_size(),
+                1,
+            ):
+                if rows != num_tokens:
+                    self.run(tensor.new_zeros((rows, local_hidden_size)))
         total_hidden_size = local_hidden_size * self.producer.peers.world_size
         total_numel = num_tokens * total_hidden_size
         assert all_gather_columns_can_run(
@@ -171,6 +188,23 @@ def column_gather_num_warps(local_bytes: int, world_size: int) -> int:
     if world_size == 8 and local_bytes >= _COLUMN_GATHER_TWO_SUBGROUP_MIN_BYTES:
         return 2
     return 1
+
+
+def column_gather_warmup_rows(
+    local_hidden_size: int, world_size: int, element_size: int, min_rows: int
+) -> tuple[int, ...]:
+    """Row counts of at least ``min_rows`` whose column gathers compile every
+    binary a gather of ``local_hidden_size`` columns a rank picks: one per
+    :func:`column_gather_num_warps` value (its subgroups a program, two from
+    ``_COLUMN_GATHER_TWO_SUBGROUP_MIN_BYTES`` a rank's shard at TP8). The other
+    compile-time values are the widths, so a gather of any row count reuses one
+    of these binaries."""
+    row_bytes = local_hidden_size * element_size
+    rows = {min_rows: column_gather_num_warps(min_rows * row_bytes, world_size)}
+    two = max(min_rows, -(-_COLUMN_GATHER_TWO_SUBGROUP_MIN_BYTES // row_bytes))
+    if column_gather_num_warps(two * row_bytes, world_size) not in rows.values():
+        rows[two] = column_gather_num_warps(two * row_bytes, world_size)
+    return tuple(sorted(rows))
 
 
 def all_gather_columns_can_run(
