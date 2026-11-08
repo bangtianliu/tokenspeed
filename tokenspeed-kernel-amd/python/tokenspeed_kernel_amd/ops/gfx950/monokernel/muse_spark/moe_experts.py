@@ -1017,7 +1017,7 @@ def cta_slots(PLAN: gl.constexpr, union):
 
 
 @gluon.jit
-def _lane_slot_expert(experts_smem, k):
+def lane_slot_expert(experts_smem, k):
     """The expert of the lane's ``k``-th slot (:func:`lane_slots`), or -1
     (past its last slot, ``k`` 16 or more too): every thread loads the whole
     row, so the max is its own."""
@@ -1039,12 +1039,6 @@ def table_row_picks(picks_row, R: gl.constexpr):
     for r in gl.static_range(R):
         picks += (gl.max(gl.where(iw == r, w, -1), axis=0),)
     return picks
-
-
-@gluon.jit
-def lane_slot_expert(experts_smem, k):
-    """:func:`_lane_slot_expert`, for the BF16 experts' stages."""
-    return _lane_slot_expert(experts_smem, k)
 
 
 @gluon.jit
@@ -1111,7 +1105,7 @@ def ex1_finish(
     if R > 8:
         # Past 8 rows each slot's expert and row picks come from LDS.
         experts_smem, picks_smem = table
-        following = _lane_slot_expert(experts_smem, 1)
+        following = lane_slot_expert(experts_smem, 1)
         more = ex1_issue(
             task,
             True,
@@ -1127,7 +1121,7 @@ def ex1_finish(
         for i in range(lane + LANES, count, LANES):
             k = i // LANES
             tiles = more
-            following = _lane_slot_expert(experts_smem, k + 1)
+            following = lane_slot_expert(experts_smem, k + 1)
             more = ex1_issue(
                 task,
                 True,
@@ -1402,7 +1396,7 @@ def _routed_order(picks, R: gl.constexpr):
 
 @gluon.jit
 def _ex2_gather_lane(
-    mb, union, lane, S: gl.constexpr, KEEP_PICKS: gl.constexpr, K0: gl.constexpr = 0
+    mb, union, lane, S: gl.constexpr, KEEP_PICKS: gl.constexpr, K0: gl.constexpr
 ):
     """The polls of ex2 lane ``lane``'s first ``S`` slots in one round trip:
     each slot's MXFP4 intermediates (:func:`exr_stage`) of every row that
@@ -1628,7 +1622,7 @@ def _ex2_tail_batch(
             _ex2_loads(
                 task,
                 True,
-                _lane_slot_expert(table[0], S + k),
+                lane_slot_expert(table[0], S + k),
                 w2,
                 w2s,
                 stride_we,
@@ -1645,7 +1639,7 @@ def _ex2_tail_batch(
                 _ex2_loads(
                     task,
                     True,
-                    _lane_slot_expert(table[0], S + k + A),
+                    lane_slot_expert(table[0], S + k + A),
                     w2,
                     w2s,
                     stride_we,
@@ -1711,7 +1705,7 @@ def ex2_finish(
                 task,
                 True,
                 (
-                    _lane_slot_expert(table[0], k)
+                    lane_slot_expert(table[0], k)
                     if TABLE
                     else _slot_expert(union, lane + k * LANES)
                 ),
@@ -1727,9 +1721,9 @@ def ex2_finish(
         # Past one row, each slot's row picks come from LDS (kept by the
         # gather from its one reduction): per slot, the R row scalars of
         # _row_picks were R cross-lane reductions.
-        p_smem, s_smem, picks_smem = _ex2_gather_lane(mb, union, lane, S, True)
+        p_smem, s_smem, picks_smem = _ex2_gather_lane(mb, union, lane, S, True, 0)
     else:
-        p_smem, s_smem = _ex2_gather_lane(mb, union, lane, S, False)
+        p_smem, s_smem = _ex2_gather_lane(mb, union, lane, S, False, 0)
     mb.stamp(STAGE, trace.READY)
     # MFMA row r is row r (rows that did not pick the slot's expert are zero).
     rows = ()
@@ -1743,7 +1737,7 @@ def ex2_finish(
                     task,
                     True,
                     (
-                        _lane_slot_expert(table[0], k + A)
+                        lane_slot_expert(table[0], k + A)
                         if TABLE
                         else _slot_expert(union, i + A * LANES)
                     ),

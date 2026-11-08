@@ -351,10 +351,11 @@ def _ex2_gather(mb, union, expert, x_words):
 
 @gluon.jit
 def _ex2_gather_picked(mb, picks, x_words):
-    """:func:`_ex2_gather` with the rows' picks given (``picks``). Poll the BF16 intermediates of the rows that picked ``expert`` into
-    ``x_words`` (int32 ``[16, 256]``), MFMA row ``m`` the ``m``-th routed
-    row; the other rows hold zeros. The caller orders the LDS. Returns
-    ``(picks, order)``."""
+    """:func:`_ex2_gather` with the rows' picks given (``picks``, a tuple of
+    ``R`` picks, -1 for a row that did not pick the slot's expert): poll the
+    BF16 intermediates of the routed rows into ``x_words`` (int32
+    ``[16, 256]``), MFMA row ``m`` the ``m``-th routed row; the other rows
+    hold zeros. The caller orders the LDS. Returns ``(picks, order)``."""
     R: gl.constexpr = schedule.rows(mb.plan)
     RP: gl.constexpr = triton.next_power_of_2(R)
     G: gl.constexpr = min(RP, 8)
