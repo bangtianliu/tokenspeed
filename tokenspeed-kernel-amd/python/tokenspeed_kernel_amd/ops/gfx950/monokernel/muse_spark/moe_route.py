@@ -229,8 +229,13 @@ def _router_rows(
 
 # The top-8 asm operands: the ids and the picked scores (lane k holds pass
 # k's), the choices' working copy, a VGPR temporary that returns the scores'
-# total, 15 SGPR temporaries, then the 2 inputs.
-_TOP8_CONSTRAINTS = gl.constexpr(("=&v",) * 4 + ("=&s",) * 15 + ("v", "v"))
+# total, 15 SGPR temporaries, then the 2 inputs, and the clobbered SCC (the
+# SALU compares and arithmetic write it). One string, element by element: a
+# tuple repeats an entry for every element of its operand, so a clobber on the
+# 4-element score input would come before its other elements.
+_TOP8_CONSTRAINTS = gl.constexpr(
+    ",".join(["=&v"] * (1 + 1 + 4 + 1) + ["=&s"] * 15 + ["v"] * (4 + 4) + ["~{scc}"])
+)
 
 
 @gluon.constexpr_function
@@ -266,9 +271,11 @@ def _top8_asm(outputs, inputs):
         "row_bcast:31 row_mask:0xc",
     ):
         a += [nop, f"v_max_f32_dpp {t}, {t}, {t} {ctrl}"]
-    a += [nop, f"v_readlane_b32 {best}, {t}, 63"]
+    # A VALU reads an SGPR that a VALU (v_readlane) wrote only 2 wait states
+    # later, so the compares read a SALU copy (sid, set again below).
+    a += [nop, f"v_readlane_b32 {best}, {t}, 63", f"s_mov_b32 {sid}, {best}"]
     for jj in range(4):
-        a += [f"v_cmp_eq_f32_e64 {masks[jj]}, {cw[jj]}, {best}"]
+        a += [f"v_cmp_eq_f32_e64 {masks[jj]}, {cw[jj]}, {sid}"]
     a += [
         f"s_or_b64 {any_}, {masks[0]}, {masks[1]}",
         f"s_or_b64 {any_}, {any_}, {masks[2]}",
@@ -367,6 +374,8 @@ def topk_stage(mb, task, bias, STAGE: gl.constexpr):
     one: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
     slot = gl.arange(0, 64 * nw, one)
     vt: gl.constexpr = slot.type.with_element_ty(gl.float32)
+    # asm: the passes need lane masks in SGPRs (v_cmp, s_ff1, v_readlane by
+    # an SGPR lane); Gluon has no ballot or lane read.
     res = gl.inline_asm(
         _top8_asm,
         _TOP8_CONSTRAINTS,

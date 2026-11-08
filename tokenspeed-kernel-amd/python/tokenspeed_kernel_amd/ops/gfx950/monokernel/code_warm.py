@@ -57,6 +57,7 @@ _GETPC = gl.constexpr("s_getpc_b64 $0\ns_mov_b32 $1, 0x5ec0de01")
 def code_pointer(offset):
     """The start of this kernel's ``.text`` as an ``int32`` pointer, from
     ``offset`` (:func:`text_range`). Call it from one place in a kernel."""
+    # asm: no Gluon op or intrinsic reads the program counter.
     pc, _ = gl.inline_asm(
         _GETPC,
         "=s,=s",

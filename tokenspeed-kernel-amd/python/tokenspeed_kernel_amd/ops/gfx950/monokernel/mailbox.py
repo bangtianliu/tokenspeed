@@ -128,13 +128,14 @@ def _poll_constraints(groups):
     retry count (one SGPR), the saved EXEC mask (one SGPR pair), the clock at
     the first check (one SGPR pair). Inputs: every group's pointers, the tag,
     the wave's "spin" flag. The spin flag is one value per thread, so its
-    entry also names the clobbers.
+    entry also names the clobbers. A retry reloads only the late pairs' lanes
+    (EXEC narrowed, then restored), so EXEC is among them.
     """
     return (
         ("=&v",) * groups
         + ("=&v", "=&s", "=&s", "=&s", "=&s")
         + ("v",) * groups
-        + ("s", "v,~{vcc},~{scc}")
+        + ("s", "v,~{vcc},~{scc},~{exec}")
     )
 
 
@@ -357,6 +358,9 @@ def _poll_n(scratch, offsets, tag, spin, SCOPE: gl.constexpr, stuck):
     # down zero-extended, so compare with the zero-extended tag. A
     # sign-extended tag never matches once the tag wraps past bit 31.
     gl.static_assert(SCOPE == "agent" or SCOPE == "system", "scope: agent or system")
+    # asm: a poll is a loop of uncached loads that retries only the late
+    # pairs' lanes until every tag matches; Gluon has no volatile load, and
+    # a load in a loop is hoisted or merged.
     if stuck is None:
         out = gl.inline_asm(
             _poll_asm_system if SCOPE == "system" else _poll_asm_agent,
@@ -694,6 +698,8 @@ class Mailbox:
         gfx9 ``vmcnt`` counts stores), the CTA meets at a barrier, then one
         thread puts the pair. A consumer polls the flag, then loads the
         words."""
+        # asm: waits for this wave's stores; _extern.release_drain does the
+        # same once every launch of a mailbox kernel links its library.
         gl.inline_asm("s_waitcnt vmcnt(0)")
         gl.barrier()
         lanes = gl.arange(0, 64 * gl.num_warps(), lane_layout(gl.num_warps()))
@@ -730,6 +736,7 @@ class Mailbox:
         gl.static_assert(
             schedule.is_peer(self.plan, region), "raise_flag_peers needs a peer region"
         )
+        # asm: as in raise_flag.
         gl.inline_asm("s_waitcnt vmcnt(0)")
         gl.barrier()
         W: gl.constexpr = schedule.world(self.plan)

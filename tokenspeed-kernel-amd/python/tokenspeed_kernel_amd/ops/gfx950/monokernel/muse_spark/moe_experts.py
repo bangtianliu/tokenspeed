@@ -376,13 +376,19 @@ def _slots_asm(outputs, inputs):
         f"v_lshrrev_b32 {row}, 3, {lane}",
         f"v_mov_b32 {seen}, 0",
     ]
+    # A VALU reads an SGPR that a VALU (v_readlane) wrote only 2 wait states
+    # later: pick q + 1's id is read right after pick q's compare, and its
+    # two v_cndmask (or more) pass before the next compare.
+    a += [f"v_readlane_b32 {sq}, {ident}, 0"]
     a += [f"v_mov_b32 {x}, -1" for x in table]
     for r in range(RP):
         a += [f"v_mov_b32 {hit}, 0"]
         for k in range(8):
+            q = r * 8 + k
+            a += [f"v_cmp_eq_u32_e32 vcc, {sq}, {ident}"]
+            if q + 1 < NP:
+                a += [f"v_readlane_b32 {sq}, {ident}, {q + 1}"]
             a += [
-                f"v_readlane_b32 {sq}, {ident}, {r * 8 + k}",
-                f"v_cmp_eq_u32_e32 vcc, {sq}, {ident}",
                 f"v_cndmask_b32_e64 {table[r]}, {table[r]}, {k}, vcc",
                 f"v_cndmask_b32_e64 {hit}, {hit}, 1, vcc",
             ]
@@ -441,15 +447,19 @@ def _slots2_asm(outputs, inputs):
         f"v_mov_b32 {seen[0]}, 0",
         f"v_mov_b32 {seen[1]}, 0",
     ]
+    # As in _slots_asm, pick q + 1's id is read right after pick q's last
+    # compare, 2 wait states before the next compare reads it.
+    a += [f"v_readlane_b32 {sq}, {ident[0]}, 0"]
     a += [f"v_mov_b32 {x}, -1" for x in table]
     for r in range(RP):
         a += [f"v_mov_b32 {hit[0]}, 0", f"v_mov_b32 {hit[1]}, 0"]
         for k in range(8):
             q = r * 8 + k
-            a += [f"v_readlane_b32 {sq}, {ident[q % 2]}, {q // 2}"]
             for e in range(2):
+                a += [f"v_cmp_eq_u32_e32 vcc, {sq}, {ident[e]}"]
+                if e == 1 and q + 1 < 8 * RP:
+                    a += [f"v_readlane_b32 {sq}, {ident[(q + 1) % 2]}, {(q + 1) // 2}"]
                 a += [
-                    f"v_cmp_eq_u32_e32 vcc, {sq}, {ident[e]}",
                     f"v_cndmask_b32_e64 {table[e * RP + r]}, {table[e * RP + r]}, {k}, vcc",
                     f"v_cndmask_b32_e64 {hit[e]}, {hit[e]}, 1, vcc",
                 ]
@@ -500,6 +510,8 @@ def _ballot_slots2(ids, RP: gl.constexpr):
     tt: gl.constexpr = gl.distributed_type(
         gl.int32, [NP, RP], gl.BlockedLayout([2, RP], [64, 1], [nw, 1], [1, 0])
     )
+    # asm: the per-pick compares need a lane read (v_readlane) and lane
+    # masks (ballots, v_mbcnt); Gluon has neither.
     out = gl.inline_asm(
         _slots2_asm,
         _slots2_constraints(RP),
@@ -537,6 +549,8 @@ def _ballot_slots(ids, RP: gl.constexpr):
     tt: gl.constexpr = gl.distributed_type(
         gl.int32, [NP, RP], _table_lanes_layout(RP, nw)
     )
+    # asm: the per-pick compares need a lane read (v_readlane) and lane
+    # masks (ballots, v_mbcnt); Gluon has neither.
     out = gl.inline_asm(
         _slots_asm,
         (
