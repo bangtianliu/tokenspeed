@@ -1637,7 +1637,13 @@ def _routed_order(picks, R: gl.constexpr):
 
 @gluon.jit
 def _ex2_gather_lane(
-    mb, union, lane, S: gl.constexpr, KEEP_PICKS: gl.constexpr, K0: gl.constexpr
+    mb,
+    union,
+    slot_picks,
+    lane,
+    S: gl.constexpr,
+    KEEP_PICKS: gl.constexpr,
+    K0: gl.constexpr,
 ):
     """The polls of ex2 lane ``lane``'s first ``S`` slots in one round trip:
     each slot's MXFP4 intermediates (:func:`exr_stage`) of every row that
@@ -1645,34 +1651,49 @@ def _ex2_gather_lane(
     LDS. Returns the LDS (values ``[S 16, 256]`` and scales ``[S 16, 16]``
     bytes) for :func:`_ex2_compute`, a slot's 16 rows a slice.
 
-    The picks of all ``S`` slots come from the slot table in one reduction.
+    The picks of all ``S`` slots come from one reduction over the slot table
+    (``union``), or past 8 rows from the CTA's table (``slot_picks``: the
+    picks of :func:`lane_slots`, the same picks; up to 8 rows a placeholder).
     A slot past the lane's last, and a row that did not pick the slot's
-    expert, poll words that are published (the lane's first slot, the
-    slot's first routed row). With ``KEEP_PICKS`` (past one row) it also
-    returns those picks in LDS, ``int32 [S, 16]``: row ``k`` is slot
-    ``lane + 8 k``, column ``r`` row ``r``'s pick of its expert, or -1 (a
-    row that did not pick it, a row past the launch's, or a slot past the
-    lane's last), from the same reduction. ``K0``: the first slot is the lane's
-    ``K0``-th (past 8 rows, :func:`_ex2_tail_batch` gathers slots 8 .. 15)."""
+    expert, poll words that are published (the lane's first slot, the slot's
+    first routed row). With ``KEEP_PICKS`` (past one row) it also returns
+    those picks in LDS, ``int32 [S, 16]``: row ``k`` is slot ``lane + 8 k``,
+    column ``r`` row ``r``'s pick of its expert, or -1 (a row that did not
+    pick it, a row past the launch's, or a slot past the lane's last).
+    ``K0``: the first slot is the lane's ``K0``-th (past 8 rows,
+    :func:`_ex2_tail_batch` gathers slots 8 .. 15)."""
     R: gl.constexpr = schedule.rows(mb.plan)
     RP: gl.constexpr = triton.next_power_of_2(R)
     nw: gl.constexpr = gl.num_warps()
     ids, owner, slot, count, table = union
-    NP: gl.constexpr = table.shape[0]
     # [slot, pick, row]: a slot a wave, a pick a lane, the rows in registers.
     l3: gl.constexpr = gl.BlockedLayout([1, 1, RP], [1, 64, 1], [nw, 1, 1], [2, 1, 0])
-    pl: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, l3))
-    j = gl.arange(0, S, gl.SliceLayout(1, gl.SliceLayout(2, l3)))[:, None, None]
-    if K0 > 0:
-        want = lane + (j + K0) * LANES
+    tl: gl.constexpr = gl.SliceLayout(1, l3)  # [slot, row]
+    if R > 8:
+        # The table's row k is slot lane + 8 k; past the lane's last slot it
+        # holds -1, where the reduction below takes the lane's first slot
+        # (whose words are published), so those rows take row 0's picks.
+        gl.static_assert(RP == M_DUP, "past 8 rows the table has 16 row columns")
+        flat: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+        tab = slot_picks.reinterpret(gl.int32, [M_DUP, M_DUP], flat)
+        js = gl.arange(0, S, gl.SliceLayout(1, tl))[:, None]
+        picks = gl.where(
+            lane + (js + K0) * LANES < count,
+            tab.slice(K0, S, dim=0).load(tl),
+            tab.slice(0, 1, dim=0).load(tl),
+        )
     else:
-        want = lane + j * LANES
-    want = gl.where(want < count, want, lane)
-    own = gl.convert_layout(owner, pl)[None, :, None]
-    mine = gl.convert_layout(slot, pl)[None, :, None]
-    t3 = gl.convert_layout(table, gl.SliceLayout(0, l3))[None, :, :]
-    picks = gl.max(gl.where((own > 0) & (mine == want), t3, -1), axis=1)  # [S, RP]
-    tl: gl.constexpr = picks.type.layout
+        pl: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, l3))
+        j = gl.arange(0, S, gl.SliceLayout(1, gl.SliceLayout(2, l3)))[:, None, None]
+        if K0 > 0:
+            want = lane + (j + K0) * LANES
+        else:
+            want = lane + j * LANES
+        want = gl.where(want < count, want, lane)
+        own = gl.convert_layout(owner, pl)[None, :, None]
+        mine = gl.convert_layout(slot, pl)[None, :, None]
+        t3 = gl.convert_layout(table, gl.SliceLayout(0, l3))[None, :, :]
+        picks = gl.max(gl.where((own > 0) & (mine == want), t3, -1), axis=1)  # [S, RP]
     if KEEP_PICKS:
         ks = gl.arange(0, S, gl.SliceLayout(1, tl))[:, None]
         plain_p: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
@@ -1872,7 +1893,7 @@ def _ex2_tail_batch(
                 stride_snb,
             ),
         )
-    p_smem, s_smem, picks_smem = _ex2_gather_lane(mb, union, lane, S, True, S)
+    p_smem, s_smem, picks_smem = _ex2_gather_lane(mb, union, table[1], lane, S, True, S)
     for k in gl.static_range(S):
         i = lane + (S + k) * LANES
         if k + A < S:
@@ -1962,9 +1983,11 @@ def ex2_finish(
         # Past one row, each slot's row picks come from LDS (kept by the
         # gather from its one reduction): per slot, the R row scalars of
         # _row_picks were R cross-lane reductions.
-        p_smem, s_smem, picks_smem = _ex2_gather_lane(mb, union, lane, S, True, 0)
+        p_smem, s_smem, picks_smem = _ex2_gather_lane(
+            mb, union, table[1], lane, S, True, 0
+        )
     else:
-        p_smem, s_smem = _ex2_gather_lane(mb, union, lane, S, False, 0)
+        p_smem, s_smem = _ex2_gather_lane(mb, union, table[1], lane, S, False, 0)
     mb.stamp(STAGE, trace.READY)
     # MFMA row r is row r (rows that did not pick the slot's expert are zero).
     rows = ()
