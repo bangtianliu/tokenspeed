@@ -44,7 +44,7 @@ import os
 from pathlib import Path
 
 import torch
-from tokenspeed_kernel_amd._scheduling import sched_compile_options, wave_uniform_i32
+from tokenspeed_kernel_amd._extern import extern_compile_options, wave_uniform_i32
 from tokenspeed_kernel_amd._triton import gl, gluon, tl
 
 _LIBRARY_NAME = "tokenspeed_stream_sync"
@@ -55,7 +55,7 @@ _SYMBOL = "__tokenspeed_stream_sync_"
 def stream_sync_compile_options() -> dict:
     """Launch options for kernels using these helpers (with the scheduling
     library, whose ``readfirstlane`` and ``release_drain`` they also use)."""
-    libs = dict(sched_compile_options()["extern_libs"])
+    libs = dict(extern_compile_options()["extern_libs"])
     libs[_LIBRARY_NAME] = _LIBRARY_PATH
     return {"extern_libs": libs}
 

@@ -64,7 +64,7 @@ token at position ``L0 + t``, where ``L0`` is the request's own.
 
 from __future__ import annotations
 
-from tokenspeed_kernel_amd._scheduling import wave_uniform_i32
+from tokenspeed_kernel_amd._extern import wave_uniform_i32
 from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import mx, schedule, trace
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import (

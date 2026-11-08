@@ -32,7 +32,7 @@ from utils import is_cdna4
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
-from tokenspeed_kernel_amd._scheduling import sched_compile_options  # noqa: E402
+from tokenspeed_kernel_amd._extern import extern_compile_options  # noqa: E402
 from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox, schedule  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
@@ -203,7 +203,7 @@ def test_attention_matches_the_regular_path_math(
         window,
         rope,
         num_warps=8,
-        **sched_compile_options(),
+        **extern_compile_options(),
     )
     torch.cuda.synchronize()
 
