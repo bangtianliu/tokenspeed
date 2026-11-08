@@ -568,9 +568,10 @@ match the larger serving cache. After the rebind, startup runs the traversal
 again on the serving pool (`warmup_serving_pool`), compiling without tuning.
 Its KV writes go to the dummy tables' blocks (never block 0) before any
 request is admitted, as a capture's do; they are never prefix-matched, and
-an allocated block is written before it is read. The pass runs the same two
-extends, the larger at the prefill budget, the activation size a chunked
-prefill allocates anyway.
+an allocated block is written before it is read. The pass runs the same
+traversal, so the same extends: the largest at the prefill budget, the
+activation size a chunked prefill allocates anyway, and the shorter ones of
+the ladder above, whose row buckets read the serving cache too.
 
 Kernels the dummy traversal never reaches compile on the first request and
 are left so deliberately: the executor's input preparation (positions, the
