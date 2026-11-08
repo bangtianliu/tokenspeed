@@ -280,13 +280,19 @@ def _median_us(graph, replays: int) -> float:
     graph.replay()
     torch.cuda.synchronize()
     dist.barrier()
-    ev = [torch.cuda.Event(enable_timing=True) for _ in range(replays + 1)]
-    ev[0].record()
+    start = [torch.cuda.Event(enable_timing=True) for _ in range(replays)]
+    end = [torch.cuda.Event(enable_timing=True) for _ in range(replays)]
     for i in range(replays):
+        start[i].record()
         graph.replay()
-        ev[i + 1].record()
+        end[i].record()
+        # A deep unsynced launch queue (hundreds of replays of LAUNCHES
+        # launches each) segfaults the host on gfx950: sync every 16. Each
+        # replay has its own events, so the sync's gap is in no replay's time.
+        if i % 16 == 15:
+            torch.cuda.synchronize()
     torch.cuda.synchronize()
-    times = sorted(ev[i].elapsed_time(ev[i + 1]) for i in range(replays))
+    times = sorted(start[i].elapsed_time(end[i]) for i in range(replays))
     dist.barrier()
     return times[replays // 2] * 1e3 / LAUNCHES
 
