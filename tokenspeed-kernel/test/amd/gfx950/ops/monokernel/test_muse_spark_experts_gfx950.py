@@ -62,9 +62,14 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import (  # noqa: E402
     launch_tag,
 )
 
-# 48 experts: 8 rows of random picks share about 37 of them, as many as a
-# verify's 8 consecutive tokens, so the slot lanes run several slots.
-WORLD, POOLED, INTER, EXPERTS, TOP_K, OWNED = 8, 4096, 512, 48, 8, 512
+# 128 experts, as many as 16 rows can pick. Random picks come from the first
+# 48: 8 rows share about 37 of them, as many as a verify's 8 consecutive
+# tokens, so the slot lanes run several slots. Picks of a set number of
+# distinct experts (_picks) cover the slot counts a lane can have past 8
+# rows: up to 64 experts (8 slots a lane, no second ex2 batch), 65 (one lane
+# with 9), and up to 128 (16).
+WORLD, POOLED, INTER, EXPERTS, TOP_K, OWNED = 8, 4096, 512, 128, 8, 512
+RANDOM_EXPERTS = 48
 
 
 @gluon.jit
@@ -151,26 +156,21 @@ def experts_kernel(
         )
 
 
-def _raw_experts(rank: int):
-    """Random MXFP4 expert shards of ``rank``: w13 rows interleave gate / up."""
-    g = torch.Generator().manual_seed(500 + rank)
-    w13 = torch.randint(
-        0, 256, (EXPERTS, 2 * INTER, POOLED // 2), dtype=torch.uint8, generator=g
-    )
-    s13 = torch.randint(
-        122, 127, (EXPERTS, 2 * INTER, POOLED // 32), dtype=torch.uint8, generator=g
-    )
-    w2 = torch.randint(
-        0, 256, (EXPERTS, POOLED, INTER // 2), dtype=torch.uint8, generator=g
-    )
-    s2 = torch.randint(
-        118, 123, (EXPERTS, POOLED, INTER // 32), dtype=torch.uint8, generator=g
-    )
+def _raw_experts(rank: int, device: torch.device):
+    """Random MXFP4 expert shards of ``rank``, made on ``device`` (the same on
+    every GPU; on the host they would take seconds a rank): w13 rows
+    interleave gate / up."""
+    g = torch.Generator(device).manual_seed(500 + rank)
+    kw = dict(dtype=torch.uint8, generator=g, device=device)
+    w13 = torch.randint(0, 256, (EXPERTS, 2 * INTER, POOLED // 2), **kw)
+    s13 = torch.randint(122, 127, (EXPERTS, 2 * INTER, POOLED // 32), **kw)
+    w2 = torch.randint(0, 256, (EXPERTS, POOLED, INTER // 2), **kw)
+    s2 = torch.randint(118, 123, (EXPERTS, POOLED, INTER // 32), **kw)
     return w13, s13, w2, s2
 
 
 def _preprocessed(rank: int, device: torch.device):
-    w13, s13, w2, s2 = _raw_experts(rank)
+    w13, s13, w2, s2 = _raw_experts(rank, device)
     module = torch.nn.Module()
     module.w13_input_layout = "interleaved"
     module.quant_config = SimpleNamespace(use_dynamic_mxfp4_activations=True)
@@ -180,7 +180,7 @@ def _preprocessed(rank: int, device: torch.device):
         ("w2_weight", w2),
         ("w2_weight_scale", s2),
     ):
-        setattr(module, name, torch.nn.Parameter(t.to(device), requires_grad=False))
+        setattr(module, name, torch.nn.Parameter(t, requires_grad=False))
     preprocess_gluon_mxfp4_gfx950_moe_weights({}, module)
     return (
         _extract_gluon_raw_w(module.w13_weight_triton_tensor),
@@ -190,16 +190,30 @@ def _preprocessed(rank: int, device: torch.device):
     )
 
 
-def _inputs(launch: int, rows: int):
+def _inputs(launch: int, rows: int, distinct: int | None):
     """Each row's pooled input and 8 picks (rows ``[rows, ...]``), and the
     pre-expert gain."""
     g = torch.Generator().manual_seed(77 + launch)
     pooled = torch.randn(rows, POOLED, generator=g).to(torch.bfloat16)
     gain = (1.0 + 0.1 * torch.randn(POOLED, generator=g)).to(torch.bfloat16).float()
-    ids = torch.stack(
-        [torch.randperm(EXPERTS, generator=g)[:TOP_K] for _ in range(rows)]
-    ).to(torch.int32)
-    return pooled, gain, ids
+    return pooled, gain, _picks(g, rows, distinct)
+
+
+def _picks(g: torch.Generator, rows: int, distinct: int | None) -> torch.Tensor:
+    """Each row's 8 picks, ``int32 [rows, 8]``. ``distinct`` None: random
+    picks among the first ``RANDOM_EXPERTS`` experts. Otherwise exactly
+    ``distinct`` experts over the launch (``distinct`` slots, lane ``l``
+    ``ceil((distinct - l) / 8)`` of them): random distinct experts, dealt to
+    the rows' picks in turn so each row's 8 differ and every one is picked."""
+    if distinct is None:
+        return torch.stack(
+            [torch.randperm(RANDOM_EXPERTS, generator=g)[:TOP_K] for _ in range(rows)]
+        ).to(torch.int32)
+    assert TOP_K <= distinct <= min(rows * TOP_K, EXPERTS)
+    chosen = torch.randperm(EXPERTS, generator=g)[:distinct]
+    deal = torch.arange(rows * TOP_K).view(rows, TOP_K) % distinct
+    order = torch.argsort(torch.rand(rows, TOP_K, generator=g), dim=1)
+    return chosen[deal.gather(1, order)].to(torch.int32)
 
 
 def _reference(rank: int, pooled, gain, ids, cols, device):
@@ -209,7 +223,7 @@ def _reference(rank: int, pooled, gain, ids, cols, device):
     x = pooled.float().to(device)
     x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-5) * gain.to(device)
     xq = fake_quantize_mxfp4_even(x.to(torch.bfloat16).float())
-    w13, s13, w2, s2 = (t.to(device) for t in _raw_experts(rank))
+    w13, s13, w2, s2 = _raw_experts(rank, device)
     out = torch.empty(ids.shape[0], TOP_K, cols.stop - cols.start, device=device)
     for e in ids.unique().tolist():
         up = dequantize_mxfp4(w13[e], s13[e]).float()
@@ -222,7 +236,9 @@ def _reference(rank: int, pooled, gain, ids, cols, device):
     return out.to(torch.bfloat16).cpu()
 
 
-def _worker(rank: int, port: int, rows: int, exr: int, exr_parts: int) -> None:
+def _worker(
+    rank: int, port: int, rows: int, exr: int, exr_parts: int, distinct: int | None
+) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "gloo",
@@ -259,7 +275,9 @@ def _worker(rank: int, port: int, rows: int, exr: int, exr_parts: int) -> None:
         for launch in range(2):
             step = 10 + launch
             tag = launch_tag(step, 0)
-            pooled, gain, ids = _inputs(launch, rows)
+            pooled, gain, ids = _inputs(launch, rows, distinct)
+            if distinct is not None:
+                assert ids.unique().numel() == distinct
             for row in range(rows):
                 route = torch.cat(
                     [ids[row], torch.full((TOP_K,), 0.125).view(torch.int32)]
@@ -322,15 +340,35 @@ def _worker(rank: int, port: int, rows: int, exr: int, exr_parts: int) -> None:
 
 
 @pytest.mark.parametrize(
-    "rows, exr, exr_parts",
-    [(1, 192, 1), (8, 0, 4), (8, 128, 2), (16, 0, 4), (16, 128, 2)],
+    "rows, exr, exr_parts, distinct",
+    [
+        (1, 192, 1, None),
+        (8, 0, 4, None),
+        (8, 128, 2, None),
+        (8, 0, 4, 64),
+        (16, 0, 4, None),
+        (16, 128, 2, None),
+        # Past 8 rows, by the lanes' slot counts: 1 each (the next slot's
+        # expert is -1 from the first), 1 or 2, 8 each (no second ex2 batch),
+        # 9 on lane 0 only, 9 each, 12 or 13, 16 each.
+        (16, 0, 4, 8),
+        (16, 0, 4, 13),
+        (16, 0, 4, 64),
+        (16, 0, 4, 65),
+        (16, 128, 2, 65),
+        (16, 0, 4, 72),
+        (16, 0, 4, 100),
+        (16, 128, 2, 128),
+    ],
 )
 def test_experts_match_the_regular_path_math_on_its_weight_layout(
-    rows: int, exr: int, exr_parts: int
+    rows: int, exr: int, exr_parts: int, distinct: int | None
 ):
     if torch.cuda.device_count() < WORLD:
         pytest.skip(f"requires {WORLD} GPUs")
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port, rows, exr, exr_parts), nprocs=WORLD, join=True)
+    mp.spawn(
+        _worker, args=(port, rows, exr, exr_parts, distinct), nprocs=WORLD, join=True
+    )

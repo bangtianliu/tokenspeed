@@ -51,9 +51,12 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import (  # noqa: E402
     launch_tag,
 )
 
-# 48 experts: 8 rows of random picks share about 37 of them, so the slot
-# lanes run several slots.
-WORLD, POOLED, INTER, EXPERTS, TOP_K, OWNED = 8, 4096, 512, 48, 8, 512
+# 128 experts, as many as 16 rows can pick. Random picks come from the first
+# 48: 8 rows share about 37 of them, so the slot lanes run several slots.
+# Picks of a set number of distinct experts (_picks) cover the slot counts a
+# lane can have past 8 rows (up to 16).
+WORLD, POOLED, INTER, EXPERTS, TOP_K, OWNED = 8, 4096, 512, 128, 8, 512
+RANDOM_EXPERTS = 48
 
 
 @gluon.jit
@@ -99,26 +102,41 @@ def experts_kernel(
         )
 
 
-def _experts(rank: int):
+def _experts(rank: int, device: torch.device):
     """Random BF16 expert shards of ``rank`` in the regular route path's
-    layout: w13 ``[E, 2 I, H]`` (gate rows, then up rows), w2 ``[E, H, I]``."""
-    g = torch.Generator().manual_seed(500 + rank)
-    w13 = (torch.randn(EXPERTS, 2 * INTER, POOLED, generator=g) * 0.02).to(
-        torch.bfloat16
-    )
-    w2 = (torch.randn(EXPERTS, POOLED, INTER, generator=g) * 0.04).to(torch.bfloat16)
+    layout, made on ``device`` (the same on every GPU; every rank holds all
+    ranks' shards, too many for the host): w13 ``[E, 2 I, H]`` (gate rows,
+    then up rows), w2 ``[E, H, I]``."""
+    g = torch.Generator(device).manual_seed(500 + rank)
+    kw = dict(generator=g, device=device)
+    w13 = (torch.randn(EXPERTS, 2 * INTER, POOLED, **kw) * 0.02).to(torch.bfloat16)
+    w2 = (torch.randn(EXPERTS, POOLED, INTER, **kw) * 0.04).to(torch.bfloat16)
     return w13, w2
 
 
-def _inputs(launch: int, rows: int):
+def _inputs(launch: int, rows: int, distinct: int | None):
     """Each row's pooled input and 8 picks, and the pre-expert gain."""
     g = torch.Generator().manual_seed(77 + launch)
     pooled = torch.randn(rows, POOLED, generator=g).to(torch.bfloat16)
     gain = (1.0 + 0.1 * torch.randn(POOLED, generator=g)).to(torch.bfloat16).float()
-    ids = torch.stack(
-        [torch.randperm(EXPERTS, generator=g)[:TOP_K] for _ in range(rows)]
-    ).to(torch.int32)
-    return pooled, gain, ids
+    return pooled, gain, _picks(g, rows, distinct)
+
+
+def _picks(g: torch.Generator, rows: int, distinct: int | None) -> torch.Tensor:
+    """Each row's 8 picks, ``int32 [rows, 8]``. ``distinct`` None: random
+    picks among the first ``RANDOM_EXPERTS`` experts. Otherwise exactly
+    ``distinct`` experts over the launch (``distinct`` slots, lane ``l``
+    ``ceil((distinct - l) / 8)`` of them): random distinct experts, dealt to
+    the rows' picks in turn so each row's 8 differ and every one is picked."""
+    if distinct is None:
+        return torch.stack(
+            [torch.randperm(RANDOM_EXPERTS, generator=g)[:TOP_K] for _ in range(rows)]
+        ).to(torch.int32)
+    assert TOP_K <= distinct <= min(rows * TOP_K, EXPERTS)
+    chosen = torch.randperm(EXPERTS, generator=g)[:distinct]
+    deal = torch.arange(rows * TOP_K).view(rows, TOP_K) % distinct
+    order = torch.argsort(torch.rand(rows, TOP_K, generator=g), dim=1)
+    return chosen[deal.gather(1, order)].to(torch.int32)
 
 
 def _reference(experts, pooled, gain, ids, cols, device):
@@ -128,7 +146,7 @@ def _reference(experts, pooled, gain, ids, cols, device):
     x = pooled.float().to(device)
     x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-5) * gain.to(device)
     x = x.to(torch.bfloat16).float()
-    w13, w2 = (t.to(device) for t in experts)
+    w13, w2 = experts
     out = torch.empty(ids.shape[0], TOP_K, cols.stop - cols.start, device=device)
     for e in ids.unique().tolist():
         gate, up = w13[e, :INTER].float(), w13[e, INTER:].float()
@@ -140,7 +158,7 @@ def _reference(experts, pooled, gain, ids, cols, device):
     return out.to(torch.bfloat16).cpu()
 
 
-def _worker(rank: int, port: int, rows: int) -> None:
+def _worker(rank: int, port: int, rows: int, distinct: int | None) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "gloo",
@@ -176,14 +194,16 @@ def _worker(rank: int, port: int, rows: int) -> None:
             peers=("cg",) + moe_experts.PEERS,
         )
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
-        experts = [_experts(r) for r in range(WORLD)]
-        w13, w2 = (t.to(device) for t in experts[rank])
+        experts = [_experts(r, device) for r in range(WORLD)]
+        w13, w2 = experts[rank]
         group.finish_prepare()
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         for launch in range(2):
             step = 10 + launch
             tag = launch_tag(step, 0)
-            pooled, gain, ids = _inputs(launch, rows)
+            pooled, gain, ids = _inputs(launch, rows, distinct)
+            if distinct is not None:
+                assert ids.unique().numel() == distinct
             for row in range(rows):
                 route = torch.cat(
                     [ids[row], torch.full((TOP_K,), 0.125).view(torch.int32)]
@@ -238,11 +258,28 @@ def _worker(rank: int, port: int, rows: int) -> None:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("rows", [1, 8, 16])
-def test_bf16_experts_match_the_route_path_math_on_its_weight_layout(rows: int):
+@pytest.mark.parametrize(
+    "rows, distinct",
+    [
+        (1, None),
+        (8, None),
+        (16, None),
+        # Past 8 rows, by the lanes' slot counts: 1 each, 1 or 2, 8 each, 9
+        # on lane 0 only, 12 or 13, 16 each.
+        (16, 8),
+        (16, 13),
+        (16, 64),
+        (16, 65),
+        (16, 100),
+        (16, 128),
+    ],
+)
+def test_bf16_experts_match_the_route_path_math_on_its_weight_layout(
+    rows: int, distinct: int | None
+):
     if torch.cuda.device_count() < WORLD:
         pytest.skip(f"requires {WORLD} GPUs")
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port, rows), nprocs=WORLD, join=True)
+    mp.spawn(_worker, args=(port, rows, distinct), nprocs=WORLD, join=True)
