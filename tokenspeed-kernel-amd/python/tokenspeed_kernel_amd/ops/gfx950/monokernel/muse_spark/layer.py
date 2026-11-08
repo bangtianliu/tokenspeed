@@ -501,6 +501,7 @@ def gluon_muse_spark_layer_gfx950(
         union = moe_experts.union_of(ids)
         # Every CTA, outside the task branches: it ends in a barrier.
         slot_lds = moe_experts.cta_slots(PLAN, union)
+        pre1 = moe_experts.ex1_prefetch(PLAN, task1, active1, slot_lds, w13, s13_we)
         a1 = moe_experts.ex1_xq(mb, task1, active1, "ex1")
         if active1:
             moe_experts.ex1_finish(
@@ -511,6 +512,7 @@ def gluon_muse_spark_layer_gfx950(
                 e1,
                 union,
                 slot_lds,
+                pre1,
                 w13,
                 w13s,
                 s13_we,

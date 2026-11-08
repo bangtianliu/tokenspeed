@@ -92,7 +92,7 @@ then run the lane's other slots, one after another.
 
 from __future__ import annotations
 
-from tokenspeed_kernel_amd._triton import gl, gluon, triton
+from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_common import (
     _cdna4_swizzled_mxfp4_scale_offset,
     _direct_mxfp4_mfma,
@@ -989,6 +989,127 @@ def ex1_xq(mb, task, active, STAGE: gl.constexpr):
     return p_smem, s_smem
 
 
+# An ex1 B tile in LDS (ex1_prefetch): the K-tile's 8 chunks of 1 KiB (16
+# columns each), raw-copied, read back in the MFMA's dot_b layout through
+# this byte permutation: offset = (n // 16) 1024 + (k // 16) 256 + (n % 16) 16
+# + k % 16 for packed K row k and column n. Bit-identical to _load_b's
+# register read of the same tile.
+B_TILE_LDS = gl.constexpr(
+    gl.SharedLinearLayout(
+        offset_bases=[
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [16, 0],
+            [32, 0],
+            [0, 16],
+            [0, 32],
+            [0, 64],
+        ]
+    )
+)
+B_TILE_BYTES = gl.constexpr(8192)  # 64 packed K x 128 columns
+
+
+@gluon.jit
+def ex1_prefetch(PLAN: gl.constexpr, task, active, table, w13, stride_we):
+    """Past 8 rows: copy the w13 B tiles (not the scales) of the lane's second
+    slot for ex1 task ``task`` into LDS: 8 buffers, ``uint8 [8192]`` a K-tile,
+    while the CTA waits on the routing chain for its A operand. Only the first
+    slot's tiles are in flight then (in registers: a second there spills past 8
+    rows). ``table``: :func:`cta_slots`. Up to 8 rows nothing loads (a
+    placeholder).
+
+    The copies count in ``vmcnt`` in order, so :func:`ex1_xq`'s poll waits for
+    them: by its return they have landed."""
+    if schedule.rows(PLAN) > 8:
+        nw: gl.constexpr = gl.num_warps()
+        KT: gl.constexpr = K_SLICE // 128
+        blk = (task // KSPLIT) % NB1
+        ks = task % KSPLIT
+        expert = lane_slot_expert(table[0], 1)
+        on = active & (expert >= 0)
+        w_off = gl.maximum(expert, 0).to(gl.int64) * stride_we
+        raw: gl.constexpr = gl.BlockedLayout([16], [64], [nw], [0])
+        i = gl.arange(0, B_TILE_BYTES, raw)
+        # The tile's chunks (16 columns each) sit 2 KiB apart.
+        chunk = (i // 1024) * 2048 + i % 1024
+        plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+        out = ()
+        for t in gl.static_range(KT):
+            smem = gl.allocate_shared_memory(gl.uint8, [B_TILE_BYTES], plain)
+            base = _gluon_dot_preshuffled_w_offset(
+                w_off, (ks * KT + t) * 64, blk * BLOCK_N, W13_N
+            )
+            # Each lane's 16 bytes are contiguous and 16-byte aligned: the
+            # tile starts at a K row multiple of 64 and a column multiple of
+            # 128 (the chunk offsets are multiples of 1 KiB).
+            offs = gl.max_contiguous(
+                gl.multiple_of((base + chunk).to(gl.int32), 16), 16
+            )
+            cdna4_async_copy.buffer_load_to_shared(
+                smem,
+                w13,
+                offs,
+                mask=on & (i >= 0),
+                cache_modifier=".cg",
+            )
+            out += (smem,)
+        cdna4_async_copy.commit_group()
+    else:
+        out = 0
+    return out
+
+
+@gluon.jit
+def _lds_b_tiles(pre, scales):
+    """The B tiles of a slot from LDS (``pre``, :func:`ex1_prefetch`) with its
+    scales from registers (``scales``, :func:`_load_scales`), as
+    :func:`_load_b` returns them."""
+    layouts: gl.constexpr = _direct_mxfp4_mfma_layouts(
+        M_DUP, BLOCK_N, 4, gl.num_warps()
+    )
+    dot_b: gl.constexpr = layouts[2]
+    tiles = ()
+    for t in gl.static_range(len(scales)):
+        b = pre[t].reinterpret(gl.uint8, [64, BLOCK_N], B_TILE_LDS).load(dot_b)
+        tiles += ((b, scales[t]),)
+    return tiles
+
+
+@gluon.jit
+def _load_scales(
+    ws, expert, stride_se, stride_slin, stride_snb, n0, kt0, KT: gl.constexpr
+):
+    """:func:`_load_b`'s scale loads alone: ``KT`` tiles' scales of columns
+    ``n0 ..`` from K tile ``kt0``; nothing loads when ``expert`` is -1."""
+    layouts: gl.constexpr = _direct_mxfp4_mfma_layouts(
+        M_DUP, BLOCK_N, 4, gl.num_warps()
+    )
+    b_scale: gl.constexpr = layouts[4]
+    sn = n0 + gl.arange(0, BLOCK_N, gl.SliceLayout(1, b_scale))[:, None]
+    sk = gl.arange(0, 4, gl.SliceLayout(0, b_scale))[None, :]
+    on = expert >= 0
+    s_off = gl.maximum(expert, 0).to(gl.int64) * stride_se
+    scales = ()
+    for i in gl.static_range(KT):
+        scales += (
+            gl.amd.cdna4.buffer_load(
+                ws,
+                _cdna4_swizzled_mxfp4_scale_offset(
+                    s_off, sn, (kt0 + i) * 4 + sk, stride_slin, stride_snb
+                ).to(gl.int32),
+                mask=(sk >= 0) & on,
+            ),
+        )
+    return scales
+
+
 @gluon.jit
 def ex1_issue(
     task, active, expert, w13, w13s, stride_we, stride_se, stride_slin, stride_snb
@@ -1184,6 +1305,7 @@ def ex1_finish(
     expert,
     union,
     table,
+    pre,
     w13,
     w13s,
     stride_we,
@@ -1196,14 +1318,31 @@ def ex1_finish(
     (``tiles``, of the lane's first slot, ``expert``) and :func:`slots`
     (``union``): multiply and publish the FP32 partial sums, then the same
     for the lane's other slots. ``table``: past 8 rows, the CTA's
-    :func:`lane_slots`."""
+    :func:`lane_slots`; ``pre``: past 8 rows, the second slot's B tiles in LDS
+    (:func:`ex1_prefetch`)."""
     lane = lane_of(mb.plan, task // (NB1 * KSPLIT))
     count = union[3]
     R: gl.constexpr = schedule.rows(mb.plan)
     if R > 8:
-        # Past 8 rows each slot's expert and row picks come from LDS.
+        # Past 8 rows each slot's expert and row picks come from LDS, and the
+        # second slot's B tiles too: they landed during the A poll (vmcnt
+        # counts in order), so the wait is free and covers no later load.
         experts_smem, picks_smem = table
-        following = lane_slot_expert(experts_smem, 1)
+        cdna4_async_copy.wait_group(0)
+        gl.barrier()
+        blk = (task // KSPLIT) % NB1
+        ks = task % KSPLIT
+        second = _load_scales(
+            w13s,
+            lane_slot_expert(experts_smem, 1),
+            stride_se,
+            stride_slin,
+            stride_snb,
+            blk * BLOCK_N,
+            ks * (K_SLICE // 128),
+            K_SLICE // 128,
+        )
+        following = lane_slot_expert(experts_smem, 2)
         more = ex1_issue(
             task,
             True,
@@ -1216,7 +1355,11 @@ def ex1_finish(
             stride_snb,
         )
         _ex1_slot_picked(mb, task, a, tiles, picks_smem.index(0))
-        for i in range(lane + LANES, count, LANES):
+        if lane + LANES < count:
+            _ex1_slot_picked(
+                mb, task, a, _lds_b_tiles(pre, second), picks_smem.index(1)
+            )
+        for i in range(lane + 2 * LANES, count, LANES):
             k = i // LANES
             tiles = more
             following = lane_slot_expert(experts_smem, k + 1)
