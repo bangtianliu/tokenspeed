@@ -148,6 +148,45 @@ EX2_AHEAD = gl.constexpr(4)
 OWNED_OUT = gl.constexpr(512)  # output columns a rank reduces: POOLED / WORLD
 PRE_EPS = gl.constexpr(1e-5)
 
+# The lane each group of 32 expert CTAs serves, per plan: slot i runs on
+# lane i % 8, so when U % 8 != 0 lanes 0 .. U % 8 - 1 carry one slot more.
+# A permutation (lane_order) moves those slots to the CTAs whose expert
+# tasks end earliest; which CTAs a slot runs on does not change its math (its
+# partials are keyed by pick), so outputs stay bit-identical. Identity until
+# a served stage trace picks one.
+LANE_IDENTITY = (0, 1, 2, 3, 4, 5, 6, 7)
+
+
+@gluon.constexpr_function
+def lane_order(plan):
+    """The lane permutation of ``plan``: CTA group ``g`` (of 32 CTAs) serves
+    lane ``lane_order(plan)[g]``."""
+    return LANE_IDENTITY
+
+
+@gluon.constexpr_function
+def _lane_bits(plan):
+    order = lane_order(plan)
+    if sorted(order) != list(LANE_IDENTITY):
+        raise ValueError(f"lane order must permute 0 .. 7, got {order}")
+    return sum(lane << (4 * g) for g, lane in enumerate(order))
+
+
+@gluon.constexpr_function
+def _lane_is_identity(plan):
+    return tuple(lane_order(plan)) == LANE_IDENTITY
+
+
+@gluon.jit
+def lane_of(plan: gl.constexpr, group):
+    """The lane that CTA group ``group`` serves (:func:`lane_order`)."""
+    if _lane_is_identity(plan):
+        out = group
+    else:
+        out = (_lane_bits(plan) >> (group * 4)) & 7
+    return out
+
+
 PEERS = ("rr",)
 # The slot table (:func:`slot_table_stage`), plain words in row 0 under one
 # flag (sltf): a word a pick (its id, slot, whether it owns its expert, the
@@ -769,7 +808,11 @@ def ex1_poll(mb, task, task2, active, pre_gain, STAGE: gl.constexpr):
     tp = gl.arange(0, NP, gl.SliceLayout(1, tl))[:, None]
     tr = gl.arange(0, RP, gl.SliceLayout(0, tl))[None, :]
     i = gl.arange(0, 2, lanes)
-    first = gl.where(i == 0, task // (NB1 * KSPLIT), task2 // (NB2 // EX2_BLOCKS))
+    first = gl.where(
+        i == 0,
+        lane_of(mb.plan, task // (NB1 * KSPLIT)),
+        lane_of(mb.plan, task2 // (NB2 // EX2_BLOCKS)),
+    )
     if R > 1:
         # Past one row every wave of many CTAs polls several whole rows:
         # one wave spins on hints first (unthrottled, the flood of polls
@@ -895,7 +938,11 @@ def ex1_poll_routes(mb, task, task2, active, STAGE: gl.constexpr):
     tp = gl.arange(0, NP, gl.SliceLayout(1, tl))[:, None]
     tr = gl.arange(0, RP, gl.SliceLayout(0, tl))[None, :]
     i = gl.arange(0, 2, lanes)
-    first = gl.where(i == 0, task // (NB1 * KSPLIT), task2 // (NB2 // EX2_BLOCKS))
+    first = gl.where(
+        i == 0,
+        lane_of(mb.plan, task // (NB1 * KSPLIT)),
+        lane_of(mb.plan, task2 // (NB2 // EX2_BLOCKS)),
+    )
     firsts, _ = mb.poll_many(("route", "sltf"), (first, i * 0))
     # The table's flag is in: its words load after the poll returned.
     gl.barrier()
@@ -1061,7 +1108,7 @@ def cta_slots(PLAN: gl.constexpr, union):
             NB2 // EX2_BLOCKS == NB1 * KSPLIT,
             "ex1 and ex2 tasks of a CTA must be of one lane",
         )
-        table = lane_slots(union, gl.program_id(0) // (NB1 * KSPLIT))
+        table = lane_slots(union, lane_of(PLAN, gl.program_id(0) // (NB1 * KSPLIT)))
     else:
         table = (0, 0)
     return table
@@ -1150,7 +1197,7 @@ def ex1_finish(
     (``union``): multiply and publish the FP32 partial sums, then the same
     for the lane's other slots. ``table``: past 8 rows, the CTA's
     :func:`lane_slots`."""
-    lane = task // (NB1 * KSPLIT)
+    lane = lane_of(mb.plan, task // (NB1 * KSPLIT))
     count = union[3]
     R: gl.constexpr = schedule.rows(mb.plan)
     if R > 8:
@@ -1337,7 +1384,7 @@ def exr_stage(mb, task, union, table, BF16: gl.constexpr, STAGE: gl.constexpr):
         gl.static_assert(
             EXR_PARTS == KSPLIT, "exr's lane must be the CTA's slot-table lane"
         )
-    lane = task // (NB1 * PARTS)
+    lane = lane_of(mb.plan, task // (NB1 * PARTS))
     blk = task // PARTS % NB1
     first = lane + LANES * (task % PARTS)
     count = union[3]
@@ -1746,7 +1793,7 @@ def ex2_finish(
     RP: gl.constexpr = triton.next_power_of_2(R)
     S: gl.constexpr = min(RP, EX2_GATHER)
     A: gl.constexpr = max(2, min(S, EX2_AHEAD))
-    lane = task // (NB2 // EX2_BLOCKS)
+    lane = lane_of(mb.plan, task // (NB2 // EX2_BLOCKS))
     count = union[3]
     TABLE: gl.constexpr = R > 8
     tiles = (loads,)

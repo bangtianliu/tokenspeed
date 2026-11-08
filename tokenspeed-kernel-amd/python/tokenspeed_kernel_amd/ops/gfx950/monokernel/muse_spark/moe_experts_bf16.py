@@ -248,7 +248,7 @@ def ex1_finish(mb, task, x3, tiles, union, table, w13, stride_we, STAGE: gl.cons
     ``table``: past 8 rows, the CTA's :func:`moe_experts.lane_slots`, which
     gives each slot's expert and row picks with one LDS load."""
     R: gl.constexpr = schedule.rows(mb.plan)
-    lane = task // (NB1 * KSPLIT)
+    lane = moe_experts.lane_of(mb.plan, task // (NB1 * KSPLIT))
     count = union[3]
     if R > 8:
         for i in range(lane, count, LANES):
@@ -445,7 +445,7 @@ def ex2_finish(
     before a half's products. ``table``: past 8 rows, the CTA's
     :func:`moe_experts.lane_slots`."""
     R: gl.constexpr = schedule.rows(mb.plan)
-    lane = task // NB2
+    lane = moe_experts.lane_of(mb.plan, task // NB2)
     count = union[3]
     plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     flat: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [2, 1, 0])
