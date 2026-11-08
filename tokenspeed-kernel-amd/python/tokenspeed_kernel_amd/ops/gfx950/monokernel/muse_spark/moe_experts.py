@@ -198,13 +198,25 @@ SLT_WORDS = gl.constexpr(128 + 128 * 16)
 # The expert input (:func:`xq_stage`): each row's K quarters normed and
 # quantized to MXFP4 once, as plain words in the row's copy of xq: a
 # quarter's 512 E2M1 bytes (128 words), then its 32 E8M0 scales (8 words).
-# An xq task does one K quarter of a group of up to XQ_ROWS rows (one poll
-# round trip) and raises flag ``quarter * XQ_GROUPS + group`` in row 0 of
-# xqf. ex1 then loads 136 words a row instead of polling every whole pooled
-# row (16 KiB of pairs) on each of its 256 CTAs.
+# An xq task does one K quarter of a group of rows (one poll round trip)
+# and raises flag ``quarter * XQ_GROUPS + group`` in row 0 of xqf. ex1 then
+# loads 136 words a row instead of polling every whole pooled row (16 KiB of
+# pairs) on each of its 256 CTAs. A launch's rows split into up to
+# XQ_GROUPS groups (:func:`xq_rows`): one row a group up to 8 rows, two at
+# 16. An xq task polls its group's whole pooled rows (8 KiB of tagged pairs
+# a row) for the norm, so fewer rows a group shorten xq's poll; at 8 ranks,
+# 4 rows a group put the xq CTAs' ex1 ~3 us behind the others at 1 x 8.
+# With one row a group at 16 rows, the 64 tasks wrapped onto the heaviest ex1
+# lanes' CTAs and cost 1-1.5 us a sliding launch.
 XQ_QUARTER_WORDS = gl.constexpr(136)  # K_SLICE // 8 + K_SLICE // 128
-XQ_ROWS = gl.constexpr(4)
-XQ_GROUPS = gl.constexpr(4)  # 16 rows / XQ_ROWS
+XQ_GROUPS = gl.constexpr(8)
+
+
+@gluon.constexpr_function
+def xq_rows(rows):
+    """Rows of an xq row group in a launch of ``rows`` rows."""
+    rp = 1 << (int(rows) - 1).bit_length()
+    return max(1, rp // int(XQ_GROUPS))
 
 
 def regions() -> tuple[tuple[str, int], ...]:
@@ -228,7 +240,7 @@ def regions() -> tuple[tuple[str, int], ...]:
 def xq_tasks(rows: int) -> int:
     """The xq tasks of a launch of ``rows``: a K quarter of a row group each."""
     rp = 1 << (rows - 1).bit_length()
-    return int(KSPLIT) * (rp // min(rp, int(XQ_ROWS)))
+    return int(KSPLIT) * (rp // xq_rows(rows))
 
 
 def stages(
@@ -876,13 +888,13 @@ def _words_layout(cols, num_warps):
 @gluon.jit
 def xq_stage(mb, task, pre_gain, STAGE: gl.constexpr):
     """xq task ``task``: K quarter ``task % KSPLIT`` of the rows of group
-    ``task // KSPLIT`` (``G = min(RP, XQ_ROWS)`` rows), normed and quantized
+    ``task // KSPLIT`` (``G = xq_rows(R)`` rows), normed and quantized
     by :func:`_xq_quantize`, published as plain words in each row's copy of
     xq under one flag (xqf)."""
     mb.stamp(STAGE, trace.START)
     R: gl.constexpr = schedule.rows(mb.plan)
     RP: gl.constexpr = triton.next_power_of_2(R)
-    G: gl.constexpr = min(RP, XQ_ROWS)
+    G: gl.constexpr = xq_rows(R)
     ks = task % KSPLIT
     grp = task // KSPLIT
     nw: gl.constexpr = gl.num_warps()
@@ -960,7 +972,7 @@ def ex1_xq(mb, task, active, STAGE: gl.constexpr):
     past ``RP`` are zero). Returns the LDS (values, scales)."""
     R: gl.constexpr = schedule.rows(mb.plan)
     RP: gl.constexpr = triton.next_power_of_2(R)
-    NG: gl.constexpr = RP // min(RP, XQ_ROWS)
+    NG: gl.constexpr = RP // xq_rows(R)
     ks = task % KSPLIT
     nw: gl.constexpr = gl.num_warps()
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
