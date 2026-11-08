@@ -140,8 +140,14 @@ NEXT_BASES = {**CHAINED_BASES, "qnext": 192, "out": 96, "exr": 128}
 # take CTAs 192 .. 255 and 0 .. 63, whose last earlier task is oproj or an
 # attention task.
 WIDE = {"router": 192, "topk": 192}
-# exr's base and parts in a launch of more than 8 rows that ends with qnext.
-WIDE_NEXT_EXR = (128, 2)
+# exr's base and parts in a launch of more than 8 rows that ends with qnext:
+# spread over every CTA. From CTA 128 in 2 parts (the 8-row qnext placement),
+# exr shared CTAs 128 .. 255 with ex2's lanes 4 .. 7, whose ex2 then started
+# only as their own exr task ended, 5-8 us after the lane's last intermediate
+# (lanes 0 .. 3: ~1.5 us). Spread, a 2 x 8 launch at 200k keys took 160.5 us
+# warm instead of 162.9 (8.7k: the same, 111.3 vs 111.6; from CTA 64 or 0 in
+# 2 parts was 1-3 us slower).
+WIDE_NEXT_EXR = (0, 4)
 
 
 def _bases(rows: int, next_qkvg: bool, *names: str) -> dict[str, int]:
