@@ -570,36 +570,91 @@ def gluon_muse_spark_layer_gfx950(
             RANK,
         )
     task, active = schedule.stage_task(PLAN, "out")
-    if active:
-        moe_tail.out_stage(
-            mb,
-            task,
-            post_gain,
-            beta2,
-            in_gain,
-            a_out,
-            h_next,
-            tap,
-            tap_col,
-            tap_row,
-            RANK,
-            TAP,
-            WHOLE_ROWS,
-            schedule.stage_tasks(PLAN, "out") // schedule.rows(PLAN),
-            schedule.has_stage(PLAN, "qnext"),
-            "out",
-        )
-    if schedule.has_stage(PLAN, "qnext"):
-        task, active = schedule.stage_task(PLAN, "qnext")
-        if active:
-            qkvg.qnext_stage(
+    if schedule.has_stage(PLAN, "qnext") and schedule.rows(PLAN) > 8:
+        # Past 8 rows out's 128 tasks share 32 CTAs with qnext's 160: those
+        # CTAs issue their qnext weights before the out task (qnext reads
+        # every out task's words, so out runs first), not after it.
+        q_task, q_active = schedule.stage_task(PLAN, "qnext")
+        if q_active:
+            mb.stamp("qnext", trace.START)
+            tiles = qkvg.qnext_tiles(w_next, q_task)
+            if active:
+                moe_tail.out_stage(
+                    mb,
+                    task,
+                    post_gain,
+                    beta2,
+                    in_gain,
+                    a_out,
+                    h_next,
+                    tap,
+                    tap_col,
+                    tap_row,
+                    RANK,
+                    TAP,
+                    WHOLE_ROWS,
+                    schedule.stage_tasks(PLAN, "out") // schedule.rows(PLAN),
+                    schedule.has_stage(PLAN, "qnext"),
+                    "out",
+                )
+            qkvg.qnext_finish(
                 mb,
-                task,
-                w_next,
+                q_task,
+                tiles,
                 proj_out,
                 schedule.stage_tasks(PLAN, "out") // schedule.rows(PLAN),
                 "qnext",
             )
+        elif active:
+            moe_tail.out_stage(
+                mb,
+                task,
+                post_gain,
+                beta2,
+                in_gain,
+                a_out,
+                h_next,
+                tap,
+                tap_col,
+                tap_row,
+                RANK,
+                TAP,
+                WHOLE_ROWS,
+                schedule.stage_tasks(PLAN, "out") // schedule.rows(PLAN),
+                schedule.has_stage(PLAN, "qnext"),
+                "out",
+            )
+    else:
+        if active:
+            moe_tail.out_stage(
+                mb,
+                task,
+                post_gain,
+                beta2,
+                in_gain,
+                a_out,
+                h_next,
+                tap,
+                tap_col,
+                tap_row,
+                RANK,
+                TAP,
+                WHOLE_ROWS,
+                schedule.stage_tasks(PLAN, "out") // schedule.rows(PLAN),
+                schedule.has_stage(PLAN, "qnext"),
+                "out",
+            )
+        if schedule.has_stage(PLAN, "qnext"):
+            task, active = schedule.stage_task(PLAN, "qnext")
+            if active:
+                qkvg.qnext_stage(
+                    mb,
+                    task,
+                    w_next,
+                    proj_out,
+                    schedule.stage_tasks(PLAN, "out") // schedule.rows(PLAN),
+                    "qnext",
+                )
     trace.flush(table, trace_buf)
 
 

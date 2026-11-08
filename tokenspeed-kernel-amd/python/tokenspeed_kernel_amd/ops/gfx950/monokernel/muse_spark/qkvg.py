@@ -170,22 +170,34 @@ def qnext_stage(mb, task, w, proj, OUT_PER_ROW: gl.constexpr, STAGE: gl.constexp
         OUT_PER_ROW: Out tasks a row; each publishes ``8192 / OUT_PER_ROW``
             values of its row and raises flag ``task`` of ``anxf``.
     """
-    R: gl.constexpr = schedule.rows(mb.plan)
     mb.stamp(STAGE, trace.START)
-    blk = task // KSPLIT
-    half = task % KSPLIT
+    tiles = qnext_tiles(w, task)
+    qnext_finish(mb, task, tiles, proj, OUT_PER_ROW, STAGE)
+
+
+@gluon.jit
+def qnext_tiles(w, task):
+    """Issue qnext task ``task``'s weight loads (128 KiB; nothing waits)."""
     KITS: gl.constexpr = HIDDEN // 32 // KSPLIT
-    tiles = bf16.load_weight_tiles(
+    return bf16.load_weight_tiles(
         w,
-        nb0=blk,
+        nb0=task // KSPLIT,
         K=HIDDEN,
-        kit0=half * KITS,
+        kit0=(task % KSPLIT) * KITS,
         KITS=KITS,
         SPLIT=8,
         NW=1,
         GROUP=1,
         GROUP_STRIDE=0,
     )
+
+
+@gluon.jit
+def qnext_finish(mb, task, tiles, proj, OUT_PER_ROW: gl.constexpr, STAGE: gl.constexpr):
+    """:func:`qnext_stage` after its weight loads (:func:`qnext_tiles`)."""
+    R: gl.constexpr = schedule.rows(mb.plan)
+    blk = task // KSPLIT
+    half = task % KSPLIT
     # The out tasks of this K half, in every row: one flag each.
     F: gl.constexpr = OUT_PER_ROW // KSPLIT
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
