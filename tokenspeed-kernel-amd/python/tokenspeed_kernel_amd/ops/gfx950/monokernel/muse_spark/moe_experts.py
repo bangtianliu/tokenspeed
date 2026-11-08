@@ -70,7 +70,10 @@ each row's 8 picks as for one row.
 The slot table (:func:`slots`: each pick's slot, whether it owns its
 expert, every row's pick of it) is built once, by one task after the
 routing (:func:`slot_table_stage`), and published in ``slt``; built on all
-256 CTAs it took ~5 us of each ex1 task's prelude.
+256 CTAs it took ~5 us of each ex1 task's prelude. Past 8 rows each CTA
+also keeps its lane's slots' experts and row picks in LDS
+(:func:`cta_slots`), which ex1, exr and ex2 (and the BF16 experts' stages)
+read with one load a slot instead of two reductions over the table.
 
 Expert weights cannot load before routing picks the experts. So a CTA runs
 the first slot of its ex1 and ex2 tasks in parts: :func:`ex1_poll_routes`
@@ -943,6 +946,138 @@ def _ex1_slot(mb, task, a, tiles, union, expert):
 
 
 @gluon.jit
+def lane_slots(union, lane):
+    """Past 8 rows: the expert and the row picks of each of lane ``lane``'s
+    slots, from the slot table (``union``) in one reduction, in LDS: ``(experts,
+    picks)``, ``int32 [16, 16]`` each, row ``k`` for slot ``lane + 8 k`` (at
+    most 8 picks a row make at most 16 slots a lane). A picks row holds each
+    row's pick of the slot's expert, or -1 (as :func:`_ex2_gather_lane`); an
+    experts row holds the slot's expert in every column, or -1 past the
+    lane's last slot.
+
+    Past 8 rows ex1, ex2 and (placed from CTA 0 in EXR_PARTS parts) exr task
+    ``t`` all run on CTA ``t`` with lane ``t // 32``, so the CTA builds one
+    table, after :func:`union_of`, for all three. Per slot they then read it
+    with one LDS load: the lookups it replaces (:func:`_slot_expert`,
+    :func:`_row_picks`) were reductions over the 128-pick table, ~2 us a
+    slot of ex1's at 2 x 8 rows."""
+    nw: gl.constexpr = gl.num_warps()
+    ids, owner, slot, count, table = union
+    RP: gl.constexpr = table.shape[1]
+    gl.static_assert(RP == M_DUP, "past 8 rows the table has 16 row columns")
+    # [slot, pick, row]: a slot a wave, a pick a lane, the rows in registers.
+    l3: gl.constexpr = gl.BlockedLayout([1, 1, RP], [1, 64, 1], [nw, 1, 1], [2, 1, 0])
+    pl: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, l3))
+    j = gl.arange(0, M_DUP, gl.SliceLayout(1, gl.SliceLayout(2, l3)))[:, None, None]
+    want = lane + j * LANES
+    hit = (gl.convert_layout(owner, pl)[None, :, None] > 0) & (
+        gl.convert_layout(slot, pl)[None, :, None] == want
+    )
+    t3 = gl.convert_layout(table, gl.SliceLayout(0, l3))[None, :, :]
+    picks = gl.max(gl.where(hit, t3, -1), axis=1)  # [16, RP]
+    i3 = gl.convert_layout(ids, pl)[None, :, None]
+    experts, _ = gl.broadcast(gl.max(gl.where(hit, i3, -1), axis=1), picks)
+    plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    picks_smem = gl.allocate_shared_memory(gl.int32, [M_DUP, M_DUP], plain)
+    experts_smem = gl.allocate_shared_memory(gl.int32, [M_DUP, M_DUP], plain)
+    picks_smem.store(picks)
+    experts_smem.store(experts)
+    gl.barrier()
+    # The same row-major words, as rows: index(k) is slot k's row.
+    rows: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+    return (
+        experts_smem.reinterpret(gl.int32, [M_DUP, M_DUP], rows),
+        picks_smem.reinterpret(gl.int32, [M_DUP, M_DUP], rows),
+    )
+
+
+@gluon.jit
+def cta_slots(PLAN: gl.constexpr, union):
+    """Past 8 rows, this CTA's :func:`lane_slots`: ex1 and ex2 task ``t``
+    (placed from CTA 0) run on CTA ``t``, lane ``t // 32``, and so does exr
+    task ``t`` when it is placed from CTA 0 in EXR_PARTS parts. Up to 8 rows
+    the stages look their slots up in ``union`` themselves (a placeholder).
+    It ends in a barrier, so every CTA calls it, outside any task branch."""
+    if schedule.rows(PLAN) > 8:
+        gl.static_assert(
+            schedule.stage_base(PLAN, "ex1") == 0
+            and schedule.stage_base(PLAN, "ex2") == 0,
+            "the slot table serves the lane of CTA t: t // 32",
+        )
+        table = lane_slots(union, gl.program_id(0) // (NB1 * KSPLIT))
+    else:
+        table = (0, 0)
+    return table
+
+
+@gluon.jit
+def _lane_slot_expert(experts_smem, k):
+    """The expert of the lane's ``k``-th slot (:func:`lane_slots`), or -1
+    (past its last slot, ``k`` 16 or more too): every thread loads the whole
+    row, so the max is its own."""
+    whole: gl.constexpr = gl.BlockedLayout([M_DUP], [64], [gl.num_warps()], [0])
+    k = gl.to_tensor(k)
+    row = experts_smem.index(gl.minimum(k, M_DUP - 1)).load(whole)
+    return gl.where(k < M_DUP, gl.max(row, axis=0), -1)
+
+
+@gluon.jit
+def table_row_picks(picks_row, R: gl.constexpr):
+    """:func:`_row_picks` of a slot's row picks from LDS (``picks_row``
+    ``[16]``, :func:`lane_slots`): the same ``R`` scalars, each a reduction
+    within the thread (every thread loads the whole row)."""
+    whole: gl.constexpr = gl.BlockedLayout([M_DUP], [64], [gl.num_warps()], [0])
+    w = picks_row.load(whole)
+    iw = gl.arange(0, M_DUP, whole)
+    picks = ()
+    for r in gl.static_range(R):
+        picks += (gl.max(gl.where(iw == r, w, -1), axis=0),)
+    return picks
+
+
+@gluon.jit
+def lane_slot_expert(experts_smem, k):
+    """:func:`_lane_slot_expert`, for the BF16 experts' stages."""
+    return _lane_slot_expert(experts_smem, k)
+
+
+@gluon.jit
+def _slot_rows_lds(picks_row, RP: gl.constexpr, layout: gl.constexpr):
+    """:func:`_slot_rows` of a slot's row picks from LDS (``picks_row``
+    ``[16]``, :func:`lane_slots`): the same ``(row, pick, routed)``."""
+    whole: gl.constexpr = gl.BlockedLayout([M_DUP], [64], [gl.num_warps()], [0])
+    w = picks_row.load(whole)
+    iw = gl.arange(0, M_DUP, whole)
+    first = gl.min(gl.where(w >= 0, iw, M_DUP), axis=0)
+    first_pick = gl.max(gl.where(iw == first, w, -1), axis=0)
+    pick = picks_row.slice(0, RP).load(layout)
+    i = gl.arange(0, RP, layout)
+    routed = pick >= 0
+    return gl.where(routed, i, first), gl.where(routed, pick, first_pick), routed
+
+
+@gluon.jit
+def _ex1_slot_picked(mb, task, a, tiles, picks_row):
+    """:func:`_ex1_slot` past 8 rows, with the slot's row picks from LDS
+    (``picks_row`` ``[16]``, kept by :func:`_ex1_lane_slots`): MFMA row ``r``
+    is row ``r``, as there."""
+    blk = (task // KSPLIT) % NB1
+    ks = task % KSPLIT
+    p_smem, s_smem = a
+    acc = _mma_rows(p_smem, s_smem, tiles)
+    m = gl.arange(0, M_DUP, gl.SliceLayout(1, acc.type.layout))
+    k = picks_row.load(gl.SliceLayout(1, acc.type.layout))
+    n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, acc.type.layout))[None, :]
+    at = ((k[:, None] * NB1 + blk) * KSPLIT + ks) * BLOCK_N + n
+    mb.put(
+        "p1",
+        mb.row_offset(m[:, None]) + at,
+        acc.to(gl.int32, bitcast=True),
+        mask=(k[:, None] >= 0) & (n >= 0),
+    )
+
+
+@gluon.jit
 def ex1_finish(
     mb,
     task,
@@ -950,6 +1085,7 @@ def ex1_finish(
     tiles,
     expert,
     union,
+    table,
     w13,
     w13s,
     stride_we,
@@ -961,30 +1097,49 @@ def ex1_finish(
     """Ex1 task ``task`` after :func:`ex1_xq` (``a``) and :func:`ex1_issue`
     (``tiles``, of the lane's first slot, ``expert``) and :func:`slots`
     (``union``): multiply and publish the FP32 partial sums, then the same
-    for the lane's other slots."""
+    for the lane's other slots. ``table``: past 8 rows, the CTA's
+    :func:`lane_slots`."""
     lane = task // (NB1 * KSPLIT)
     count = union[3]
-    # Each slot's loads go out before the previous slot's product. With
-    # one row the loop never runs, yet this form measured 2 us faster per
-    # layer than one without it (a backend schedule effect). Past one row
-    # it fits the registers since the slots' ids sit a lane each.
-    following = _slot_expert(union, lane + LANES)
-    more = ex1_issue(
-        task,
-        True,
-        following,
-        w13,
-        w13s,
-        stride_we,
-        stride_se,
-        stride_slin,
-        stride_snb,
-    )
-    _ex1_slot(mb, task, a, tiles, union, expert)
-    for i in range(lane + LANES, count, LANES):
-        expert = following
-        tiles = more
-        following = _slot_expert(union, i + LANES)
+    R: gl.constexpr = schedule.rows(mb.plan)
+    if R > 8:
+        # Past 8 rows each slot's expert and row picks come from LDS.
+        experts_smem, picks_smem = table
+        following = _lane_slot_expert(experts_smem, 1)
+        more = ex1_issue(
+            task,
+            True,
+            following,
+            w13,
+            w13s,
+            stride_we,
+            stride_se,
+            stride_slin,
+            stride_snb,
+        )
+        _ex1_slot_picked(mb, task, a, tiles, picks_smem.index(0))
+        for i in range(lane + LANES, count, LANES):
+            k = i // LANES
+            tiles = more
+            following = _lane_slot_expert(experts_smem, k + 1)
+            more = ex1_issue(
+                task,
+                True,
+                following,
+                w13,
+                w13s,
+                stride_we,
+                stride_se,
+                stride_slin,
+                stride_snb,
+            )
+            _ex1_slot_picked(mb, task, a, tiles, picks_smem.index(k))
+    else:
+        # Each slot's loads go out before the previous slot's product. With
+        # one row the loop never runs, yet this form measured 2 us faster per
+        # layer than one without it (a backend schedule effect). Past one row
+        # it fits the registers since the slots' ids sit a lane each.
+        following = _slot_expert(union, lane + LANES)
         more = ex1_issue(
             task,
             True,
@@ -997,6 +1152,22 @@ def ex1_finish(
             stride_snb,
         )
         _ex1_slot(mb, task, a, tiles, union, expert)
+        for i in range(lane + LANES, count, LANES):
+            expert = following
+            tiles = more
+            following = _slot_expert(union, i + LANES)
+            more = ex1_issue(
+                task,
+                True,
+                following,
+                w13,
+                w13s,
+                stride_we,
+                stride_se,
+                stride_slin,
+                stride_snb,
+            )
+            _ex1_slot(mb, task, a, tiles, union, expert)
     mb.stamp(STAGE, trace.COMPUTED)
     mb.stamp(STAGE, trace.END)
 
@@ -1090,19 +1261,25 @@ def _words(x):
 
 
 @gluon.jit
-def exr_stage(mb, task, union, BF16: gl.constexpr, STAGE: gl.constexpr):
+def exr_stage(mb, task, union, table, BF16: gl.constexpr, STAGE: gl.constexpr):
     """Exr task ``task`` (slot lane, ex1 column block): for each slot of the
     lane, sum the 4 K quarters of the ex1 partials of every row that picked
     the slot's expert, apply SwiGLU (``silu(gate) up``) and publish the
     block's 64 intermediate values a row. The 32 ex2 tasks of the lane then
     read 512 values a row, not 4 partials of 1024 columns each. With
     ``BF16`` (BF16 experts) the values are rounded to BF16, as the regular
-    BF16 route path stores its intermediate, else requantized to MXFP4."""
+    BF16 route path stores its intermediate, else requantized to MXFP4.
+    ``table``: past 8 rows, the CTA's :func:`lane_slots`, which serves the
+    task's slots when exr runs from CTA 0 in EXR_PARTS parts (its lane is
+    then the CTA's)."""
     mb.stamp(STAGE, trace.START)
     R: gl.constexpr = schedule.rows(mb.plan)
     RP: gl.constexpr = triton.next_power_of_2(R)
     nw: gl.constexpr = gl.num_warps()
     PARTS: gl.constexpr = schedule.stage_tasks(mb.plan, STAGE) // EXR_LANE_TASKS
+    LDS: gl.constexpr = (
+        R > 8 and schedule.stage_base(mb.plan, STAGE) == 0 and PARTS == EXR_PARTS
+    )
     lane = task // (NB1 * PARTS)
     blk = task // PARTS % NB1
     first = lane + LANES * (task % PARTS)
@@ -1118,9 +1295,13 @@ def exr_stage(mb, task, union, BF16: gl.constexpr, STAGE: gl.constexpr):
         2, gl.BlockedLayout([1, 1, 2], [1, 64, 1], [nw, 1, 1], [2, 1, 0])
     )
     for i in range(first, count, LANES * PARTS):
-        expert = _slot_expert(union, i)
-        picks = _row_picks(union, expert, R)
-        row, pick, _ = _slot_rows(mb, picks, RP, rl)
+        if LDS:
+            picks_row = table[1].index(i // LANES)
+            row, pick, _ = _slot_rows_lds(picks_row, RP, rl)
+        else:
+            expert = _slot_expert(union, i)
+            picks = _row_picks(union, expert, R)
+            row, pick, _ = _slot_rows(mb, picks, RP, rl)
         at = ((pick[:, None, None] * NB1 + blk) * KSPLIT + ks) * BLOCK_N + n
         (got,) = mb.poll_many(("p1",), (mb.row_offset(row[:, None, None]) + at,))
         if i == first:
@@ -1143,7 +1324,10 @@ def exr_stage(mb, task, union, BF16: gl.constexpr, STAGE: gl.constexpr):
                 )
             )
             wl: gl.constexpr = words.type.layout
-            row, pick, routed = _slot_rows(mb, picks, RP, gl.SliceLayout(1, wl))
+            if LDS:
+                row, pick, routed = _slot_rows_lds(picks_row, RP, gl.SliceLayout(1, wl))
+            else:
+                row, pick, routed = _slot_rows(mb, picks, RP, gl.SliceLayout(1, wl))
             w = gl.arange(0, BLOCK_N // 4, gl.SliceLayout(0, wl))[None, :]
             mb.put(
                 "h1",
@@ -1160,7 +1344,10 @@ def exr_stage(mb, task, union, BF16: gl.constexpr, STAGE: gl.constexpr):
             packed, scales = _mxfp4_quantize_tile(inter)
             words = _words(packed)
             wl: gl.constexpr = words.type.layout
-            row, pick, routed = _slot_rows(mb, picks, RP, gl.SliceLayout(1, wl))
+            if LDS:
+                row, pick, routed = _slot_rows_lds(picks_row, RP, gl.SliceLayout(1, wl))
+            else:
+                row, pick, routed = _slot_rows(mb, picks, RP, gl.SliceLayout(1, wl))
             w = gl.arange(0, BLOCK_N // 16, gl.SliceLayout(0, wl))[None, :]
             mb.put(
                 "h1",
@@ -1175,7 +1362,10 @@ def exr_stage(mb, task, union, BF16: gl.constexpr, STAGE: gl.constexpr):
             pl2: gl.constexpr = gl.BlockedLayout([1, 2], [64, 1], [nw, 1], [1, 0])
             lo, hi = gl.split(gl.convert_layout(scales.to(gl.int32), pl2))
             sl: gl.constexpr = lo.type.layout
-            row, pick, routed = _slot_rows(mb, picks, RP, sl)
+            if LDS:
+                row, pick, routed = _slot_rows_lds(picks_row, RP, sl)
+            else:
+                row, pick, routed = _slot_rows(mb, picks, RP, sl)
             mb.put(
                 "h1",
                 mb.row_offset(row) + pick * H1_WORDS + INTER // 8 + blk,
@@ -1464,6 +1654,7 @@ def ex2_finish(
     loads,
     expert,
     union,
+    table,
     w2,
     w2s,
     stride_we,
@@ -1484,20 +1675,28 @@ def ex2_finish(
     order): polled a slot at a time between the slots' weights, each slot
     paid its weights' latency and a poll round trip (13 us for 4 slots,
     about 2.4x their stream at 8 rows). The unrolled slots carry no weights
-    across a loop, whose copies would wait for the loads in flight."""
+    across a loop, whose copies would wait for the loads in flight.
+
+    ``table``: past 8 rows, the CTA's :func:`lane_slots`, which gives the
+    slots' experts with one LDS load each."""
     R: gl.constexpr = schedule.rows(mb.plan)
     RP: gl.constexpr = triton.next_power_of_2(R)
     S: gl.constexpr = min(RP, EX2_GATHER)
     A: gl.constexpr = max(2, min(S, EX2_AHEAD))
     lane = task // (NB2 // EX2_BLOCKS)
     count = union[3]
+    TABLE: gl.constexpr = R > 8
     tiles = (loads,)
     for k in gl.static_range(1, A):
         tiles += (
             _ex2_loads(
                 task,
                 True,
-                _slot_expert(union, lane + k * LANES),
+                (
+                    _lane_slot_expert(table[0], k)
+                    if TABLE
+                    else _slot_expert(union, lane + k * LANES)
+                ),
                 w2,
                 w2s,
                 stride_we,
@@ -1525,7 +1724,11 @@ def ex2_finish(
                 _ex2_loads(
                     task,
                     True,
-                    _slot_expert(union, i + A * LANES),
+                    (
+                        _lane_slot_expert(table[0], k + A)
+                        if TABLE
+                        else _slot_expert(union, i + A * LANES)
+                    ),
                     w2,
                     w2s,
                     stride_we,
@@ -1547,7 +1750,10 @@ def ex2_finish(
                 picks = _row_picks(union, _slot_expert(union, i), R)
                 _ex2_compute(mb, task, tiles[k], (a, picks, rows), RANK)
     if S < RP:
-        following = _slot_expert(union, lane + S * LANES)
+        if TABLE:
+            following = _lane_slot_expert(table[0], S)
+        else:
+            following = _slot_expert(union, lane + S * LANES)
         more = _ex2_loads(
             task,
             True,
@@ -1562,7 +1768,10 @@ def ex2_finish(
         for i in range(lane + S * LANES, count, LANES):
             loads = more
             gathered = _ex2_gather(mb, union, following)
-            following = _slot_expert(union, i + LANES)
+            if TABLE:
+                following = _lane_slot_expert(table[0], i // LANES + 1)
+            else:
+                following = _slot_expert(union, i + LANES)
             more = _ex2_loads(
                 task,
                 True,

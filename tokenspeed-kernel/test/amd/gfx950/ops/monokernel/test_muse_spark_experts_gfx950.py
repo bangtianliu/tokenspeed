@@ -110,6 +110,7 @@ def experts_kernel(
         mb, task2, active2, e2, w2, w2s, s2_we, s2_se, s2_lin, s2_nb, "ex2"
     )
     union = moe_experts.union_of(ids)
+    table = moe_experts.cta_slots(PLAN, union)
     a1 = moe_experts.ex1_xq(mb, task1, active1, "ex1")
     if active1:
         moe_experts.ex1_finish(
@@ -119,6 +120,7 @@ def experts_kernel(
             loads1,
             e1,
             union,
+            table,
             w13,
             w13s,
             s13_we,
@@ -129,7 +131,7 @@ def experts_kernel(
         )
     task, active = schedule.stage_task(PLAN, "exr")
     if active:
-        moe_experts.exr_stage(mb, task, union, False, "exr")
+        moe_experts.exr_stage(mb, task, union, table, False, "exr")
     if active2:
         moe_experts.ex2_finish(
             mb,
@@ -137,6 +139,7 @@ def experts_kernel(
             loads2,
             e2,
             union,
+            table,
             w2,
             w2s,
             s2_we,

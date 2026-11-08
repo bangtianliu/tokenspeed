@@ -83,15 +83,20 @@ def experts_kernel(
     )
     loads1 = moe_experts_bf16.ex1_issue(task1, active1, e1, w13, s13_we)
     union = moe_experts.union_of(ids)
+    table = moe_experts.cta_slots(PLAN, union)
     a1 = moe_experts_bf16.ex1_operand(task1, got1, gain_lo, gain_hi)
     if active1:
-        moe_experts_bf16.ex1_finish(mb, task1, a1, loads1, union, w13, s13_we, "ex1")
+        moe_experts_bf16.ex1_finish(
+            mb, task1, a1, loads1, union, table, w13, s13_we, "ex1"
+        )
     task, active = schedule.stage_task(PLAN, "exr")
     if active:
-        moe_experts.exr_stage(mb, task, union, True, "exr")
+        moe_experts.exr_stage(mb, task, union, table, True, "exr")
     loads2 = moe_experts_bf16.ex2_issue(mb, task2, active2, e2, w2, s2_we, "ex2")
     if active2:
-        moe_experts_bf16.ex2_finish(mb, task2, loads2, union, w2, s2_we, RANK, "ex2")
+        moe_experts_bf16.ex2_finish(
+            mb, task2, loads2, union, table, w2, s2_we, RANK, "ex2"
+        )
 
 
 def _experts(rank: int):

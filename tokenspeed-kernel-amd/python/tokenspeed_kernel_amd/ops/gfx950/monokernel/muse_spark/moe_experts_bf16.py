@@ -46,6 +46,7 @@ from __future__ import annotations
 
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import bf16, mx, schedule, trace
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import moe_experts
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.moe_experts import (
     BLOCK_N,
     H1_BF16_WORDS,
@@ -215,26 +216,74 @@ def _ex1_put(mb, task, acc, union, expert):
 
 
 @gluon.jit
-def ex1_finish(mb, task, x3, tiles, union, w13, stride_we, STAGE: gl.constexpr):
+def _ex1_put_picked(mb, task, acc, picks):
+    """:func:`_ex1_put` with the rows' picks given (``picks``, past 8 rows
+    from :func:`moe_experts.table_row_picks`)."""
+    R: gl.constexpr = schedule.rows(mb.plan)
+    blk = (task // KSPLIT) % NB1
+    ks = task % KSPLIT
+    out = mx.gemv_result(acc, M_DUP)  # [16, 128]
+    ol: gl.constexpr = out.type.layout
+    m = gl.arange(0, M_DUP, gl.SliceLayout(1, ol))
+    k = gl.full([M_DUP], -1, gl.int32, m.type.layout)
+    for r in gl.static_range(R):
+        k = gl.where(m == r, picks[r], k)
+    n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, ol))[None, :]
+    col = gl.where(n < BLOCK_N // 2, 2 * n, 2 * (n - BLOCK_N // 2) + 1)
+    at = ((k[:, None] * NB1 + blk) * KSPLIT + ks) * BLOCK_N + col
+    mb.put(
+        "p1",
+        mb.row_offset(m[:, None]) + at,
+        out.to(gl.int32, bitcast=True),
+        mask=(k[:, None] >= 0) & (n >= 0),
+    )
+
+
+@gluon.jit
+def ex1_finish(mb, task, x3, tiles, union, table, w13, stride_we, STAGE: gl.constexpr):
     """Ex1 task ``task`` after :func:`ex1_operand` (``x3``), :func:`ex1_issue`
     (``tiles``, the first chunk of the lane's first slot) and
     :func:`moe_experts.slots` (``union``): every slot of the lane, each in
-    K chunks with the next chunk's loads issued before a chunk's products."""
+    K chunks with the next chunk's loads issued before a chunk's products.
+    ``table``: past 8 rows, the CTA's :func:`moe_experts.lane_slots`, which
+    gives each slot's expert and row picks with one LDS load."""
+    R: gl.constexpr = schedule.rows(mb.plan)
     lane = task // (NB1 * KSPLIT)
     count = union[3]
-    for i in range(lane, count, LANES):
-        expert = _slot_expert(union, i)
-        acc = gl.zeros([1, 16, BLOCK_N], gl.float32, bf16.mfma_layout(1, NW))
-        for c in gl.static_range(EX1_CHUNKS):
-            if c + 1 < EX1_CHUNKS:
-                ahead = _ex1_tiles(task, True, expert, w13, stride_we, c + 1)
-            else:
-                ahead = _ex1_tiles(
-                    task, True, _slot_expert(union, i + LANES), w13, stride_we, 0
-                )
-            acc = _mma(x3, c * EX1_CHUNK, tiles, acc)
-            tiles = ahead
-        _ex1_put(mb, task, acc, union, expert)
+    if R > 8:
+        for i in range(lane, count, LANES):
+            expert = moe_experts.lane_slot_expert(table[0], i // LANES)
+            acc = gl.zeros([1, 16, BLOCK_N], gl.float32, bf16.mfma_layout(1, NW))
+            for c in gl.static_range(EX1_CHUNKS):
+                if c + 1 < EX1_CHUNKS:
+                    ahead = _ex1_tiles(task, True, expert, w13, stride_we, c + 1)
+                else:
+                    ahead = _ex1_tiles(
+                        task,
+                        True,
+                        moe_experts.lane_slot_expert(table[0], i // LANES + 1),
+                        w13,
+                        stride_we,
+                        0,
+                    )
+                acc = _mma(x3, c * EX1_CHUNK, tiles, acc)
+                tiles = ahead
+            picks = moe_experts.table_row_picks(table[1].index(i // LANES), R)
+            _ex1_put_picked(mb, task, acc, picks)
+    else:
+        for i in range(lane, count, LANES):
+            expert = _slot_expert(union, i)
+            acc = gl.zeros([1, 16, BLOCK_N], gl.float32, bf16.mfma_layout(1, NW))
+            for c in gl.static_range(EX1_CHUNKS):
+                if c + 1 < EX1_CHUNKS:
+                    ahead = _ex1_tiles(task, True, expert, w13, stride_we, c + 1)
+                else:
+                    ahead = _ex1_tiles(
+                        task, True, _slot_expert(union, i + LANES), w13, stride_we, 0
+                    )
+                acc = _mma(x3, c * EX1_CHUNK, tiles, acc)
+                tiles = ahead
+            _ex1_put(mb, task, acc, union, expert)
     mb.stamp(STAGE, trace.COMPUTED)
     mb.stamp(STAGE, trace.END)
 
@@ -268,6 +317,48 @@ def _ex2_gather(mb, union, expert, x_words):
     G: gl.constexpr = min(RP, 8)
     nw: gl.constexpr = gl.num_warps()
     picks = _row_picks(union, expert, R)
+    order, count = _routed_order(picks, R)
+    wl: gl.constexpr = gl.BlockedLayout([1, 4], [1, 64], [1, nw], [1, 0])
+    v = gl.arange(0, H1_BF16_WORDS, gl.SliceLayout(0, wl))[None, :]
+    from_rows: gl.constexpr = gl.SliceLayout(1, wl)
+    for g in gl.static_range(RP // G):
+        m = g * G + gl.arange(0, G, from_rows)
+        row = gl.full([G], -1, gl.int32, from_rows)
+        pick = gl.full([G], -1, gl.int32, from_rows)
+        row0 = gl.to_tensor(-1)
+        pick0 = gl.to_tensor(-1)
+        for r in gl.static_range(R):
+            hit = (picks[r] >= 0) & (m == order[r])
+            row = gl.where(hit, r, row)
+            pick = gl.where(hit, picks[r], pick)
+            first = (picks[r] >= 0) & (order[r] == 0)
+            row0 = gl.where(first, r, row0)
+            pick0 = gl.where(first, picks[r], pick0)
+        routed = m < count
+        row = gl.where(routed, row, row0)
+        pick = gl.where(routed, pick, pick0)
+        (got,) = mb.poll_many(
+            ("h1",), (mb.row_offset(row[:, None]) + pick[:, None] * H1_BF16_WORDS + v,)
+        )
+        x_words.slice(g * G, G, dim=0).store(gl.where(routed[:, None], got, 0))
+    for k in gl.static_range(4):  # M_DUP = 16 rows
+        if (RP << k) < M_DUP:
+            x_words.slice(RP << k, RP << k, dim=0).store(
+                gl.zeros([RP << k, H1_BF16_WORDS], gl.int32, wl)
+            )
+    return picks, order
+
+
+@gluon.jit
+def _ex2_gather_picked(mb, picks, x_words):
+    """:func:`_ex2_gather` with the rows' picks given (``picks``). Poll the BF16 intermediates of the rows that picked ``expert`` into
+    ``x_words`` (int32 ``[16, 256]``), MFMA row ``m`` the ``m``-th routed
+    row; the other rows hold zeros. The caller orders the LDS. Returns
+    ``(picks, order)``."""
+    R: gl.constexpr = schedule.rows(mb.plan)
+    RP: gl.constexpr = triton.next_power_of_2(R)
+    G: gl.constexpr = min(RP, 8)
+    nw: gl.constexpr = gl.num_warps()
     order, count = _routed_order(picks, R)
     wl: gl.constexpr = gl.BlockedLayout([1, 4], [1, 64], [1, nw], [1, 0])
     v = gl.arange(0, H1_BF16_WORDS, gl.SliceLayout(0, wl))[None, :]
@@ -337,32 +428,69 @@ def _ex2_put(mb, task, acc, picks, order, RANK: gl.constexpr):
 
 @gluon.jit
 def ex2_finish(
-    mb, task, tiles, union, w2, stride_we, RANK: gl.constexpr, STAGE: gl.constexpr
+    mb,
+    task,
+    tiles,
+    union,
+    table,
+    w2,
+    stride_we,
+    RANK: gl.constexpr,
+    STAGE: gl.constexpr,
 ):
     """Ex2 task ``task`` after :func:`ex2_issue` (``tiles``, the first half of
     the lane's first slot) and :func:`moe_experts.slots` (``union``): each
     slot's polls, then its two halves with the next half's loads issued
-    before a half's products."""
+    before a half's products. ``table``: past 8 rows, the CTA's
+    :func:`moe_experts.lane_slots`."""
+    R: gl.constexpr = schedule.rows(mb.plan)
     lane = task // NB2
     count = union[3]
     plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     flat: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [2, 1, 0])
     x_words = gl.allocate_shared_memory(gl.int32, [M_DUP, H1_BF16_WORDS], plain)
     x3 = x_words.reinterpret(gl.bfloat16, [M_DUP, INTER // 32, 32], flat)
-    for i in range(lane, count, LANES):
-        expert = _slot_expert(union, i)
-        # The previous slot's products read the buffer (and, before the
-        # first slot, the LDS may hold ex1's operand).
-        gl.barrier()
-        picks, order = _ex2_gather(mb, union, expert, x_words)
-        gl.barrier()
-        if i == lane:
-            mb.stamp(STAGE, trace.READY)
-        second = _ex2_tiles(task, True, expert, w2, stride_we, 1)
-        acc = gl.zeros([1, 16, BLOCK_N], gl.float32, bf16.mfma_layout(1, NW))
-        acc = _mma(x3, 0, tiles, acc)
-        tiles = _ex2_tiles(task, True, _slot_expert(union, i + LANES), w2, stride_we, 0)
-        acc = _mma(x3, EX2_HALF, second, acc)
-        _ex2_put(mb, task, acc, picks, order, RANK)
+    if R > 8:
+        for i in range(lane, count, LANES):
+            k = i // LANES
+            expert = moe_experts.lane_slot_expert(table[0], k)
+            gl.barrier()
+            picks, order = _ex2_gather_picked(
+                mb, moe_experts.table_row_picks(table[1].index(k), R), x_words
+            )
+            gl.barrier()
+            if i == lane:
+                mb.stamp(STAGE, trace.READY)
+            second = _ex2_tiles(task, True, expert, w2, stride_we, 1)
+            acc = gl.zeros([1, 16, BLOCK_N], gl.float32, bf16.mfma_layout(1, NW))
+            acc = _mma(x3, 0, tiles, acc)
+            tiles = _ex2_tiles(
+                task,
+                True,
+                moe_experts.lane_slot_expert(table[0], k + 1),
+                w2,
+                stride_we,
+                0,
+            )
+            acc = _mma(x3, EX2_HALF, second, acc)
+            _ex2_put(mb, task, acc, picks, order, RANK)
+    else:
+        for i in range(lane, count, LANES):
+            expert = _slot_expert(union, i)
+            # The previous slot's products read the buffer (and, before the
+            # first slot, the LDS may hold ex1's operand).
+            gl.barrier()
+            picks, order = _ex2_gather(mb, union, expert, x_words)
+            gl.barrier()
+            if i == lane:
+                mb.stamp(STAGE, trace.READY)
+            second = _ex2_tiles(task, True, expert, w2, stride_we, 1)
+            acc = gl.zeros([1, 16, BLOCK_N], gl.float32, bf16.mfma_layout(1, NW))
+            acc = _mma(x3, 0, tiles, acc)
+            tiles = _ex2_tiles(
+                task, True, _slot_expert(union, i + LANES), w2, stride_we, 0
+            )
+            acc = _mma(x3, EX2_HALF, second, acc)
+            _ex2_put(mb, task, acc, picks, order, RANK)
     mb.stamp(STAGE, trace.COMPUTED)
     mb.stamp(STAGE, trace.END)

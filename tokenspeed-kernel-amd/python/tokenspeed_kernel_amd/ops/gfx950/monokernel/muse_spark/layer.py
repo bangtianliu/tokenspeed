@@ -478,18 +478,20 @@ def gluon_muse_spark_layer_gfx950(
         )
         loads1 = moe_experts_bf16.ex1_issue(task1, active1, e1, w13, s13_we)
         union = moe_experts.union_of(ids)
+        # Every CTA, outside the task branches: it ends in a barrier.
+        slot_lds = moe_experts.cta_slots(PLAN, union)
         a1 = moe_experts_bf16.ex1_operand(task1, got1, gain_lo, gain_hi)
         if active1:
             moe_experts_bf16.ex1_finish(
-                mb, task1, a1, loads1, union, w13, s13_we, "ex1"
+                mb, task1, a1, loads1, union, slot_lds, w13, s13_we, "ex1"
             )
         task, active = schedule.stage_task(PLAN, "exr")
         if active:
-            moe_experts.exr_stage(mb, task, union, True, "exr")
+            moe_experts.exr_stage(mb, task, union, slot_lds, True, "exr")
         loads2 = moe_experts_bf16.ex2_issue(mb, task2, active2, e2, w2, s2_we, "ex2")
         if active2:
             moe_experts_bf16.ex2_finish(
-                mb, task2, loads2, union, w2, s2_we, RANK, "ex2"
+                mb, task2, loads2, union, slot_lds, w2, s2_we, RANK, "ex2"
             )
     else:
         ids, e1, e2 = moe_experts.ex1_poll_routes(mb, task1, task2, active1, "ex1")
@@ -497,6 +499,8 @@ def gluon_muse_spark_layer_gfx950(
             task1, active1, e1, w13, w13s, s13_we, s13_se, s13_lin, s13_nb
         )
         union = moe_experts.union_of(ids)
+        # Every CTA, outside the task branches: it ends in a barrier.
+        slot_lds = moe_experts.cta_slots(PLAN, union)
         a1 = moe_experts.ex1_xq(mb, task1, active1, "ex1")
         if active1:
             moe_experts.ex1_finish(
@@ -506,6 +510,7 @@ def gluon_muse_spark_layer_gfx950(
                 loads1,
                 e1,
                 union,
+                slot_lds,
                 w13,
                 w13s,
                 s13_we,
@@ -516,7 +521,7 @@ def gluon_muse_spark_layer_gfx950(
             )
         task, active = schedule.stage_task(PLAN, "exr")
         if active:
-            moe_experts.exr_stage(mb, task, union, False, "exr")
+            moe_experts.exr_stage(mb, task, union, slot_lds, False, "exr")
         loads2 = moe_experts.ex2_issue(
             mb, task2, active2, e2, w2, w2s, s2_we, s2_se, s2_lin, s2_nb, "ex2"
         )
@@ -527,6 +532,7 @@ def gluon_muse_spark_layer_gfx950(
                 loads2,
                 e2,
                 union,
+                slot_lds,
                 w2,
                 w2s,
                 s2_we,

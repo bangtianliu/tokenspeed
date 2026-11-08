@@ -106,6 +106,12 @@ def _stage_tasks(plan, name):
 
 
 @gluon.constexpr_function
+def stage_base(plan, name):
+    """The CTA that runs task 0 of stage ``name``."""
+    return _stage_base(plan, name)
+
+
+@gluon.constexpr_function
 def stage_tasks(plan, name):
     """The number of tasks of stage ``name``."""
     return _stage_tasks(plan, name)
