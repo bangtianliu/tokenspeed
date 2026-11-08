@@ -163,6 +163,26 @@ def _choose_splitk_config(M: int, N: int, K: int) -> tuple[int, ...] | None:
     return None if bucket is None else buckets[bucket]
 
 
+def gluon_fp32_router_gemv_warmup_rows_gfx950(N: int, K: int) -> tuple[int, ...]:
+    """Row counts whose launches compile every binary the router launch picks
+    for an ``[N, K]`` weight. The GEMV (up to ``MAX_ROWS`` rows a split-K
+    bucket does not take) compiles one tile per power-of-two row count; each
+    split-K bucket compiles one tile, at its largest row count and the one
+    below it (the row count is a runtime argument, but Triton specializes on
+    its divisibility by 16, and on a count of 1). Rows past the last bucket
+    take hipBLASLt."""
+    rows = {1}
+    m = 2
+    while m <= MAX_ROWS:
+        if _choose_splitk_config(m, N, K) is None:
+            rows.add(m)
+        m *= 2
+    for bound in _PREFERRED_SPLITK_CONFIGS.get((N, K), {}):
+        if _PREFERRED_SPLITK_CONFIGS[(N, K)][bound] is not None:
+            rows.update(r for r in (bound, bound - 1) if r >= 1)
+    return tuple(sorted(rows))
+
+
 def gluon_fp32_router_gemv_num_counters_gfx950(M: int, N: int, K: int) -> int:
     """Split-K arrival counters a router launch needs; 0 when it does not split K."""
     config = _choose_splitk_config(M, N, K)
