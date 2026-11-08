@@ -432,6 +432,30 @@ def iris_lamport_residual_rmsnorm_supported(
     )
 
 
+def iris_lamport_residual_rmsnorm_heap_bytes(
+    world_size: int, max_rows: int, hidden_size: int
+) -> int:
+    """The Iris heap bytes ``prepare_iris_lamport_residual_rmsnorm`` allocates.
+
+    Its mailboxes come from the heap's headroom. A caller whose own heap
+    reservations set that headroom (``_iris.reserve_heap``) reserves these
+    bytes too, so the preparation keeps room after the reserved buffers.
+
+    Args:
+        world_size: Number of ranks in the group.
+        max_rows: Most rows one call reduces.
+        hidden_size: Row width in elements.
+
+    Returns:
+        The bytes of both mailboxes at the heap allocator's alignment.
+    """
+    from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
+        LamportResidualRMSNorm,
+    )
+
+    return LamportResidualRMSNorm.heap_bytes(world_size, max_rows, hidden_size)
+
+
 def prepare_iris_lamport_residual_rmsnorm(
     all_reduce: IrisAllReduce, max_rows: int, hidden_size: int
 ) -> "LamportResidualRMSNorm":

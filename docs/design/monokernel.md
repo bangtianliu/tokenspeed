@@ -88,7 +88,11 @@ rank runs the same stages, and a stage can put into another rank's copy of
 a peer region. The deadlock rule then holds across ranks: the earliest
 unfinished stage on any rank reads only regions that earlier stages on every
 rank wrote, and all CTAs of all ranks are resident. The scratch lives on a
-symmetric heap, so a region has the same offset on every rank. A rank can
+symmetric heap, so a region has the same offset on every rank. The scratch is
+reserved before the heap exists (`_iris.reserve_heap`), and the reservations
+set the heap's headroom, so a model that runs monokernels also reserves every
+other buffer it later takes from that headroom (the DFlash2 draft's fused
+reduce + norm); otherwise those buffers have only the small margin. A rank can
 start its next launch while another still reads this one, but not two
 launches ahead, because finishing the next launch needs every rank's part of
 it. So a peer region holds two copies, which the launches pick by a parity

@@ -263,6 +263,41 @@ def request_seq_lens(leaf, bs: int) -> torch.Tensor:
     return lengths[:, 0].contiguous()
 
 
+def draft_heap_bytes(
+    scratch_pairs: tuple[int, ...], *, tp_size: int, hidden_size: int
+) -> int:
+    """The Iris heap bytes the draft allocates once the heap exists, which
+    :class:`DFlash2MonokernelState` reserves before it does.
+
+    The monokernels' mailbox scratch (``scratch_pairs``: the layers', the
+    context write's and the head's int64 pairs) and the regular layers' fused
+    reduce + norm (``DFlash2DraftModel.prepare_communication_runtime``). The
+    fused reduce + norm reserves nothing itself: it takes the heap's default
+    headroom, which these reservations replace (``heap_headroom_bytes`` is the
+    larger of the default and the reservations plus a small margin), so it is
+    reserved here, whenever the group and width could take it.
+
+    Args:
+        scratch_pairs: Each monokernel's mailbox pairs (0: none).
+        tp_size: The draft's attention TP group size.
+        hidden_size: The draft's hidden size.
+    """
+    from tokenspeed_kernel.ops.communication._iris import allocation_bytes
+    from tokenspeed_kernel.ops.communication.iris import (
+        iris_lamport_residual_rmsnorm_heap_bytes,
+        iris_lamport_residual_rmsnorm_supported,
+    )
+
+    from tokenspeed.runtime.models.dflash2 import FUSED_REDUCE_NORM_MAX_ROWS
+
+    total = sum(allocation_bytes((n,), torch.int64) for n in scratch_pairs if n)
+    if iris_lamport_residual_rmsnorm_supported(tp_size, hidden_size, torch.bfloat16):
+        total += iris_lamport_residual_rmsnorm_heap_bytes(
+            tp_size, FUSED_REDUCE_NORM_MAX_ROWS, hidden_size
+        )
+    return total
+
+
 def mailbox_scratch(
     group: dist.ProcessGroup, rank: int, scratch_pairs: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -354,18 +389,15 @@ class DFlash2MonokernelState(MonokernelState):
         # What prepare() and enable_head() allocate on the Iris heap, reserved
         # before the heap exists: the layers' scratch, the context write's and
         # the head's (enable_head runs after the heap exists).
-        from tokenspeed_kernel.ops.communication._iris import (
-            allocation_bytes,
-            reserve_heap,
-        )
+        from tokenspeed_kernel.ops.communication._iris import reserve_heap
 
         self.head_pairs = muse_spark_draft_head_scratch_pairs(max_rows=HEAD_ROWS) or 0
         reserve_heap(
             "dflash2_monokernel",
-            sum(
-                allocation_bytes((n,), torch.int64)
-                for n in (scratch_pairs, context.scratch_pairs, self.head_pairs)
-                if n
+            draft_heap_bytes(
+                (scratch_pairs, context.scratch_pairs, self.head_pairs),
+                tp_size=model.mapping.attn.tp_size,
+                hidden_size=int(model.config.hidden_size),
             ),
         )
 

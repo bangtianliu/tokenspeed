@@ -229,6 +229,67 @@ def test_decode_monokernel_packs_a_bf16_tp8_draft(monkeypatch) -> None:
     assert state.context is not None
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform().is_cdna4,
+    reason="the draft monokernels are gfx950 kernels",
+)
+@pytest.mark.parametrize("requests", [1, 2])
+def test_the_draft_reserves_every_iris_heap_buffer_it_allocates(
+    monkeypatch, requests
+) -> None:
+    """What the draft allocates on the Iris heap once it exists (the
+    monokernels' mailbox scratch and the regular layers' fused reduce + norm)
+    is exactly what it reserved before, since the heap's headroom is sized from
+    the reservations: at one and two requests a launch."""
+    from tokenspeed_kernel.ops.communication import _iris
+    from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
+        LamportResidualRMSNorm,
+    )
+
+    from tokenspeed.runtime.models import dflash2_monokernel as seam
+    from tokenspeed.runtime.models.dflash2 import FUSED_REDUCE_NORM_MAX_ROWS
+
+    monkeypatch.setitem(global_server_args_dict, "decode_monokernel", True)
+    monkeypatch.setattr(seam, "MAX_REQUESTS", requests)
+    monkeypatch.setattr(seam, "LAYER_ROWS", requests * seam.BLOCK_ROWS)
+    monkeypatch.setattr(seam, "HEAD_ROWS", requests * seam.STEPS)
+    monkeypatch.setattr(seam, "CONTEXT_WRITE_ROWS", requests * seam.CONTEXT_ROWS)
+    monkeypatch.setattr(_iris, "_reserved", {})
+    draft = _packed_draft()
+    reserved = _iris._reserved["dflash2_monokernel"]
+
+    # A heap that records each allocation at the Torch allocator's alignment.
+    allocated: list[int] = []
+
+    class Heap:
+        def zeros(self, shape, dtype):
+            allocated.append(_iris.allocation_bytes(tuple(shape), dtype))
+            return torch.zeros(shape, dtype=dtype)
+
+        empty = zeros
+
+    class Group:
+        def __init__(self, ctx, group=None, rank=0, device=None):
+            self.ctx = ctx
+            self.world_size = 8
+            self.bases = torch.zeros(8, dtype=torch.int64)
+
+        def finish_prepare(self) -> None:
+            pass
+
+    monkeypatch.setattr(_iris, "get_or_create_context", lambda heap_size: Heap())
+    monkeypatch.setattr(_iris, "IrisGroup", Group)
+    state = draft.monokernel_state
+    for pairs in (state.scratch_pairs, state.context.scratch_pairs, state.head_pairs):
+        if pairs:
+            seam.mailbox_scratch(None, 0, pairs)
+    LamportResidualRMSNorm(
+        Group(Heap()), FUSED_REDUCE_NORM_MAX_ROWS, int(draft.config.hidden_size)
+    )
+    assert len(allocated) == 5
+    assert sum(allocated) == reserved
+
+
 def _packed_draft() -> DFlash2DraftModel:
     """Muse Spark Open's BF16 TP8 draft (rank 0) on the GPU, loaded with
     --decode-monokernel (set by the caller): its layers and context write
