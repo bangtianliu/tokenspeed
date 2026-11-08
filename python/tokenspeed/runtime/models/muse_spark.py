@@ -71,6 +71,7 @@ from tokenspeed_kernel.ops.residual import (
     post_norm_residual_pre_norm_bf16,
     residual_gate_coefficients,
 )
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.selection import resolve_kernel_override
 from torch import nn
@@ -270,6 +271,8 @@ class _MuseGatheredLinear(ColumnParallelLinear):
                 publish_gemm=partial(_block_gemm, self),
             )
         self.iris_state: MuseIrisState | None = None
+        # Whether startup warmup ran this projection's plain column all-gather.
+        self.warmed_all_gather = False
 
     def _project(
         self,
@@ -309,6 +312,23 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         width = self.output_size // len(self.group)
         return self.weight[self.rank * width : (self.rank + 1) * width]
 
+    def _gather_columns(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        """Project ``x`` to this rank's columns and all-gather full rows."""
+        return all_gather(
+            (
+                self._project(x, weight, None)
+                if current_platform().is_cdna4
+                else super().forward(x)[0]
+            ),
+            self.group,
+            dim=-1,
+            backend=(
+                get_global_backend()
+                if current_platform().is_cdna4
+                else get_global_backend().nccl
+            ),
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the projection and return complete full-width rows."""
         weight = self._local_weight()
@@ -319,23 +339,20 @@ class _MuseGatheredLinear(ColumnParallelLinear):
                 else super().forward(x)[0]
             )
         tokens = x.shape[0]
+        if is_warming_up() and not self.warmed_all_gather:
+            # The plain column all-gather below serves rows past the workspace
+            # that neither multicast nor a fused route takes, outside the
+            # owned-row layout: a mixed batch's long extend, which no startup
+            # extend is. One gather here, on every rank alike (the same layers,
+            # in the same order), lets the gather op warm its own variants.
+            self.warmed_all_gather = True
+            self._gather_columns(
+                x.new_zeros((_GATHER_WORKSPACE_ROWS + 1, x.shape[1])), weight
+            )
         if self.multicast is not None and self.multicast.handles(tokens):
             return self.multicast(x, weight, output_scale=None)
         if tokens > _GATHER_WORKSPACE_ROWS:
-            return all_gather(
-                (
-                    self._project(x, weight, None)
-                    if current_platform().is_cdna4
-                    else super().forward(x)[0]
-                ),
-                self.group,
-                dim=-1,
-                backend=(
-                    get_global_backend()
-                    if current_platform().is_cdna4
-                    else get_global_backend().nccl
-                ),
-            )
+            return self._gather_columns(x, weight)
         local_width = weight.shape[0]
         probe = self.workspace.reshape(-1)[: tokens * local_width].view(
             tokens, local_width
