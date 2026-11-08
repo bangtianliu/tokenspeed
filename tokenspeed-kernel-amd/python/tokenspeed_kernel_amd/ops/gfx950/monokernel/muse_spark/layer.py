@@ -140,13 +140,25 @@ NEXT_BASES = {**CHAINED_BASES, "qnext": 192, "out": 96, "exr": 128}
 # take CTAs 192 .. 255 and 0 .. 63, whose last earlier task is oproj or an
 # attention task.
 WIDE = {"router": 192, "topk": 192}
+# exr's base and parts in a launch of more than 8 rows that ends with qnext.
+WIDE_NEXT_EXR = (128, 2)
 
 
 def _bases(rows: int, next_qkvg: bool, *names: str) -> dict[str, int]:
     table = NEXT_BASES if next_qkvg else BASES if rows == 1 else CHAINED_BASES
     if rows > 8:
         table = {**table, **WIDE}
+        if next_qkvg:
+            table = {**table, "exr": WIDE_NEXT_EXR[0]}
     return {name: table[name] for name in names}
+
+
+def _exr_parts(rows: int, next_qkvg: bool) -> int:
+    if rows == 1:
+        return 1
+    if next_qkvg:
+        return WIDE_NEXT_EXR[1] if rows > 8 else 2
+    return int(moe_experts.EXR_PARTS)
 
 
 # The most rows of one launch: two requests' verifies of 7 draft tokens
@@ -226,7 +238,7 @@ def layer_plan(
         + moe_experts.stages(
             _bases(rows, nq, "slt", "xq", "ex1", "exr", "ex2"),
             rows,
-            1 if rows == 1 else 2 if next_qkvg else int(moe_experts.EXR_PARTS),
+            _exr_parts(rows, next_qkvg),
             bf16_experts,
         )
         + ((Stage("warm", WARM_TASKS, 0),) if warm_next else ())
