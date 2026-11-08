@@ -313,6 +313,18 @@ if platform.is_amd:
         mm_out: torch.Tensor,
     ) -> torch.Tensor:
         """Run the router's split-K GEMM and a decode GEMM in one gfx950 launch."""
+        if is_warming_up():
+            _warm_router_gemv_mm_buckets(x, weight, multiplier, mm_b)
+        return _router_gemv_mm(x, weight, multiplier, mm_a, mm_b, mm_out)
+
+    def _router_gemv_mm(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        multiplier: float,
+        mm_a: torch.Tensor,
+        mm_b: torch.Tensor,
+        mm_out: torch.Tensor,
+    ) -> torch.Tensor:
         router_counters = _router_gemv_mm_counters(x.shape[0], weight.shape[0])
         counters = zeroed_state(
             router_counters
@@ -330,6 +342,36 @@ if platform.is_amd:
             mm_out,
             counters[router_counters:],
         )
+
+    _warmed_router_gemv_mm: set[tuple] = set()
+
+    def _warm_router_gemv_mm_buckets(
+        x: torch.Tensor, weight: torch.Tensor, multiplier: float, mm_b: torch.Tensor
+    ) -> None:
+        """Compile every row bucket of this router and GEMM pair during warmup.
+
+        The launch compiles in the decode GEMM's tile for the row bucket, and
+        the row count itself is a runtime argument: one launch at each bucket
+        bound covers every row count of the bucket. A short extend reaches a
+        bucket that the startup traversal's rows do not.
+        """
+        n, k = weight.shape
+        mm_n, mm_k = mm_b.shape
+        key = (n, k, mm_n, mm_k, multiplier, x.device)
+        if key in _warmed_router_gemv_mm:
+            return
+        _warmed_router_gemv_mm.add(key)
+        for m in _MM_A16W16_DECODE_M_BUCKETS:
+            if not _supports_router_gemv_mm(m, n, k, mm_n, mm_k):
+                continue
+            _router_gemv_mm(
+                x.new_zeros((m, k)),
+                weight,
+                multiplier,
+                mm_b.new_zeros((m, mm_k)),
+                mm_b,
+                mm_b.new_empty((m, mm_n)),
+            )
 
     try:
         from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.linear_attnres_partials_gfx950 import (

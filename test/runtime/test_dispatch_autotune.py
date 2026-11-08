@@ -35,6 +35,7 @@ import os
 import sys
 from contextlib import nullcontext
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Literal, get_args
 
 import pytest
@@ -64,6 +65,7 @@ from tokenspeed.runtime.execution import model_executor as executor_module  # no
 from tokenspeed.runtime.execution.model_executor import (  # noqa: E402
     ModelExecutor,
     ModelExecutorConfig,
+    warmup_extend_sizes,
 )
 from tokenspeed.runtime.execution.prefill_graph import (  # noqa: E402
     get_prefill_token_buckets,
@@ -281,6 +283,13 @@ class _ForwardStepDouble:
         self.max_tokens_per_req = max_tokens_per_req
 
 
+class _NoEagerSamplingVariants:
+    """A sampling backend without eager variants to compile."""
+
+    def warmup_eager(self, draft_q) -> None:
+        pass
+
+
 class _AutotuneExecutor:
     """The ModelExecutor state autotune() reads, without the GPU boot."""
 
@@ -308,11 +317,16 @@ class _AutotuneExecutor:
         # The stub gathers whole sampled rows, so autotune() runs no
         # vocab-shard warmup.
         self._samples_from_vocab_shard = False
+        # autotune() also compiles the eager sampling variants
+        # (SamplingBackend.warmup_eager); this executor's backend has none.
+        self.sampling_backend = _NoEagerSamplingVariants()
+        self.runtime_states = SimpleNamespace(future_draft_q=None)
 
     # autotune() sizes and runs its traversal through these; the real methods
     # read only the state above.
     _warmup_num_tokens = ModelExecutor._warmup_num_tokens
     _warmup_traversal = ModelExecutor._warmup_traversal
+    _warmup_extend = ModelExecutor._warmup_extend
 
     def _model_input_kwargs(self, num_tokens, bs, rows):
         return self._model_input_kwargs_hook(num_tokens, bs, rows)
@@ -445,28 +459,28 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
         "set_autotune_process_group",
         lambda group: events.append(("group", group)),
     )
+    budget = 32 if chunk_size < 0 else chunk_size
     if failure:
         with pytest.raises(RuntimeError, match="profiling failed"):
             ModelExecutor.autotune(executor, keep_loaded_tactics=False)
+        # The first extend fails; the tuning window still closes.
         assert events == [
             "load",
             ("group", None),
             "scrub",
-            ("target", (32 if chunk_size < 0 else chunk_size)),
+            ("target", budget),
             ("group", None),
         ]
     else:
         ModelExecutor.autotune(executor, keep_loaded_tactics=False)
+        # One extend per row bucket a last chunk can take.
+        extends = [("target", tokens) for tokens in warmup_extend_sizes(budget)]
         assert events == [
             "load",
             ("group", None),
             "scrub",
-            ("target", (32 if chunk_size < 0 else chunk_size)),
-            *(
-                [("draft_experts", (32 if chunk_size < 0 else chunk_size))]
-                if speculative
-                else []
-            ),
+            *extends,
+            *([("draft_experts", budget)] if speculative else []),
             *(["draft"] if speculative and not prefill_only else []),
             ("group", None),
             *(["save"] if not disabled else []),
@@ -493,7 +507,7 @@ def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
     pg_manager = _ProcessGroupManagerDouble(group)
 
     def forward(**kwargs):
-        seen.update(kwargs)
+        seen[kwargs["span"]] = kwargs
 
     executor = _AutotuneExecutor(
         config=_AutotuneConfig(
@@ -511,8 +525,12 @@ def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
             max_num_tokens=32,
             on_fill_dummy=lambda **kwargs: None,
         ),
+        # The plan shards the budget's 16-token extend; the shorter extends of
+        # the warmup ladder run on every row.
         prefill_graph=_PrefillGraphDouble(
-            make_dummy_batch=lambda n, bs: _DummyBatch(bs=bs, query_shard=plan)
+            make_dummy_batch=lambda n, bs: _DummyBatch(
+                bs=bs, query_shard=plan if n == 16 else None
+            )
         ),
         forward_step=_ForwardStepDouble(),
         drafter=None,
@@ -539,9 +557,11 @@ def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
     )
     _tap(monkeypatch, executor_module, "autotune", lambda *args, **kwargs: None)
     ModelExecutor.autotune(executor, keep_loaded_tactics=False)
-    assert seen["input_ids"].tolist() == [2, 6, 10, 14]
-    assert seen["positions"].tolist() == [20, 60, 100, 140]
-    assert seen["rows"].tolist() == [2, 6, 10, 14] and seen["span"] == 16
+    assert sorted(seen) == sorted(warmup_extend_sizes(16))
+    assert seen[16]["input_ids"].tolist() == [2, 6, 10, 14]
+    assert seen[16]["positions"].tolist() == [20, 60, 100, 140]
+    assert seen[16]["rows"].tolist() == [2, 6, 10, 14]
+    assert seen[9]["input_ids"].tolist() == list(range(9))
     assert pg_manager.requests == [("gloo", (0, 1, 2, 3))]
     assert events == [
         ("load", None, group, 0),
