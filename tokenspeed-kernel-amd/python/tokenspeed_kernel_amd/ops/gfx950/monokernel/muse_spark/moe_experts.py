@@ -425,54 +425,75 @@ def _slots_asm(outputs, inputs):
 
 
 @gluon.constexpr_function
-def _slots2_asm(outputs, inputs):
-    """:func:`_slots_asm` of 128 picks (16 rows of 8), two a lane: lane
-    ``l`` holds picks ``2 l`` and ``2 l + 1`` (both of row ``l // 4``). Each
-    pick ``q`` (v_readlane of its lane's pick) is compared with both of every
-    lane's picks. A pick's slot is the owner picks below it: those of the
-    lanes below (both ballots), and for ``2 l + 1`` also ``2 l``."""
-    owner, slot = outputs[0], outputs[1]
-    (count,) = outputs[2]
-    table = outputs[3]
-    lane, row = outputs[4][0], outputs[5][0]
-    seen, hit, t = outputs[6], outputs[7], outputs[8]
-    (sq,) = outputs[9]
-    (ident,) = inputs
-    RP = len(table) // 2
+def _slots2_rows_asm(outputs, inputs):
+    """The table entries of one wave's two rows for 128 picks (16 rows of 8),
+    two picks a lane: lane ``l`` holds picks ``2 l`` and ``2 l + 1`` (both of
+    row ``l // 4``). Element ``(e, j)`` of a lane is pick ``2 l + e``'s entry
+    for row ``2 w + j`` (``w`` the wave): that row's pick (``q % 8``) of the
+    same expert, or -1. Each of the rows' 16 picks ``q`` (v_readlane of its
+    lane's pick) is compared with both of every lane's picks, in a loop of 4
+    passes (row picks ``2 kk`` and ``2 kk + 1`` in pass ``kk``). A row's
+    picks are distinct, so at most one pick hits an entry."""
+    tab, tmp = outputs[0], outputs[1]
+    (sb,), (sl,), (sc,) = outputs[2:5]
+    sq = [o[0] for o in outputs[5:9]]
+    ident, rows = inputs
+    picks = (ident[0], ident[2])  # elements (0, 0) and (1, 0)
+    kv = (tmp[0], tmp[1])
     a = [
+        # rows[0] holds 2 w in every lane: the wave's first row pick 2 w * 8
+        # sits in lane 8 w.
+        f"v_readfirstlane_b32 {sb}, {rows[0]}",
         "s_nop 4",
-        f"v_mbcnt_lo_u32_b32 {lane}, -1, 0",
-        f"v_mbcnt_hi_u32_b32 {lane}, -1, {lane}",
-        f"v_lshrrev_b32 {row}, 2, {lane}",
-        f"v_mov_b32 {seen[0]}, 0",
-        f"v_mov_b32 {seen[1]}, 0",
+        f"s_lshl_b32 {sb}, {sb}, 2",
     ]
-    # As in _slots_asm, pick q + 1's id is read right after pick q's last
-    # compare, 2 wait states before the next compare reads it.
-    a += [f"v_readlane_b32 {sq}, {ident[0]}, 0"]
-    a += [f"v_mov_b32 {x}, -1" for x in table]
-    for r in range(RP):
-        a += [f"v_mov_b32 {hit[0]}, 0", f"v_mov_b32 {hit[1]}, 0"]
-        for k in range(8):
-            q = r * 8 + k
-            for e in range(2):
-                a += [f"v_cmp_eq_u32_e32 vcc, {sq}, {ident[e]}"]
-                if e == 1 and q + 1 < 8 * RP:
-                    a += [f"v_readlane_b32 {sq}, {ident[(q + 1) % 2]}, {(q + 1) // 2}"]
-                a += [
-                    f"v_cndmask_b32_e64 {table[e * RP + r]}, {table[e * RP + r]}, {k}, vcc",
-                    f"v_cndmask_b32_e64 {hit[e]}, {hit[e]}, 1, vcc",
-                ]
-        # A lane of a later row saw row r's experts.
-        a += [f"v_cmp_lt_u32_e32 vcc, {r}, {row}"]
-        for e in range(2):
-            a += [
-                f"v_or_b32 {t[e]}, {seen[e]}, {hit[e]}",
-                f"v_cndmask_b32_e32 {seen[e]}, {seen[e]}, {t[e]}, vcc",
-            ]
+    a += [f"v_mov_b32 {x}, -1" for x in tab]
     a += [
-        f"v_sub_u32 {owner[0]}, 1, {seen[0]}",
-        f"v_sub_u32 {owner[1]}, 1, {seen[1]}",
+        f"v_mov_b32 {kv[0]}, 0",
+        f"v_mov_b32 {kv[1]}, 1",
+        f"s_mov_b32 {sc}, 0",
+        "slots2_${:uid}:",
+    ]
+    # The pass's 4 row picks (rows 2 w + j, picks 2 kk and 2 kk + 1: lane
+    # 8 w + 4 j + kk) are read first, each into its own SGPR: a v_readlane's
+    # SGPR may feed a VALU only 2 wait states later, and here every compare
+    # comes at least 3 VALU after the read of its pick. The lane selects are
+    # SALU-written, which needs no wait.
+    a += [f"s_add_u32 {sl}, {sb}, {sc}"]
+    for j in range(2):
+        if j:
+            a += [f"s_add_u32 {sl}, {sl}, 4"]
+        for par in range(2):
+            a += [f"v_readlane_b32 {sq[2 * j + par]}, {picks[par]}, {sl}"]
+    for j in range(2):
+        for par in range(2):
+            for e in range(2):
+                a += [
+                    f"v_cmp_eq_u32_e32 vcc, {sq[2 * j + par]}, {picks[e]}",
+                    f"v_cndmask_b32_e32 {tab[2 * e + j]}, {tab[2 * e + j]}, {kv[par]}",
+                ]
+    a += [
+        f"v_add_u32 {kv[0]}, 2, {kv[0]}",
+        f"v_add_u32 {kv[1]}, 2, {kv[1]}",
+        f"s_add_u32 {sc}, {sc}, 1",
+        f"s_cmp_lt_u32 {sc}, 4",
+        "s_cbranch_scc1 slots2_${:uid}",
+    ]
+    return "\n".join(a)
+
+
+@gluon.constexpr_function
+def _slots2_ballot_asm(outputs, inputs):
+    """Each pick's slot and the slot count from the owner flags of 128 picks,
+    two a lane (``2 l``, ``2 l + 1``): a pick's slot is the owner picks below
+    it, those of the lanes below (both ballots) and for ``2 l + 1`` also
+    ``2 l``."""
+    slot = outputs[0]
+    (count,) = outputs[1]
+    t = outputs[2]
+    (sq,) = outputs[3]
+    (owner,) = inputs
+    a = [
         # Even picks' owners: their count and the ones below each lane.
         f"v_cmp_ne_u32_e32 vcc, 0, {owner[0]}",
         "s_nop 4",
@@ -492,45 +513,61 @@ def _slots2_asm(outputs, inputs):
 
 
 @gluon.constexpr_function
-def _slots2_constraints(RP):
-    """:func:`_slots2_asm`'s constraints as one string: a tuple repeats an
-    entry for every element of its operand, and with two picks a lane the
-    input's entry would repeat its clobbers before the second pick."""
-    two = ["=&v", "=&v"]
-    outputs = two * 2 + ["=&s"] + ["=&v"] * (2 * RP) + two * 5 + ["=&s"]
-    return ",".join(outputs + ["v", "v", "~{vcc}", "~{scc}"])
+def _slots2_rows_constraints():
+    """:func:`_slots2_rows_asm`'s constraints, one entry an element: the
+    entries and a scratch of 4 a thread, 7 SGPRs, then the picks and rows."""
+    return ",".join(["=&v"] * 8 + ["=&s"] * 7 + ["v"] * 8 + ["~{vcc}", "~{scc}"])
+
+
+@gluon.constexpr_function
+def _slots2_ballot_constraints():
+    """:func:`_slots2_ballot_asm`'s constraints, one entry an element."""
+    return ",".join(
+        ["=&v"] * 2 + ["=&s"] + ["=&v"] * 2 + ["=&s"] + ["v"] * 2 + ["~{vcc}", "~{scc}"]
+    )
 
 
 @gluon.jit
 def _ballot_slots2(ids, RP: gl.constexpr):
-    """:func:`slots` by :func:`_slots2_asm`: ``ids`` two a lane (128
-    picks). Returns the same ``(ids, owner, slot, count, table)``."""
+    """:func:`slots` of ``ids`` two a lane (128 picks, 16 rows), the rows
+    split over the waves: each wave builds its two rows' table entries
+    (:func:`_slots2_rows_asm`), a pick's ``seen`` (an earlier row picked its
+    expert) is a reduction of the entries across the waves, and the whole
+    table goes to every wave in LDS. Every wave then holds the same owner,
+    slot and count (:func:`_slots2_ballot_asm`) and table. Built in every
+    wave, the 16 rows took ~900 VALU a wave (3.6 us; 8 waves, 2 a SIMD).
+    Returns the same ``(ids, owner, slot, count, table)``."""
     NP: gl.constexpr = ids.shape[0]
     nw: gl.constexpr = gl.num_warps()
-    tt: gl.constexpr = gl.distributed_type(
-        gl.int32, [NP, RP], gl.BlockedLayout([2, RP], [64, 1], [nw, 1], [1, 0])
-    )
+    gl.static_assert(RP == 2 * nw, "two rows a wave")
     # asm: the per-pick compares need a lane read (v_readlane) and lane
     # masks (ballots, v_mbcnt); Gluon has neither.
+    # [pick, row]: two picks a lane, two rows a wave.
+    la: gl.constexpr = gl.BlockedLayout([2, 2], [64, 1], [1, nw], [1, 0])
+    mine = gl.convert_layout(ids, gl.SliceLayout(1, la))[:, None]
+    r = gl.arange(0, RP, gl.SliceLayout(0, la))[None, :]
+    mine, r = gl.broadcast(mine, r)
     out = gl.inline_asm(
-        _slots2_asm,
-        _slots2_constraints(RP),
-        [ids],
-        [
-            ids.type,
-            ids.type,
-            gl.int32,
-            tt,
-            ids.type,
-            ids.type,
-            ids.type,
-            ids.type,
-            ids.type,
-            gl.int32,
-        ],
+        _slots2_rows_asm,
+        _slots2_rows_constraints(),
+        [mine, r],
+        [mine.type, mine.type] + [gl.int32] * 7,
         is_pure=True,
     )
-    return ids, out[0], out[1], out[2], out[3]
+    entries = out[0]
+    p = gl.arange(0, NP, gl.SliceLayout(1, la))[:, None]
+    seen = gl.max(gl.where((entries >= 0) & (r < p // TOP_K), 1, 0), axis=1)
+    owner = gl.convert_layout(1 - seen, ids.type.layout)
+    ballot = gl.inline_asm(
+        _slots2_ballot_asm,
+        _slots2_ballot_constraints(),
+        [owner],
+        [ids.type, gl.int32, ids.type, gl.int32],
+        is_pure=True,
+    )
+    tt: gl.constexpr = gl.BlockedLayout([2, RP], [64, 1], [nw, 1], [1, 0])
+    table = gl.convert_layout(entries, tt)
+    return ids, owner, ballot[0], ballot[1], table
 
 
 @gluon.constexpr_function

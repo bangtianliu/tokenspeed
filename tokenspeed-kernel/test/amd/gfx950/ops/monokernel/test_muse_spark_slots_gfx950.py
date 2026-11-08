@@ -70,10 +70,11 @@ def _slots_kernel(ids_ptr, out_ptr, RP: gl.constexpr):
 def test_ballot_slots_match_slots(rows: int):
     rp = triton_next_power_of_2(rows)
     g = torch.Generator().manual_seed(rows)
-    for trial in range(20):
+    for trial in range(24):
         # Each row's 8 distinct picks, from a small pool so rows share
-        # experts; the slot table stage repeats the last row up to rp.
-        pool = 8 + trial * (2 if rows > 8 else 1)
+        # experts (the last trials from all 256, up to 128 slots); the slot
+        # table stage repeats the last row up to rp.
+        pool = 256 if trial >= 20 else 8 + trial * (2 if rows > 8 else 1)
         picks = [torch.randperm(pool, generator=g)[:8] for _ in range(rows)]
         picks += [picks[-1]] * (rp - rows)
         ids = torch.stack(picks).flatten().to(torch.int32).cuda()
