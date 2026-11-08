@@ -418,3 +418,37 @@ def test_warmup_compiles_every_router_with_mm_row_bucket() -> None:
     with assert_no_triton_compile(gluon_fp32_router_gemv_mm_a16w16_gfx950):
         for m in rows:
             run(m)
+
+
+# 0.375: this test's own (the multiplier is compiled in, so no other test's
+# binaries serve its launches). MULTIPLIER: Muse Spark's served router (its
+# config's output_multiplier, the only router shape it registers: 8192 inputs,
+# 256 experts, replicated at TP8); run it alone (-k served) for the same
+# guarantee, since the tests above compile some of its buckets.
+@pytest.mark.parametrize("multiplier", [0.375, MULTIPLIER], ids=["own", "served"])
+def test_warmup_compiles_every_router_row_bucket(multiplier: float) -> None:
+    """One warmup launch of any row count compiles the GEMV and every split-K
+    tile the launch can pick: an extend of any rows up to the last measured
+    bucket (and both edges of each: 8 / 9, 64 / 65, 96) compiles nothing
+    later."""
+    plan = _router_plan()
+    x, weight = _problem(96, 8192, 256, 20261108)
+    prepared = fp32_router_gemv_process_weight(plan, weight)
+    counters = fp32_router_gemv_counters(256, x.device)
+
+    def run(rows: int) -> None:
+        out = fp32_router_gemv_execute(
+            plan, x[:rows].contiguous(), prepared, multiplier, counters, False
+        )
+        expected = (x[:rows].double() @ weight.double()) * multiplier
+        torch.testing.assert_close(
+            out.double(), expected, rtol=0, atol=2e-6 * 8192**0.5
+        )
+
+    with kernel_warmup(enabled=True):
+        run(40)
+    with assert_no_triton_compile(
+        gluon_fp32_router_gemv_gfx950, gluon_fp32_router_gemv_splitk_gfx950
+    ):
+        for rows in range(1, 97):
+            run(rows)

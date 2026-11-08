@@ -137,6 +137,9 @@ if platform.is_amd:
         gluon_fp32_router_gemv_num_counters_gfx950 as _fp32_router_gemv_counters,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
+        gluon_fp32_router_gemv_warmup_rows_gfx950 as _fp32_router_gemv_warmup_rows,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
         launch_gluon_fp32_router_gemv_gfx950 as _fp32_router_gemv_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
@@ -263,12 +266,40 @@ if platform.is_amd:
         # The caller's counters are sized for the portable kernel's column
         # blocks; the split-K GEMM counts arrivals per row-and-column tile.
         del counters
+        if is_warming_up():
+            _warm_router_gemv_buckets(x, weight, multiplier, enable_pdl)
         tile_counters = zeroed_state(
             _fp32_router_gemv_counters(x.shape[0], weight.shape[0], x.shape[1]),
             dtype=torch.int32,
             device=x.device,
         )
         return _fp32_router_gemv_impl(x, weight, multiplier, tile_counters, enable_pdl)
+
+    _warmed_router_gemv: set[tuple] = set()
+
+    def _warm_router_gemv_buckets(
+        x: torch.Tensor, weight: torch.Tensor, multiplier: float, enable_pdl: bool
+    ) -> None:
+        """Compile every row bucket of this router during warmup.
+
+        The launch picks its kernel and tile by the row count (the GEMV, then
+        split-K tiles of measured row buckets), and the startup traversal's
+        extends do not reach every bucket (Muse Spark's 8192-wide router: the
+        65-96 row tile). One launch at each bucket's largest row count and the
+        one below it covers every row count of the bucket.
+        """
+        n, k = weight.shape
+        key = (n, k, multiplier, x.device)
+        if key in _warmed_router_gemv:
+            return
+        _warmed_router_gemv.add(key)
+        for m in _fp32_router_gemv_warmup_rows(n, k):
+            counters = zeroed_state(
+                _fp32_router_gemv_counters(m, n, k), dtype=torch.int32, device=x.device
+            )
+            _fp32_router_gemv_impl(
+                x.new_zeros((m, k)), weight, multiplier, counters, enable_pdl
+            )
 
     def _supports_router_gemv_mm_problem(m: int, n: int, k: int) -> bool:
         # Any router shape the traits admit tiles the router half; the decode
