@@ -1004,6 +1004,12 @@ def cta_slots(PLAN: gl.constexpr, union):
             and schedule.stage_base(PLAN, "ex2") == 0,
             "the slot table serves the lane of CTA t: t // 32",
         )
+        # The table is the lane of ex1's task on this CTA; ex2 reads it for
+        # its own task's lane, task // (NB2 // EX2_BLOCKS): the two must agree.
+        gl.static_assert(
+            NB2 // EX2_BLOCKS == NB1 * KSPLIT,
+            "ex1 and ex2 tasks of a CTA must be of one lane",
+        )
         table = lane_slots(union, gl.program_id(0) // (NB1 * KSPLIT))
     else:
         table = (0, 0)
@@ -1280,6 +1286,12 @@ def exr_stage(mb, task, union, table, BF16: gl.constexpr, STAGE: gl.constexpr):
     LDS: gl.constexpr = (
         R > 8 and schedule.stage_base(mb.plan, STAGE) == 0 and PARTS == EXR_PARTS
     )
+    if LDS:
+        # Then exr task t, lane t // (NB1 * EXR_PARTS), is the lane of the
+        # CTA's table (cta_slots: CTA // (NB1 * KSPLIT)).
+        gl.static_assert(
+            EXR_PARTS == KSPLIT, "exr's lane must be the CTA's slot-table lane"
+        )
     lane = task // (NB1 * PARTS)
     blk = task // PARTS % NB1
     first = lane + LANES * (task % PARTS)
