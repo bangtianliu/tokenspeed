@@ -615,6 +615,10 @@ private:
     // prefill/decode interval for prefill_decode_interval rounds in total
     // (docs/design/scheduler.md §3.3).
     bool prefillDeferralExhausted(std::span<Request* const> candidates) const;
+    // True when this round owes the running decodes a round before prefill
+    // work: the interval's rounds, or while a prompt is overdue, the first
+    // prefill_decode_overdue_rounds of them (§3.3).
+    bool intervalOwesDecodes(std::span<Request* const> candidates) const;
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   bool new_prompts_sealed, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);

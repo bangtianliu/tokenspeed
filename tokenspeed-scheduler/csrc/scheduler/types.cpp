@@ -187,6 +187,20 @@ void SchedulerConfig::Validate() const {
             "Scheduler: prefill_decode_interval (--prefill-decode-interval) applies to the fused role only: a P "
             "node runs no decodes and a D node no local prefill");
     }
+    if (prefill_decode_overdue_rounds < 0) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_decode_overdue_rounds (--prefill-decode-overdue-rounds) must be >= 0");
+    }
+    if (prefill_decode_overdue_rounds != 0 && prefill_decode_interval == 0) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_decode_overdue_rounds (--prefill-decode-overdue-rounds) needs a prefill/decode "
+            "interval (--prefill-decode-interval > 0): without one no prompt is ever overdue");
+    }
+    if (prefill_decode_overdue_rounds != 0 && role != Role::kFused) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_decode_overdue_rounds (--prefill-decode-overdue-rounds) applies to the fused role "
+            "only: a P node runs no decodes and a D node no local prefill");
+    }
     if (HasHostCache() || HasSnapshotPool()) {
         if (host_group_packing.size() != cache_groups.size()) {
             throw std::invalid_argument("Scheduler: Host pools require explicit packing for every cache group");

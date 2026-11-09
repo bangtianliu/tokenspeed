@@ -220,6 +220,7 @@ def _scheduled_batch():
         enable_l3_storage=False,
         role="fused",
         prefill_decode_interval=0,
+        prefill_decode_overdue_rounds=0,
         num_snapshot_pages=1,
         host_group_packing=(),
         max_retracted_requests=0,

@@ -101,6 +101,10 @@ struct SchedulerConfig {
     // Fused role only: decode rounds owed after a local prefill round
     // (docs/design/scheduler.md §3.3). 0 is off.
     std::int32_t prefill_decode_interval{0};
+    // Decode rounds still owed after each chunk while a prompt is overdue
+    // (held back prefill_decode_interval rounds) (§3.3). 0 runs the overdue
+    // prompt's chunks back to back.
+    std::int32_t prefill_decode_overdue_rounds{0};
 
     // The P and D roles ARE the cache-transfer PD protocol: there is no
     // disaggregated deployment without it, so everything PD-specific

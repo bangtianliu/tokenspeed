@@ -424,6 +424,9 @@ class ServerArgs:
     # Decode rounds owed to the running decodes after each prefill round; 0 is
     # off (docs/design/scheduler.md §3.3).
     prefill_decode_interval: int = 0
+    # Decode rounds each chunk of an overdue prompt still owes the running
+    # decodes; 0 runs an overdue prompt's chunks back to back (§3.3).
+    prefill_decode_overdue_rounds: int = 0
     # Opt-in: the prefill forward that spans a long prompt's last prefix-page
     # boundary before its replay tail (normally the final token) also writes
     # the recurrent state there, where hybrid models publish a checkpoint;
@@ -2737,6 +2740,13 @@ class ServerArgs:
                 "prefill engine runs no decodes and a decode engine no local "
                 "prefill rounds"
             )
+        if self.prefill_decode_overdue_rounds < 0:
+            raise ValueError("--prefill-decode-overdue-rounds must be non-negative")
+        if self.prefill_decode_overdue_rounds and not self.prefill_decode_interval:
+            raise ValueError(
+                "--prefill-decode-overdue-rounds needs --prefill-decode-interval "
+                "> 0: without an interval no prompt is ever overdue"
+            )
         if self.device == "npu":
             if not self.disable_prefill_graph:
                 raise ValueError("NPU execution requires --disable-prefill-graph")
@@ -3058,6 +3068,18 @@ class ServerArgs:
             "more than this many decode rounds in total. Trades TTFT for "
             "fewer decode stalls. Aggregated serving only. 0 (the default) is "
             "off.",
+        )
+        parser.add_argument(
+            "--prefill-decode-overdue-rounds",
+            type=int,
+            default=ServerArgs.prefill_decode_overdue_rounds,
+            help="Once a prompt has been held back --prefill-decode-interval "
+            "rounds in total, each of its remaining prefill chunks still owes "
+            "the running decodes this many decode rounds, so a running decode "
+            "waits at most one chunk instead of the prompt's whole prefill. "
+            "Adds this many decode steps per remaining chunk to that prompt's "
+            "TTFT. Needs --prefill-decode-interval. 0 (the default) runs the "
+            "overdue prompt's chunks back to back.",
         )
         parser.add_argument(
             "--enable-state-checkpoint-in-forward",

@@ -1982,14 +1982,17 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
 // A round with no decode to schedule runs prefill work as usual, so the
 // engine never idles to honor the interval. No prompt is held back more
 // than N rounds in total, across its chunks and other prompts' intervals: a
-// prompt held back N rounds suspends the interval, and the round runs as if
-// none were owed.
+// prompt held back N rounds is overdue. While one is, a chunk owes the decodes
+// only prefill_decode_overdue_rounds M rounds instead of N (at most the N the
+// chunk set), so the overdue prompt still advances every M decode rounds
+// and a running decode never waits more than one chunk; M = 0 runs the
+// overdue prompt's chunks back to back.
 void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                std::vector<WriteBackOperation>& write_back_operations) {
     maybeForceRetraction(build, candidates, write_back_operations);
 
     const bool new_prompts_sealed = scheduleReadmission(feedback, build, candidates);
-    const bool interval_owes_decodes = prefill_deferral_rounds_left_ > 0 && !prefillDeferralExhausted(candidates);
+    const bool interval_owes_decodes = intervalOwesDecodes(candidates);
     if (config_.enable_mixed_prefill_decode) {
         // A deferred prefill joins no decode, so the decodes keep its reserve.
         const bool has_local_prefill =
@@ -2034,6 +2037,20 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
     } else if (build.pushed_decode && prefill_deferral_rounds_left_ > 0) {
         --prefill_deferral_rounds_left_;
     }
+}
+
+bool Scheduler::intervalOwesDecodes(std::span<Request* const> candidates) const {
+    if (prefill_deferral_rounds_left_ == 0) {
+        return false;
+    }
+    if (!prefillDeferralExhausted(candidates)) {
+        return true;
+    }
+    // An overdue prompt waits: the decodes are owed what is left of the first
+    // M rounds since the last chunk. Capped by the rounds the chunk set, so a
+    // larger M than N waits no longer than the interval would.
+    const std::int32_t served = config_.prefill_decode_interval - prefill_deferral_rounds_left_;
+    return served < config_.prefill_decode_overdue_rounds;
 }
 
 bool Scheduler::prefillDeferralExhausted(std::span<Request* const> candidates) const {

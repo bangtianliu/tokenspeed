@@ -118,6 +118,7 @@ def make_config(
     storage_config: StorageConfig | None,
     host_write_policy: str,
     prefill_decode_interval: int,
+    prefill_decode_overdue_rounds: int,
     debug_force_retraction_interval: int = 0,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
@@ -172,6 +173,10 @@ def make_config(
             owed to the running decodes after each round that schedules a
             prefill chunk, unless no decode can run, and the most rounds it
             holds any one prompt back in total; 0 is off. Fused role only.
+        prefill_decode_overdue_rounds: ``--prefill-decode-overdue-rounds``:
+            decode rounds each chunk of an overdue prompt (one held back
+            ``prefill_decode_interval`` rounds) still owes the running
+            decodes; 0 runs its chunks back to back. Needs the interval.
         debug_force_retraction_interval: ``--debug-force-retraction-interval``:
             0 is off; every ``|N|`` plans the scheduler retracts the oldest
             quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request
@@ -298,6 +303,10 @@ def make_config(
         # Set only when on, like state_checkpoint_in_forward: a scheduler
         # wheel without the field still runs the default.
         cfg.prefill_decode_interval = prefill_decode_interval
+    if prefill_decode_overdue_rounds:
+        # Set only when on, as the interval: a scheduler wheel without the
+        # field refuses the assignment instead of dropping it.
+        cfg.prefill_decode_overdue_rounds = prefill_decode_overdue_rounds
     if cache_groups:
         cfg.cache_groups = list(cache_groups)
     return cfg

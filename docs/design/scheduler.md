@@ -1361,16 +1361,26 @@ interval, but no prompt is held back more than `N` rounds in total. Each
 rounds in which the interval skipped the prefill phases while it waited
 (`Request::PrefillDeferredRounds`). The count is never reset: a victim
 retracted in such a round counts the round, and the count survives the
-restore. While any request has counted `N`, the scheduler suspends the
-interval and plans the round as if no decode rounds were owed. So the interval
-adds at most `N` decode steps to a prompt's time to first token, whatever its
-number of chunks and however many other prompts' intervals it waits through. A
-round that the prompt would have waited anyway, for a request slot, for
-capacity, or behind an older chunk, counts too.
+restore. A request that has counted `N` is overdue. While any request is
+overdue, a chunk owes the running decodes only `prefill_decode_overdue_rounds`
+`M` rounds instead of `N` (`M` greater than `N` owes `N`): the decodes run
+first until `M` decode rounds have followed the last chunk, then prefill work
+runs. With `M` = 0 the overdue prompt's remaining chunks, and any older chunk
+ahead of it in the line (§1.1), run back to back while the decodes stall, as
+long as its prefill takes. So the interval adds at most `N` decode steps to a
+prompt's time to first token before it is overdue, whatever its number of
+chunks and however many other prompts' intervals it waits through, and `M`
+more for each chunk it runs while overdue; with `M` > 0 a running decode waits
+at most one chunk. A round that the prompt would have waited anyway, for a
+request slot, for capacity, or behind an older chunk, counts too.
 
-A suspended round runs without the interval: outside mixed mode, the overdue
-prompt's remaining chunks, and any older chunk ahead of it in the line (§1.1),
-run back to back while the decodes stall. A round with no decode to schedule
+`M` exists for long prompts. A cold prompt of several hundred thousand tokens
+is many chunks; once it is overdue, `M` = 0 kept a running request from
+decoding for its whole prefill (19 s for a 548k-token prompt in 67 chunks),
+while `M` = 2 gives that request two steps per chunk at a cost of two decode
+steps per chunk to the long prompt's time to first token.
+
+A round with no decode to schedule
 runs prefill work as usual, so the engine never idles for the interval. A
 deferred prefill tries no admission, so it never blocks on capacity; a
 deferred resident chunk holds its pages idle and is the first victim (§2) when

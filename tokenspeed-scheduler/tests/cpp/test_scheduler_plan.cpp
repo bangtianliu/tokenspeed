@@ -1443,6 +1443,23 @@ protected:
         }
         return ran;
     }
+
+    // The round, counted from b's submission, in which b's last chunk runs
+    // and gives its first token: b is a three-chunk prompt that arrives while
+    // a decodes and is overdue from its first chunk on.
+    int FirstTokenRoundOfAnOverduePrompt() {
+        Submit(MakeRequestSpec("a", 2));
+        EXPECT_EQ(Round(), "P:a");
+        Submit(MakeRequestSpec("b", 6, /*start=*/100));
+        int chunks = 0;
+        for (int round = 1; round <= 12; ++round) {
+            const std::string ran = Round(chunks < 2 ? std::set<std::string>{"b"} : std::set<std::string>{});
+            if (ran == "P:b" && ++chunks == 3) {
+                return round;
+            }
+        }
+        return -1;
+    }
 };
 
 TEST_F(PrefillDecodeIntervalSuite, ANewPromptWaitsForTheIntervalsDecodeRounds) {
@@ -1685,6 +1702,111 @@ TEST(SchedulerConstructionTest, RefusesAPrefillDecodeIntervalOutsideTheFusedRole
             ADD_FAILURE() << "prefill_decode_interval " << interval << " was accepted";
         } catch (const std::invalid_argument& error) {
             EXPECT_NE(std::string{error.what()}.find("prefill_decode_interval"), std::string::npos) << error.what();
+        }
+    }
+}
+
+// prefill_decode_overdue_rounds M: while a prompt is overdue (held back the
+// interval's N rounds in total), each of its chunks still owes the running
+// decodes M rounds, so a decode never waits more than one chunk and the
+// prompt's first token comes M rounds later per chunk after it went overdue.
+class PrefillDecodeOverdueSuite : public PrefillDecodeIntervalSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefillDecodeIntervalSuite::MakeConfig();
+        cfg.prefill_decode_overdue_rounds = 1;
+        return cfg;
+    }
+};
+
+TEST_F(PrefillDecodeOverdueSuite, ARunningDecodeGetsARoundBetweenAnOverduePromptsChunks) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 6, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    // b has been held back the interval's two rounds: it is overdue. Each of
+    // its chunks now owes a one decode round, where without the overdue
+    // rounds the three chunks ran back to back
+    // (APromptIsHeldBackAtMostTheIntervalAcrossItsChunks).
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "P:b");
+    EXPECT_EQ(Round(), "D:ab");
+}
+
+TEST_F(PrefillDecodeIntervalSuite, AnOverduePromptsChunksRunBackToBackWithoutOverdueRounds) {
+    EXPECT_EQ(FirstTokenRoundOfAnOverduePrompt(), 5);
+}
+
+TEST_F(PrefillDecodeOverdueSuite, AnOverduePromptsFirstTokenComesMRoundsLaterPerChunk) {
+    // Two rounds later than with M = 0 (5): M = 1 round for each of the two
+    // chunks b runs while overdue.
+    EXPECT_EQ(FirstTokenRoundOfAnOverduePrompt(), 7);
+}
+
+class PrefillDecodeOverdueAboveIntervalSuite : public PrefillDecodeIntervalSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefillDecodeIntervalSuite::MakeConfig();
+        cfg.prefill_decode_overdue_rounds = 5;  // more than the interval's 2
+        return cfg;
+    }
+};
+
+TEST_F(PrefillDecodeOverdueAboveIntervalSuite, OverdueRoundsAboveTheIntervalWaitOnlyTheInterval) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 4, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    // The chunk set N = 2 owed rounds; M = 5 does not make b wait longer.
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "P:b");
+}
+
+TEST(SchedulerConstructionTest, RefusesOverdueRoundsItCannotHonor) {
+    const auto config = [](Role role, std::int32_t interval, std::int32_t overdue_rounds) {
+        SchedulerConfig cfg{};
+        cfg.role = role;
+        cfg.prefix_granularity = 2;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.device_allocator.total_pages = 32;
+        cfg.disable_l2_cache = true;
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "full_attention",
+            .block_granularity = cfg.prefix_granularity,
+            .total_pages = 32,
+        });
+        if (role != Role::kFused) {
+            cfg.cache_groups.front().transfer_policy = CacheTransferPolicy::FullSuffix;
+        }
+        SetTestSnapshotPool(cfg);
+        cfg.prefill_decode_interval = interval;
+        cfg.prefill_decode_overdue_rounds = overdue_rounds;
+        return WithHostPackingFromDevice(cfg);
+    };
+    EXPECT_NO_THROW(config(Role::kFused, 4, 1).Validate());
+    EXPECT_NO_THROW(config(Role::kFused, 0, 0).Validate());
+    struct Case {
+        Role role;
+        std::int32_t interval;
+        std::int32_t overdue_rounds;
+    };
+    for (const Case& c :
+         {Case{Role::kFused, 4, -1}, Case{Role::kFused, 0, 1}, Case{Role::kP, 0, 1}, Case{Role::kD, 0, 1}}) {
+        try {
+            config(c.role, c.interval, c.overdue_rounds).Validate();
+            ADD_FAILURE() << "prefill_decode_overdue_rounds " << c.overdue_rounds << " with interval " << c.interval
+                          << " was accepted";
+        } catch (const std::invalid_argument& error) {
+            EXPECT_NE(std::string{error.what()}.find("prefill_decode_overdue_rounds"), std::string::npos)
+                << error.what();
         }
     }
 }

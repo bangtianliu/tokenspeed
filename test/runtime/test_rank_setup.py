@@ -124,6 +124,7 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         max_retracted_requests=0,
         storage_config=None,
         prefill_decode_interval=0,
+        prefill_decode_overdue_rounds=0,
     )
     # Keyword-only and required, with or without a Host tier.
     with pytest.raises(TypeError, match="host_write_policy"):
@@ -161,6 +162,62 @@ def test_the_prefill_decode_interval_reaches_the_scheduler():
     ],
 )
 def test_server_args_refuse_a_prefill_decode_interval_it_cannot_honor(flags, error):
+    with pytest.raises(ValueError, match=error):
+        prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
+
+
+def test_the_overdue_rounds_reach_the_scheduler():
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--max-num-seqs",
+            "8",
+            "--prefill-decode-interval",
+            "64",
+            "--prefill-decode-overdue-rounds",
+            "2",
+        ]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert (cfg.prefill_decode_interval, cfg.prefill_decode_overdue_rounds) == (64, 2)
+
+
+def test_overdue_rounds_default_to_back_to_back_chunks():
+    args = prepare_server_args(
+        ["--model", "x", "--max-num-seqs", "8", "--prefill-decode-interval", "64"]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.prefill_decode_overdue_rounds == 0
+
+
+@pytest.mark.parametrize(
+    "flags,error",
+    [
+        (
+            [
+                "--prefill-decode-interval",
+                "64",
+                "--prefill-decode-overdue-rounds",
+                "-1",
+            ],
+            "must be non-negative",
+        ),
+        (
+            ["--prefill-decode-overdue-rounds", "2"],
+            "needs --prefill-decode-interval",
+        ),
+        (
+            ["--prefill-decode-overdue-rounds", "2", "--disaggregation-mode", "decode"],
+            "needs --prefill-decode-interval",
+        ),
+    ],
+)
+def test_server_args_refuse_overdue_rounds_they_cannot_honor(flags, error):
     with pytest.raises(ValueError, match=error):
         prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
 
@@ -877,6 +934,7 @@ def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
         storage_config=None,
         host_write_policy="write_through",
         prefill_decode_interval=0,
+        prefill_decode_overdue_rounds=0,
     )
     assert make_config(**fields).prefill_chunk_yield_tokens == 0
     assert (
