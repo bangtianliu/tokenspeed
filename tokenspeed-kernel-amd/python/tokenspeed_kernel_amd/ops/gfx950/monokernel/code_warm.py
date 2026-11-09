@@ -131,7 +131,7 @@ def text_range(kernel) -> tuple[int, int]:
         raise RuntimeError(f"code warm: the marker occurs {body.count(marker)} times")
     # s_getpc_b64 returns the address of the next instruction: the s_mov_b32
     # whose 4-byte opcode the literal follows.
-    got = (body.index(marker) - 4, text[5] // 16)
+    got = (body.index(marker) - 4, 0)
     _TEXT_RANGES[id(kernel)] = (got, kernel)  # holds the kernel: ids stay unique
     return got
 
