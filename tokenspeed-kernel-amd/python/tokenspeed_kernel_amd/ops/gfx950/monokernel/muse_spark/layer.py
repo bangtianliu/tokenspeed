@@ -41,7 +41,6 @@ import torch
 from tokenspeed_kernel_amd._extern import extern_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import (
-    code_warm,
     mailbox,
     schedule,
     trace,
@@ -175,9 +174,6 @@ KV_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
 # expert weights streaming after them would evict them. The comb tasks start
 # at CTA 64.
 WARM_TASKS = 64
-# CTAs 0 .. CODE_TASKS - 1 first read the launch's own code into the L2s
-# (code_warm.py): 8 tasks on each XCD.
-CODE_TASKS = 64
 
 
 def layer_plan(
@@ -227,8 +223,7 @@ def layer_plan(
     )
     nq = next_qkvg
     stages = (
-        (Stage("code", CODE_TASKS, 0),)
-        + qkvg.stages(_bases(rows, nq, "qkvg", "gate"), own_qkvg)
+        qkvg.stages(_bases(rows, nq, "qkvg", "gate"), own_qkvg)
         + attention.stages(
             _bases(rows, nq, "head", "attn", "merge"), splits, rows, chain, own_qkvg
         )
@@ -269,9 +264,8 @@ def layer_plan(
 
 # The layer index changes every launch: a specialization on it (1, or a
 # multiple of 16) would compile new binaries while serving. The warm word
-# count is the next layer's, a runtime value too. The code range is the
-# compiled binary's own, known only after the compile.
-@gluon.jit(do_not_specialize=("layer", "warm_quads", "code_offset", "code_quads"))
+# count is the next layer's, a runtime value too.
+@gluon.jit(do_not_specialize=("layer", "warm_quads"))
 def gluon_muse_spark_layer_gfx950(
     scratch,
     step,
@@ -284,8 +278,6 @@ def gluon_muse_spark_layer_gfx950(
     tap_row,
     warm_ptr,
     warm_quads,
-    code_offset,
-    code_quads,
     proj_in,
     proj_out,
     w_next,
@@ -317,7 +309,6 @@ def gluon_muse_spark_layer_gfx950(
     launch's parity repeats the last one's (``Mailbox.check_parity``).
     ``warm_ptr``, ``warm_quads``: the next launch's packed QKVG weights, read
     (``4 * warm_quads`` int32 words) only when ``PLAN`` has the warm stage.
-    ``code_offset``, ``code_quads``: this binary's ``code_warm.text_range``.
     ``proj_in``: int32 ``[rows, qkvg.PROJ_WORDS]``, the q | k | v projection
     the previous launch's qnext tasks stored, read when ``PLAN`` has no qkvg
     stage. ``proj_out``, ``w_next``: where the qnext tasks store the next
@@ -331,17 +322,6 @@ def gluon_muse_spark_layer_gfx950(
     if CHECK_PARITY:
         if gl.program_id(0) == 0:
             mb.check_parity(layer & 1)
-    task, active = schedule.stage_task(PLAN, "code")
-    if active:
-        code_warm.code_warm_stage(
-            mb,
-            task,
-            schedule.stage_tasks(PLAN, "code"),
-            scratch,
-            code_offset,
-            code_quads,
-            "code",
-        )
     (
         w_qkvg,
         a_in,
@@ -693,7 +673,7 @@ def launch_layer(
         attn_ops[0] if next_qkvg is None else next_qkvg,
     )
 
-    def kernel_args(code: tuple[int, int]) -> tuple:
+    def kernel_args() -> tuple:
         return (
             scratch,
             step,
@@ -703,7 +683,6 @@ def launch_layer(
             moe_ops,
             *tap_args,
             *warm_args,
-            *code,
             *proj_args,
             trace_buf,
             stuck_rec,
@@ -718,17 +697,16 @@ def launch_layer(
         )
 
     # The device libraries of _extern.wave_uniform_i32 (attention.py).
-    kernel = gluon_muse_spark_layer_gfx950.warmup(
-        *kernel_args((0, 0)),
-        num_warps=8,
-        grid=(plan.grid,),
-        **extern_compile_options(),
-    )
     if compile_only:
+        gluon_muse_spark_layer_gfx950.warmup(
+            *kernel_args(),
+            num_warps=8,
+            grid=(plan.grid,),
+            **extern_compile_options(),
+        )
         return
-    # The code range is a runtime argument: the same binary.
     gluon_muse_spark_layer_gfx950[(plan.grid,)](
-        *kernel_args(code_warm.text_range(kernel)),
+        *kernel_args(),
         num_warps=8,
         **extern_compile_options(),
     )

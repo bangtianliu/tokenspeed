@@ -135,13 +135,6 @@ on every CTA downstream of it; the decoder groups them by wait and prints the
 earliest stage in plan order first, which by the deadlock rule is the one
 whose producer is missing.
 
-**A launch first reads its own code.** A layer kernel's code can be larger
-than the instruction cache, and the weights that stream through the caches
-evict it during a launch. Each stage would then wait on its instructions
-from memory, one stage after another on the critical path. So a launch's
-first tasks may read its own code into the caches as data, and stages that
-run once a launch keep compute-light loops rolled, not unrolled.
-
 **Compile-time plans are canonical text.** A plan is a compile-time argument
 of the kernel, and Triton's compile hooks serialize every compile-time
 argument to JSON. So a kernel takes its plan as its canonical JSON text, never

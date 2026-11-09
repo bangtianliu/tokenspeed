@@ -58,7 +58,6 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import (
     bf16,
-    code_warm,
     mailbox,
     mx,
     schedule,
@@ -115,17 +114,12 @@ def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
     )
 
 
-# CTAs 0 .. CODE_TASKS - 1 first read the launch's own code into the L2s
-# (code_warm.py): 8 tasks on each XCD.
-CODE_TASKS = 64
-
-
 @functools.lru_cache(maxsize=None)
 def head_plan(rows: int) -> Plan:
     """The plan of the draft head for ``rows`` draft steps."""
     return Plan(
         grid=256,
-        stages=(Stage("code", CODE_TASKS, 0),) + stages(BASES, rows),
+        stages=stages(BASES, rows),
         regions=regions(),
         rows=rows,
         chain=rows,
@@ -432,8 +426,7 @@ def score_stage(mb, row, ids, u, first_token, anchor, pred_cb, succ_cb, scores):
     mb.stamp("score", trace.END)
 
 
-# The code range is the compiled binary's own, known only after the compile.
-@gluon.jit(do_not_specialize=("code_offset", "code_quads"))
+@gluon.jit
 def gluon_muse_spark_draft_head_gfx950(
     scratch,
     step,
@@ -450,8 +443,6 @@ def gluon_muse_spark_draft_head_gfx950(
     scores,
     scale,
     softcap,
-    code_offset,
-    code_quads,
     trace_buf,
     PLAN: gl.constexpr,
     RANK: gl.constexpr,
@@ -461,17 +452,6 @@ def gluon_muse_spark_draft_head_gfx950(
     table_ = trace.allocate(trace_buf)
     peers = mailbox.load_peers(bases, RANK, gl.load(step) & 1, WORLD)
     mb = mailbox.Mailbox(scratch, mailbox.launch_tag(step, 0), PLAN, table_, peers)
-    task, active = schedule.stage_task(PLAN, "code")
-    if active:
-        code_warm.code_warm_stage(
-            mb,
-            task,
-            schedule.stage_tasks(PLAN, "code"),
-            scratch,
-            code_offset,
-            code_quads,
-            "code",
-        )
     task, active = schedule.stage_task(PLAN, "lmh")
     if active:
         lmh_stage(mb, task, x, lmh_w, scale)
@@ -549,7 +529,7 @@ def launch_gluon_muse_spark_draft_head_gfx950(
     plan = head_plan(rows)
     w = weights
 
-    def kernel_args(code: tuple[int, int]) -> tuple:
+    def kernel_args() -> tuple:
         return (
             scratch,
             step,
@@ -566,21 +546,17 @@ def launch_gluon_muse_spark_draft_head_gfx950(
             scores,
             w.scale,
             w.softcap,
-            *code,
             trace_buf,
             plan.key,
             w.rank,
         )
 
-    kernel = gluon_muse_spark_draft_head_gfx950.warmup(
-        *kernel_args((0, 0)), num_warps=8, grid=(plan.grid,)
-    )
     if compile_only:
+        gluon_muse_spark_draft_head_gfx950.warmup(
+            *kernel_args(), num_warps=8, grid=(plan.grid,)
+        )
         return
-    # The code range is a runtime argument: the same binary.
-    gluon_muse_spark_draft_head_gfx950[(plan.grid,)](
-        *kernel_args(code_warm.text_range(kernel)), num_warps=8
-    )
+    gluon_muse_spark_draft_head_gfx950[(plan.grid,)](*kernel_args(), num_warps=8)
 
 
 __all__ = [

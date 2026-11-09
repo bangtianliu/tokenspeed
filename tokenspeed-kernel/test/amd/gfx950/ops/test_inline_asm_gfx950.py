@@ -842,7 +842,7 @@ def _compiled(name):
 _AMD = "tokenspeed_kernel_amd.ops.gfx950."
 _MONO = _AMD + "monokernel."
 INLINE_ASM = {
-    # The monokernels' mailbox, code warm-up, trace and expert routing.
+    # The monokernels' mailbox, trace and expert routing.
     "_poll_n": (
         _MONO + "mailbox:_poll_n",
         "a loop of uncached loads that retries only the late pairs' lanes",
@@ -857,11 +857,6 @@ INLINE_ASM = {
         _MONO + "mailbox:Mailbox.raise_flag_peers",
         "waits for this wave's peer stores before the CTA publishes them",
         "_extern.release_drain, once every mailbox kernel links its library",
-    ),
-    "code_pointer": (
-        _MONO + "code_warm:code_pointer",
-        "reads the program counter (s_getpc_b64)",
-        "an intrinsic for the program counter in the extern library",
     ),
     "stamp": (
         _MONO + "trace:stamp",
