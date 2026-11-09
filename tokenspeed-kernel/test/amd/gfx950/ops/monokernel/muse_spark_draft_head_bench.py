@@ -30,7 +30,6 @@ end (us from the launch's first stamp).
 
 import argparse
 import os
-import socket
 import statistics
 import sys
 from datetime import timedelta
@@ -40,6 +39,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from monokernel_testing import rendezvous_port  # noqa: E402
 
 WORLD, LAUNCHES, REPS = 8, 20, 20
 
@@ -179,9 +180,7 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--trace", action="store_true")
     args = p.parse_args()
-    with socket.socket() as s:
-        s.bind(("", 0))
-        port = s.getsockname()[1]
+    port = rendezvous_port()
     mp.spawn(worker, args=(port, args), nprocs=WORLD, join=True)
 
 

@@ -62,7 +62,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import socket
 import sys
 from datetime import timedelta
 
@@ -73,6 +72,7 @@ import test_muse_spark_layer_gfx950 as layer_test  # noqa: E402
 import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
 import torch.multiprocessing as mp  # noqa: E402
+from monokernel_testing import rendezvous_port  # noqa: E402
 from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
     IrisGroup,
     get_or_create_context,
@@ -688,9 +688,7 @@ def main() -> None:
         return
     if args.gpus is None:
         p.error("--gpus is required to time a layer")
-    with socket.socket() as s:
-        s.bind(("", 0))
-        port = s.getsockname()[1]
+    port = rendezvous_port()
     mp.spawn(worker, args=(port, args), nprocs=args.gpus, join=True)
 
 

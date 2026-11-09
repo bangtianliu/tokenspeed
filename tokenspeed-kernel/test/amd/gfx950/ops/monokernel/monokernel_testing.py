@@ -19,14 +19,31 @@
 # SOFTWARE.
 
 """Host helpers shared by the monokernel tests: MXFP reference
-quantization and reading or filling a launch's mailbox regions."""
+quantization, reading or filling a launch's mailbox regions, and the
+rendezvous port of a multi-process run."""
 
 from __future__ import annotations
+
+import os
+import socket
 
 import torch
 from tokenspeed_kernel.ops.quantization import quantize_mxfp4 as kernel_quantize_mxfp4
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Plan
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import dequantize_mxfp4
+
+
+def rendezvous_port() -> int:
+    """The TCP port for ``init_process_group`` of a run's ranks: ``MASTER_PORT``
+    when set, else a free port the OS picks. The free port is only probed (bound
+    and released) here and bound again by rank 0 later, so runs started at the
+    same time on one host can pick the same one; give concurrent runs their own
+    ``MASTER_PORT``."""
+    if "MASTER_PORT" in os.environ:
+        return int(os.environ["MASTER_PORT"])
+    with socket.socket() as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
 
 
 def random_mxfp4(
