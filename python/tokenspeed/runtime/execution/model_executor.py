@@ -319,7 +319,8 @@ def select_dspark_context_producer(
 
 def warmup_extend_sizes(num_tokens: int) -> list[int]:
     """The token counts of the startup dummy extends: the prefill budget, then
-    halving down to 8 tokens, then 9 (a row count that is not a multiple of 16).
+    halving down to 8 tokens, then 4, 2 and 1, then 9 (a row count that is not
+    a multiple of 16).
 
     A request's last chunk can be any length, and a layer picks its kernels by
     its rows: short extends that a model does not split over its ranks take
@@ -329,7 +330,10 @@ def warmup_extend_sizes(num_tokens: int) -> list[int]:
     (the split-K router's), and a row count's divisibility by 16 is a separate
     specialization of a GEMM. An extend at the budget reaches only the largest;
     each halving lands in the next row bucket down, so every bucket compiles
-    at startup instead of on the first request whose last chunk lands in it."""
+    at startup instead of on the first request whose last chunk lands in it.
+    Below 8 tokens the small-row kernels bucket rows by powers of two too
+    (BLOCK_M 1, 2, 4): an extend of a prompt that is cached but for its last
+    few tokens takes them."""
     sizes = [num_tokens]
     tokens = num_tokens // 2
     while tokens >= 8:
@@ -338,6 +342,7 @@ def warmup_extend_sizes(num_tokens: int) -> list[int]:
     # A budget that is not a power of two halves past 8 without landing on it.
     if sizes[-1] > 8:
         sizes.append(8)
+    sizes += [t for t in (4, 2, 1) if t < sizes[-1]]
     if 9 < num_tokens:
         sizes.append(9)
     return sizes

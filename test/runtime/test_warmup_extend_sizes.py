@@ -41,10 +41,11 @@ register_cuda_ci(est_time=1, suite="runtime-1gpu")
 def test_the_extends_cover_every_power_of_two_row_bucket_and_an_odd_count(budget):
     sizes = warmup_extend_sizes(budget)
     assert sizes[0] == budget
-    # An extend in every power-of-two row bucket from 8 tokens up to the
-    # budget's (kernels bucket rows by the next power of two).
+    # An extend in every power-of-two row bucket from 1 token up to the
+    # budget's (kernels bucket rows by the next power of two; a prompt cached
+    # but for its last few tokens extends by fewer than 8).
     buckets = {1 << (t - 1).bit_length() for t in sizes}
-    bucket = 8
+    bucket = 1
     while bucket <= budget:
         assert bucket in buckets, (bucket, sizes)
         bucket *= 2
@@ -54,5 +55,5 @@ def test_the_extends_cover_every_power_of_two_row_bucket_and_an_odd_count(budget
     assert all(t <= budget for t in sizes) and len(sizes) == len(set(sizes))
 
 
-def test_a_budget_of_eight_tokens_runs_only_itself():
-    assert warmup_extend_sizes(8) == [8]
+def test_a_budget_of_eight_tokens_runs_itself_and_the_smaller_buckets():
+    assert warmup_extend_sizes(8) == [8, 4, 2, 1]
