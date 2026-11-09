@@ -722,7 +722,8 @@ def _load_b(
             # they must not evict what the launch reuses from L2 and the
             # memory-side cache (its code, the KV, the warmed next-layer
             # QKVG). The scales stay default: small, and read again.
-            cache=".cg",
+            # EXPERIMENT (not for merge): default caching, to test whether
+            # the .cg expert loads are what made the code warm redundant.
         )
         s = gl.amd.cdna4.buffer_load(
             ws,
@@ -978,7 +979,6 @@ def ex1_prefetch(PLAN: gl.constexpr, task, active, table, w13, stride_we):
                 w13,
                 offs,
                 mask=on & (i >= 0),
-                cache_modifier=".cg",
             )
             out += (smem,)
         cdna4_async_copy.commit_group()
