@@ -203,7 +203,7 @@ SLT_WORDS = gl.constexpr(128 + 128 * 16)
 # loads 136 words a row instead of polling every whole pooled row (16 KiB of
 # pairs) on each of its 256 CTAs. A launch's rows split into up to
 # XQ_GROUPS groups (:func:`xq_rows`): one row a group up to 8 rows, two at
-# 16. An xq task polls its group's whole pooled rows (8 KiB of tagged pairs
+# 16. An xq task polls its group's whole pooled rows (16 KiB of tagged pairs
 # a row) for the norm, so fewer rows a group shorten xq's poll; at 8 ranks,
 # 4 rows a group put the xq CTAs' ex1 ~3 us behind the others at 1 x 8.
 # With one row a group at 16 rows, the 64 tasks wrapped onto the heaviest ex1
