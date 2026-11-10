@@ -273,7 +273,7 @@ def _ffn_word_flags(mb, first):
     at = first * schedule.row_pairs(mb.plan)
     mb.pre_poll("ffnf", at + gl.minimum(lanes * N // 64, N - 1))
     f = gl.arange(0, N, lanes.type.layout)
-    mb.poll_many(("ffnf",), (at + f,))
+    mb.poll_flags("ffnf", at + f)
     gl.barrier()
 
 
